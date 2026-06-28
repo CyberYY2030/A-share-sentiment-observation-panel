@@ -27,6 +27,7 @@ from ..scanners.rps_stock import (
 )
 from ..universe import build_universe
 from ..watchlist import build_watchlist, split_actionable_watchlist
+from ..playbook import lookup_playbook
 from run_daily import execute_daily_pipeline
 
 
@@ -785,6 +786,117 @@ def _prepare_watchlist_display(watchlist_df: pd.DataFrame) -> pd.DataFrame:
         if column not in display.columns:
             display[column] = pd.NA
     return display[columns]
+
+def _row_value(row: object, column: str) -> object:
+    if isinstance(row, dict):
+        return row.get(column)
+    getter = getattr(row, "get", None)
+    if callable(getter):
+        return getter(column)
+    return None
+
+
+def _playbook_lookup_keys(row: object) -> list[str]:
+    keys: list[str] = []
+
+    def add(value: object) -> None:
+        text = str(value or "").strip()
+        if text and text not in keys:
+            keys.append(text)
+
+    add(_row_value(row, "state"))
+    add(_row_value(row, "strategy_id"))
+    flag_strategies = _row_value(row, "flag_strategies")
+    if isinstance(flag_strategies, (list, tuple, set)):
+        for item in flag_strategies:
+            add(item)
+    else:
+        for item in str(flag_strategies or "").replace(";", ",").replace("，", ",").split(","):
+            add(item)
+    return keys
+
+
+def _playbook_cards_for_row(
+    row: object,
+    lookup: Callable[[str], list[dict[str, object]]] = lookup_playbook,
+) -> list[dict[str, object]]:
+    cards: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for key in _playbook_lookup_keys(row):
+        try:
+            matches = lookup(key)
+        except Exception:
+            matches = []
+        for card in matches:
+            card_key = str(card.get("id") or card.get("path") or card.get("title") or id(card))
+            if card_key in seen:
+                continue
+            seen.add(card_key)
+            cards.append(card)
+    return cards
+
+
+def _playbook_empty_message() -> str:
+    return "该状态暂无复盘笔记模式"
+
+
+def _render_card_section(title: str, value: object) -> None:
+    st.markdown(f"**{title}**")
+    text = str(value or "").strip()
+    if text:
+        st.markdown(text)
+    else:
+        st.caption("暂无")
+
+
+def _render_raw_refs(card: dict[str, object]) -> None:
+    st.markdown("**原文**")
+    source_docs = card.get("source_docs")
+    raw_paths = card.get("raw_paths") if isinstance(card.get("raw_paths"), dict) else {}
+    docs = source_docs if isinstance(source_docs, list) else []
+    if not docs:
+        text = str(card.get("原文") or "").strip()
+        if text:
+            st.markdown(text)
+        else:
+            st.caption("暂无")
+        return
+    for doc_id in docs:
+        doc_text = str(doc_id)
+        raw_path = str(raw_paths.get(doc_text, "")) if isinstance(raw_paths, dict) else ""
+        if raw_path:
+            st.markdown(f"- {doc_text}: `{raw_path}`")
+        else:
+            st.markdown(f"- {doc_text}")
+
+
+def _render_playbook_cards(cards: list[dict[str, object]]) -> None:
+    if not cards:
+        st.caption(_playbook_empty_message())
+        return
+    for idx, card in enumerate(cards):
+        if idx:
+            st.divider()
+        st.markdown(f"**{card.get('title') or card.get('id') or '复盘笔记'}**")
+        _render_card_section("模式定义", card.get("模式定义"))
+        _render_card_section("看法", card.get("看法"))
+        _render_card_section("案例", card.get("案例"))
+        _render_raw_refs(card)
+
+
+def _render_watchlist_playbooks(
+    watchlist_df: pd.DataFrame,
+    lookup: Callable[[str], list[dict[str, object]]] = lookup_playbook,
+) -> None:
+    if watchlist_df.empty:
+        return
+    for _, row in watchlist_df.iterrows():
+        sec_code = str(row.get("sec_code") or "").strip()
+        sec_name = str(row.get("sec_name") or "").strip()
+        state = str(row.get("state") or "").strip()
+        label_parts = [part for part in (sec_code, sec_name, state) if part]
+        with st.expander(" · ".join(label_parts) or "复盘笔记", expanded=False):
+            _render_playbook_cards(_playbook_cards_for_row(row, lookup=lookup))
 def render_scanner_tab(
     base_dir: str | Path,
     fallback_trade_date: str | None = None,
@@ -853,12 +965,14 @@ def render_scanner_tab(
             st.info("暂无回踩到位的预备标的。")
         else:
             st.dataframe(_prepare_watchlist_display(ready_df), width="stretch", hide_index=True)
+            _render_watchlist_playbooks(ready_df)
     with trigger_col:
         st.markdown(f"**再启动·触发今日（{len(trigger_df)}）**")
         if trigger_df.empty:
             st.info("暂无再启动触发标的。")
         else:
             st.dataframe(_prepare_watchlist_display(trigger_df), width="stretch", hide_index=True)
+            _render_watchlist_playbooks(trigger_df)
 
     with st.expander("查看全部沉淀名单", expanded=False):
         if watchlist_df.empty:

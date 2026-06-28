@@ -1,6 +1,6 @@
 # 规格：复盘笔记决策助手 —— 让每只候选票挂上「模式 + 案例 + 原文」（Phase K）
 
-状态：待实现（实现交给 Codex）
+状态：✅ 已完成（Codex 实现，Claude 验收：85 tests OK、6 卡四段化 + maps_to、案例来源 D 号全部真实对题、面板无技术词）
 作者：规划 by Claude
 前置：Phase I（漏斗双清单）已完成。本轮不改漏斗算法，只在它上面加一层"复盘笔记提示"。
 
@@ -110,4 +110,34 @@ J 是"验证漏斗准不准"的后台体检，不改变你每天看盘体验。�
 ---
 
 ## 7. 实现记录（Codex 填写）
-（待 Codex 实现后回填：卡片四段化清单、`maps_to` 覆盖、playbook 模块签名、测试数、lookup 冒烟输出。）
+
+完成时间：2026-06-28
+
+### K1 卡片四段化与 maps_to
+- 当前仓库实际存在 6 张 `knowledge/cards/setups/*.md` setup 卡，已全部统一为四段：`模式定义` / `看法` / `案例` / `原文`。规格中提到“7 张”，本次按实际文件库存全覆盖，没有新增占位卡。
+- `SET-long-leg-dip.md` 作为完整模板，映射：`[回踩到位, 再启动, second_launch]`。
+- `SET-trend-strong-leg.md` 映射：`[true_leader, trend_embryo]`。
+- `SET-launch-breakthrough.md` 映射：`[momentum_breakout, trend_embryo]`。
+- `SET-sector-resonance.md` 映射：`[rps_concept_top20, rps_stock_top20, true_leader]`。
+- `SET-relay-new-king.md` 映射：`[momentum_breakout, relay_new_king]`。
+- `SET-fanbao-low-odds.md` 映射：`[反包警示, momentum_breakout]`。
+- 未修改 `knowledge/_raw/`。
+
+### K2 playbook 模块
+- 新增 `mining/playbook.py`。
+- 暴露 `load_playbooks(cards_dir="knowledge/cards") -> dict`：解析 setup 卡 frontmatter 的 `maps_to` 与四段正文，返回 `cards`、`index`、`errors`。
+- 暴露 `lookup_playbook(state_or_scanner: str, cards_dir="knowledge/cards") -> list[dict]`：按状态或扫描器 ID 返回命中的结构化卡片；无命中返回 `[]`；坏卡跳过并计入 `errors`，不阻断面板。
+- 卡片为唯一文本源，代码只解析和索引，不复制卡片正文作为决策内容。
+
+### K3 挖掘面板接入
+- `mining/streamlit_tabs/tab_scanner.py` 接入 `lookup_playbook`。
+- Phase I 双清单中每个候选保留原表格展示，并新增逐行 `st.expander` 复盘笔记展开。
+- 每行按 `state` 与 `flag_strategies` 合并查卡，去重后渲染 `模式定义` / `看法` / `案例` / `原文`。
+- 空命中显示：`该状态暂无复盘笔记模式`。
+- UI 新增文案未使用 `edge`、`分位`、`基线`。
+
+### 测试与冒烟
+- `python -m py_compile mining/playbook.py mining/streamlit_tabs/tab_scanner.py`：通过。
+- `python -m unittest tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui`：75 tests OK。
+- `python -m unittest tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui tests.test_mining_evaluate`：85 tests OK。
+- lookup 冒烟：`lookup_playbook('回踩到位')` 命中 1 张卡，返回 `SET-long-leg-dip` 的 `模式定义`。

@@ -1,123 +1,122 @@
-# 选股系统下一步规格：前向漏斗留痕 + 兑现追踪（Phase J）
+# 规格：给漏斗做"前向体检" —— 每天留痕，事后看它说得准不准（Phase J）
 
 状态：待实现（实现交给 Codex）
 作者：规划 by Claude
-前置：`2026-06-28-watchlist-actionable-funnel.md`（Phase I）已完成，83 测试通过。漏斗已出 `state`（延伸中/回踩中/回踩到位/再启动/破位失效）+ `triage`。
-触发：用户选定方向「2a 前向漏斗留痕+兑现追踪」。
+前置：Phase I（漏斗双清单）、Phase K（复盘笔记决策助手）已完成。本轮不改漏斗算法，只在旁边加一层"留痕 + 事后对账"。
 
 ---
 
-## 0. 第一性原理：为什么是前向，不是回测
+## 0. 一句话：这个体检在帮你确认什么
 
-**已排除的死路（带证据，写死防反复）**：
-- 笔记是**方法论散文，非案例库**：母本 D0034 通篇讲逻辑（5日涨>13%/涨停≤1/同花顺指标），正文 0 股票代码；专栏复盘篇同样 0 代码。无可机械抽取的「代码+日期+结果」。
-- **本地无历史行情**：kline 仅覆盖 2025-10-23~2026-06-25；笔记是 2017–2023。历史案例即便抽出也无 K 线回放。
-- → "回测漏斗能否捞到哥点过的历史票"**数据上不可跑**，硬做即马后炮。
+漏斗现在每天给你「回踩到位·预备」「再启动·触发」这些判断，**但这些判断准不准，谁都没验证过**——里面的阈值（回撤多深算"到位"、缩量到多少、跌多少算"破位"）全是我拍脑袋设的默认值；`triage` 排序也只是号称"复核优先级"，到底和后续走势有没有关系，没人知道。
 
-**本轮要解决的真问题**：漏斗的 `state`/`triage` 现在是**未经检验的假设**——阈值（broken_pullback=−0.30、ready 带 [−0.25,−0.08]、shrink_max=0.7 等）全是拍脑袋默认值，`triage` 仅声称"复核优先级"、未验证是否真和走势相关。
+这个体检解决的就是这件事，办法是**"前向留痕、事后对账"**：
 
-**唯一诚实且可跑的验证 = 前向、样本外**：从今天起每日把漏斗的判断**在决策时刻快照**（含当时的 state/triage/特征/进场参考价），未来交易日到位后**再**回填真实走势。因为标签时刻早于结果时刻，**结构上不可能前视**，天然零马后炮。
+> - **今天**：漏斗一跑完，系统就把当天每只票的判断（什么状态、triage 多少、当时的缩量/回撤/价格）**原样拍照存下来**。
+> - **几天后**：等这些票真实走出来了，系统**回头记录它们实际涨跌**。
+> - **攒够样本后**：系统告诉你——"再启动"是不是真的比"回踩到位"更快上涨？triage 排在前面的票是不是真的走得更好？可动作的票是不是真的比"破位失效"的票强？
 
-**纪律护栏（沿用 Phase G edge 终判同款）**：
-- 比较口径**预先写死**（见 §4），样本未达门槛前一律判 `insufficient_sample`，不提前下结论。
-- 阈值/口径**不得事后回调**去凑好看。
-- 样本量如实报告，区分"已成熟/未成熟"快照。
+**为什么这样最诚实**：判断是今天存的、结果是以后才填的，**时间上不可能偷看未来**，所以天生没有"马后炮"。这是在现有数据下唯一能真验证漏斗的办法（历史回测此路不通，原因见下）。
 
-**边界**：不改任何 scanner 算法、默认参数、`universe.py`、`watchlist.py` 的状态机逻辑。本轮只**加一层留痕+兑现+读出**，复用既有前向收益与同票池基线，不造重复轮子。
+**为什么排在 K 后面**：这是**后台体检**，不改变你每天看盘的体验。先让系统每天真能帮到你（K），再回头确认它靠不靠谱（J）。先解渴，后体检。
 
 ---
 
-## 1. Phase J1：每日快照落盘（扩 `mining/watchlist.py` + 新表）
+## 1. 为什么只能前向、不能历史回测（写死防反复）
 
-新表 `watchlist_snapshots`（建在 `mining_mvp.db`，幂等）：
+两个硬阻断（都有证据）：
+1. **复盘笔记是方法论散文，不是案例数据库**：母本 D0034 通篇讲逻辑、正文 0 股票代码，专栏复盘篇同样 0 代码，没有可机械抽取的"代码+日期+结果"。
+2. **本地没有历史行情**：kline 只覆盖 2025-10~2026-06，笔记是 2017–2023，历史案例没有 K 线可回放。
+
+→ "回测漏斗能否捞到历史票"在数据上根本跑不了，硬做就是马后炮。**前向留痕是唯一诚实可跑的路径。**
+
+---
+
+## 2. 三条纪律（防止体检结果被人为做漂亮）
+
+1. **先写死"什么算好"，再攒数据**（见 §3 的三个问题），事后**不许回头改阈值/分桶**去凑好看的结论。
+2. **样本不够就老实说"样本不足"**，不提前下"有效/无效"的结论。
+3. **样本量如实报告**，区分"已经走完、可对账"的和"还没走完"的。
+
+---
+
+## 3. 攒够数据后，要回答的三个问题（预先写死，冻结）
+
+1. **"再启动"是不是比"回踩到位"更值得动手？** 带放量触发的"再启动"，后续 5 日内冲高比例、收益中位数，是否高于只是"回踩到位"的？（假设：放量触发 → 跟随更快。）
+2. **triage 排序到底有没有用？** 同一状态里，triage 排前 1/4 的票，后续收益是否真的高于排后 1/4 的？（现在只敢说它是"复核优先级"，这一问检验它是否**碰巧**真和走势相关——无论结果好坏都如实记，不回头调权重。）
+3. **漏斗的状态切分有没有区分度？** 可动作状态（回踩到位/再启动）后续冲高比例，是否既高于全市场同类票平均、又高于"破位失效"的票？（验证状态机不是白分的。）
+
+每个状态攒够约 150 个"已走完"样本前，一律标"样本不足"，不出结论。
+
+---
+
+## 4. 给 Codex 的实现细节（与上面分开，按需读）
+
+**J1 每日留痕 —— 扩 `mining/watchlist.py` + 新表 `watchlist_snapshots`（建在 `mining_mvp.db`）**
 
 | 列 | 含义 |
 |---|---|
-| snapshot_date TEXT | 决策日（= build_watchlist 的 trade_date）|
-| sec_code / sec_name TEXT | 标的 |
-| state TEXT | 五状态之一 |
-| triage REAL | 分诊分 |
-| entry_price REAL | **决策日收盘价**（前向收益基准）|
-| run_up_pct / shrink_ratio / ma_proximity / pullback_pct REAL | 决策上下文快照 |
-| reclaim_ma10 / vol_expand_up INTEGER | 触发上下文 |
-| flag_count / days_since_flag INTEGER, flag_strategies TEXT | 来源上下文 |
-| created_at TEXT | 写入时间 |
+| snapshot_date | 决策日（= build_watchlist 的 trade_date）|
+| sec_code / sec_name | 标的 |
+| state / triage | 漏斗状态 / 分诊分 |
+| entry_price | **决策日收盘价**（前向收益基准）|
+| run_up_pct / shrink_ratio / ma_proximity / pullback_pct | 决策上下文快照 |
+| reclaim_ma10 / vol_expand_up | 触发上下文（0/1）|
+| flag_count / days_since_flag / flag_strategies | 来源上下文 |
+| created_at | 写入时间 |
 
-主键 `(snapshot_date, sec_code, state)`，重跑同日用 `INSERT OR REPLACE` 幂等。
+- 主键 `(snapshot_date, sec_code, state)`，重跑同日用 `INSERT OR REPLACE` 幂等。
+- 新函数 `persist_watchlist_snapshot(conn, trade_date, params=None) -> int`：调 `build_watchlist(conn, trade_date, params=params)`，**持久化全部五状态**（不只可动作两栏——为验证"可动作状态是否真优于破位失效"留全样本），只存上表精简列，返回写入行数；缺收盘的行跳过并计数。
 
-新函数 `persist_watchlist_snapshot(conn, trade_date, params=None) -> int`：
-- 调 `build_watchlist(conn, trade_date, params=params)`，**持久化全部五状态**（不只可动作两栏）——为验证"状态机是否单调"（可动作状态是否真优于破位失效）留全样本。
-- 只存上表精简决策列，返回写入行数。
-- `entry_price` 取决策日该票收盘；缺收盘的行跳过并计数。
+**J2 事后对账 —— 扩 `mining/backtest.py`，复用现有前向收益逻辑**
 
-## 2. Phase J2：兑现回填（扩 `mining/backtest.py`，复用前向收益）
+- 现有 `backfill_outcomes` 里算 t1/t2/t5 收益、判 `status`（complete/partial/halted/delisted）的那段，**抽成共享助手** `_forward_bars(conn, sec_code, trade_date)`（或等价），`backfill_outcomes` 与新函数共用，**不复制粘贴**。
+- 新函数 `backfill_snapshot_outcomes(conn, ...)` + 新表 `watchlist_outcomes`，主键 `(snapshot_date, sec_code, state)`，列 `r1..r5, is_win, backfilled_at, status`，口径与现有 `outcomes` **完全一致**（r1=open_t1…r5=close_t5；is_win=(r2>0.02 and r3>−0.03)）。
+- 只对账**已走完**的快照（status=complete，即 t1/t2/t5 齐全）；未走完留 partial、下次再补。
+- mfe/mae/冲高命中率**不落库**，与 `evaluate.py` 一致在读出时算（避免口径分叉）。
 
-新函数 `backfill_snapshot_outcomes(conn, ...)`，**复用** `_compute_return` 与 t1/t2/t5 取 bar 逻辑（如有重复，抽 `_forward_bars(conn, sec_code, trade_date)` 共享助手，`backfill_outcomes` 与本函数共用，不复制粘贴）：
-- 新表 `watchlist_outcomes`，主键 `(snapshot_date, sec_code, state)`，列 `r1..r5, is_win, backfilled_at, status`，口径与现有 `outcomes` 完全一致（r1=open_t1…r5=close_t5；is_win=(r2>0.02 and r3>−0.03)）。
-- 只回填**已成熟**快照（snapshot_date 后已有 ≥5 个交易日 bar）；未成熟标 `status='pending'`，下次再补。
-- mfe/mae/discovery_hit **不落库**，与 evaluate.py 一致在读出时算（避免口径分叉）。
+**J3 接入日更 + 读出 —— `run_daily.py` + `mining/evaluate.py`**
 
-## 3. Phase J3：接入日更 + 读出报告
+- `run_daily.py`：在 `execute_daily_pipeline` 既有 `backfill_outcomes` 之后，追加 `persist_watchlist_snapshot(conn, resolved_trade_date)` 与 `backfill_snapshot_outcomes(conn)`；**包 try、失败只记日志不阻断主流程**（留痕是旁路）。
+- `mining/evaluate.py`：新增 `evaluate_watchlist_snapshots(conn, ...) -> DataFrame` + CLI `--snapshots`：
+  - 只统计**已走完**快照；**复用 `compute_baseline_universe`** 作同类票基线。
+  - 按 `state` 分组、并在每个 state 内按 `triage` 四分位分桶，输出 n、胜率、收益中位数、冲高命中率(mfe≥5%)、及各项 vs 基线的差。
+  - **最小样本门槛 `min_sample`（默认150）**：某 state 已走完样本不足 → 该 state 判 `insufficient_sample`，不出结论。
+  - 报告写 `output/`，表头注明"前向样本外、累积中"。
 
-**接入 `run_daily.py`**（在 `execute_daily_pipeline` 既有 `backfill_outcomes` 之后）：
-- 追加 `persist_watchlist_snapshot(conn, resolved_trade_date)` 与 `backfill_snapshot_outcomes(conn)`。
-- 失败不阻断主流程（漏斗留痕是旁路，包 try 记日志）。
-
-**读出 `mining/evaluate.py`** 新增 `evaluate_watchlist_snapshots(conn, ...) -> DataFrame` + CLI `--snapshots`：
-- 只统计**已成熟**快照（有 outcome）。
-- **复用 `compute_baseline_universe`** 作同票池基线。
-- 按 `state` 分组、并在每个 state 内按 `triage` 四分位分桶，输出：n、win_rate、median_r5、mfe_median、mae_median、discovery_hit，及各项 vs baseline_universe 的差。
-- **最小样本门槛**：每 state 已成熟样本 < `min_sample(默认150)` → 该 state 判 `insufficient_sample`，不出"有效/无效"结论。
-- 报告写 `output/`，文件名含区间；表头注明"前向样本外、当前为累积中"。
-
-## 4. 预先写死的校准问题（冻结，达样本量前不下结论）
-
-1. **再启动 vs 回踩到位**：再启动（带放量触发）的 t+5 discovery_hit 与 median_r5 是否高于回踩到位？（假设：放量触发→更近的跟随。）
-2. **triage 是否真有信息**：各 state 内 triage 顶 1/4 桶的 median_r5 是否高于底 1/4 桶？（当前只声称"复核排序"，本问检验它是否**意外地**与走势相关；无论结果都如实记，不回调权重。）
-3. **状态机是否单调**：可动作状态（回踩到位/再启动）的 discovery_hit 是否高于 baseline_universe，且高于破位失效？（验证状态切分有无区分度。）
-
-达 `min_sample` 前全判 `insufficient_sample`。结论出来后**不得事后改阈值/分桶**去凑。
-
----
-
-## 5. 交付顺序
-
-```
-J1 watchlist.py persist_watchlist_snapshot + 建表 + 测试
-J2 backtest.py backfill_snapshot_outcomes + 共享前向取 bar 助手 + 测试
-J3 run_daily 接入 + evaluate.py --snapshots 读出 + 预注册问题 + 测试
-```
-
-## 6. 测试
-
-- 落盘幂等：同日重跑不增行；entry_price=决策日收盘；全五状态都进表；缺收盘行被跳过计数。
-- 兑现口径平价：在合成 fixture 上 `backfill_snapshot_outcomes` 的 r1..r5/is_win 与 `backfill_outcomes` 同票同日逐值一致。
-- 不前视：outcome 只用 snapshot_date **之后**的 bar；未成熟快照标 pending、不误填。
+**测试**
+- 留痕幂等：同日重跑不增行；entry_price=决策日收盘；五状态都进表；缺收盘行被跳过计数。
+- 对账口径平价：合成 fixture 上 `backfill_snapshot_outcomes` 的 r1..r5/is_win 与 `backfill_outcomes` 同票同日逐值一致。
+- 不偷看未来：outcome 只用 snapshot_date **之后**的 bar；未走完快照标 partial、不误填。
 - 读出：按 state/triage 分桶聚合正确；样本 < min_sample 返回 `insufficient_sample`；空快照表安全返回。
-- 现有 83 测试保持全绿。
+- 现有 85 测试保持全绿。
 
-## 7. 验证命令
-
+**验证命令**
 ```powershell
 python -m unittest tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui tests.test_mining_evaluate
 python -m py_compile mining/watchlist.py mining/backtest.py mining/evaluate.py run_daily.py
 ```
-冒烟（首日预期 insufficient_sample，因无成熟样本）：
+冒烟（首日预期"样本不足"，因还没有走完的样本）：
 ```powershell
 python run_daily.py --trade-date 2026-06-25
 python -c "from mining.db import connect; from mining.evaluate import evaluate_watchlist_snapshots; print(evaluate_watchlist_snapshots(connect(base_dir='.')))"
 ```
 
-## 8. 约束
-
-- 不改 scanner 算法/默认参数/`universe.py`/状态机逻辑。
-- 复用 `_compute_return`/前向取 bar 与 `compute_baseline_universe`，不复制。
+**约束**
+- 不改 scanner 算法/默认参数/`universe.py`/漏斗状态机逻辑。
+- 复用 `_forward_bars`/前向收益与 `compute_baseline_universe`，不复制。
 - 比较口径预注册、冻结，样本不足判 `insufficient_sample`，不事后回调。
 - 向量化优先；旁路失败不阻断日更主流程。
 - 编辑前 `git status --short`，勿回退无关改动；不提交 `knowledge/_raw/`。
 
 ---
 
-## 9. 实现记录（Codex 填写）
+## 5. 交付顺序
+```
+J1 watchlist.py persist_watchlist_snapshot + 建表 + 测试
+J2 backtest.py 抽 _forward_bars 共享助手 + backfill_snapshot_outcomes + 测试
+J3 run_daily 接入 + evaluate.py --snapshots 读出 + 测试
+```
 
+## 6. 实现记录（Codex 填写）
 （待 Codex 实现后回填：建表/函数签名、测试数、首日冒烟输出、样本累积说明。）

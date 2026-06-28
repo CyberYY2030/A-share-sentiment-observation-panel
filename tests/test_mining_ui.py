@@ -1116,5 +1116,87 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertFalse(any("edge" in str(column).lower() for column in display.columns))
         self.assertAlmostEqual(display.iloc[0]["原始强度%"], 20.0)
         self.assertAlmostEqual(display.iloc[0]["峰值回撤%"], -12.0)
+
+    def test_playbook_loader_indexes_maps_and_sections_safely(self) -> None:
+        from mining.playbook import load_playbooks, lookup_playbook
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cards_dir = Path(tmp) / "cards"
+            setup_dir = cards_dir / "setups"
+            setup_dir.mkdir(parents=True)
+            (setup_dir / "SET-demo.md").write_text(
+                """---
+id: SET-demo
+type: setup
+title: Demo Card
+source_docs: [D0001]
+maps_to: [回踩到位, second_launch]
+---
+
+## 模式定义
+Demo definition
+
+## 看法
+- 买点：Demo buy
+- 确认信号：Demo confirm
+- 放弃信号：Demo stop
+
+## 案例
+- Demo case
+
+## 原文
+- D0001
+""",
+                encoding="utf-8",
+            )
+            (setup_dir / "SET-missing.md").write_text(
+                """---
+id: SET-missing
+type: setup
+title: Missing Sections
+maps_to: [trend_embryo]
+---
+
+## 模式定义
+Only definition
+""",
+                encoding="utf-8",
+            )
+            (setup_dir / "BROKEN.md").write_bytes(b"\xff\xfe\x00")
+
+            loaded = load_playbooks(cards_dir)
+            state_hits = lookup_playbook("回踩到位", cards_dir)
+            scanner_hits = lookup_playbook("second_launch", cards_dir)
+            no_hits = lookup_playbook("不存在", cards_dir)
+
+        self.assertEqual(loaded["errors"], 1)
+        self.assertIn("回踩到位", loaded["index"])
+        self.assertEqual(state_hits[0]["id"], "SET-demo")
+        self.assertEqual(scanner_hits[0]["模式定义"], "Demo definition")
+        self.assertIn("Demo confirm", scanner_hits[0]["看法"])
+        self.assertEqual(no_hits, [])
+        missing = loaded["index"]["trend_embryo"][0]
+        self.assertEqual(missing["案例"], "")
+        self.assertEqual(missing["原文"], "")
+
+    def test_playbook_row_lookup_merges_state_and_scanner_cards(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _playbook_cards_for_row, _playbook_empty_message
+
+        cards_by_key = {
+            "回踩到位": [{"id": "SET-ready", "模式定义": "ready", "看法": "view", "案例": "case", "原文": "D1"}],
+            "second_launch": [{"id": "SET-ready", "模式定义": "ready", "看法": "view", "案例": "case", "原文": "D1"}],
+            "true_leader": [{"id": "SET-leader", "模式定义": "leader", "看法": "view", "案例": "case", "原文": "D2"}],
+        }
+
+        def fake_lookup(key: str) -> list[dict[str, object]]:
+            return cards_by_key.get(key, [])
+
+        row = {"state": "回踩到位", "flag_strategies": "second_launch, true_leader"}
+        cards = _playbook_cards_for_row(row, lookup=fake_lookup)
+        empty_cards = _playbook_cards_for_row({"state": "延伸中", "flag_strategies": ""}, lookup=fake_lookup)
+
+        self.assertEqual([card["id"] for card in cards], ["SET-ready", "SET-leader"])
+        self.assertEqual(empty_cards, [])
+        self.assertEqual(_playbook_empty_message(), "该状态暂无复盘笔记模式")
 if __name__ == "__main__":
     unittest.main()
