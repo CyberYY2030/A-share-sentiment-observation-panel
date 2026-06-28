@@ -1,0 +1,1120 @@
+import unittest
+import tempfile
+from pathlib import Path
+import sqlite3
+import datetime as dt
+import time
+from unittest import mock
+
+import pandas as pd
+
+from tests._mining_test_helpers import create_sample_market_dbs, trading_days
+
+
+class MiningUiSmokeTests(unittest.TestCase):
+    def test_streamlit_tab_helpers_import(self) -> None:
+        from mining.streamlit_tabs import (
+            render_review_tab,
+            render_rps_tab,
+            render_scanner_tab,
+        )
+
+        self.assertTrue(callable(render_scanner_tab))
+        self.assertTrue(callable(render_rps_tab))
+        self.assertTrue(callable(render_review_tab))
+
+    def test_opportunity_panel_loaders_return_today_and_yesterday_sections(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import (
+            load_latest_opportunities,
+            load_previous_day_followups,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+
+            today_df, today_date = load_latest_opportunities(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+            )
+            follow_df, previous_date, current_date = load_previous_day_followups(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+            )
+
+        self.assertEqual(today_date, dates["next_trade_date"])
+        self.assertIn("strategy_id", today_df.columns)
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertEqual(current_date, dates["next_trade_date"])
+        self.assertFalse(follow_df.empty)
+        self.assertIn("today_change_pct", follow_df.columns)
+
+    def test_opportunity_panel_uses_intraday_snapshot_for_today_and_followups(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import (
+            load_latest_opportunities,
+            load_previous_day_followups,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            snapshot_today = dates["next_trade_date"]
+
+            def fake_snapshot_loader() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 16.8,
+                            "pre_close": 15.6,
+                            "open": 16.0,
+                            "high": 18.1,
+                            "low": 15.9,
+                            "volume": 12_000_000,
+                            "amount": 2_100_000_000,
+                            "change_pct": (16.8 / 15.6 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "300001",
+                            "close": 27.8,
+                            "pre_close": 25.3,
+                            "open": 26.2,
+                            "high": 29.5,
+                            "low": 26.1,
+                            "volume": 15_000_000,
+                            "amount": 2_300_000_000,
+                            "change_pct": (27.8 / 25.3 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "600003",
+                            "close": 31.2,
+                            "pre_close": 31.02,
+                            "open": 31.05,
+                            "high": 31.3,
+                            "low": 30.9,
+                            "volume": 8_000_000,
+                            "amount": 950_000_000,
+                            "change_pct": (31.2 / 31.02 - 1.0) * 100.0,
+                        },
+                    ]
+                )
+
+            today_df, today_date = load_latest_opportunities(
+                base_dir=base,
+                trade_date=snapshot_today,
+                use_intraday=True,
+                snapshot_loader=fake_snapshot_loader,
+            )
+            follow_df, previous_date, current_date = load_previous_day_followups(
+                base_dir=base,
+                trade_date=snapshot_today,
+                use_intraday=True,
+                snapshot_loader=fake_snapshot_loader,
+            )
+
+        self.assertEqual(today_date, snapshot_today)
+        self.assertFalse(today_df.empty)
+        self.assertIn("600001", set(today_df["sec_code"]))
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertEqual(current_date, snapshot_today)
+        self.assertFalse(follow_df.empty)
+        alpha = follow_df[follow_df["sec_code"] == "600001"].iloc[0]
+        self.assertAlmostEqual(alpha["today_change_pct"], (16.8 / 15.6 - 1.0) * 100.0, places=4)
+
+    def test_opportunity_panel_prefers_latest_quotes_outside_trading_hours(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import (
+            load_latest_opportunities,
+            load_previous_day_followups,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            latest_quote_date = "2026-04-13"
+            stock_conn = sqlite3.connect(base / "a_share_mvp.db")
+            try:
+                stock_conn.execute(
+                    """
+                    DELETE FROM kline_daily
+                    WHERE sec_type IN ('stock', 'index') AND trade_date > ?
+                    """,
+                    (dates["target_trade_date"],),
+                )
+                stock_conn.commit()
+            finally:
+                stock_conn.close()
+
+            def fake_latest_quotes() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 16.3,
+                            "pre_close": 15.6,
+                            "open": 15.8,
+                            "high": 16.6,
+                            "low": 15.7,
+                            "volume": 11_000_000,
+                            "amount": 1_900_000_000,
+                            "change_pct": (16.3 / 15.6 - 1.0) * 100.0,
+                        }
+                    ]
+                )
+
+            today_df, today_date = load_latest_opportunities(
+                base_dir=base,
+                trade_date=latest_quote_date,
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                snapshot_loader=fake_latest_quotes,
+            )
+            follow_df, previous_date, current_date = load_previous_day_followups(
+                base_dir=base,
+                trade_date=latest_quote_date,
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                snapshot_loader=fake_latest_quotes,
+            )
+
+        self.assertEqual(today_date, latest_quote_date)
+        self.assertFalse(today_df.empty)
+        self.assertEqual(current_date, latest_quote_date)
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertFalse(follow_df.empty)
+
+    def test_after_close_prefers_latest_close_data_over_quotes_when_close_is_available(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import (
+            load_latest_opportunities,
+            load_previous_day_followups,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+
+            def fake_latest_quotes() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 99.9,
+                            "pre_close": 15.6,
+                            "open": 99.9,
+                            "high": 99.9,
+                            "low": 99.9,
+                            "volume": 0,
+                            "amount": 0,
+                            "change_pct": 0.0,
+                        }
+                    ]
+                )
+
+            today_df, today_date = load_latest_opportunities(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                fallback_trade_date=dates["next_trade_date"],
+                snapshot_loader=fake_latest_quotes,
+            )
+            follow_df, previous_date, current_date = load_previous_day_followups(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                fallback_trade_date=dates["next_trade_date"],
+                snapshot_loader=fake_latest_quotes,
+            )
+
+        self.assertEqual(today_date, dates["next_trade_date"])
+        self.assertFalse(today_df.empty)
+        self.assertIn("rps_stock_top20", set(today_df["strategy_id"]))
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertEqual(current_date, dates["next_trade_date"])
+        self.assertFalse(follow_df.empty)
+        self.assertEqual(set(follow_df["status"]), {"日线收盘"})
+
+    def test_force_latest_quotes_uses_quotes_even_when_close_is_available(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs import tab_scanner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+
+            def fake_latest_quotes() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 16.8,
+                            "pre_close": 15.6,
+                            "open": 16.0,
+                            "high": 18.1,
+                            "low": 15.9,
+                            "volume": 12_000_000,
+                            "amount": 2_100_000_000,
+                            "change_pct": (16.8 / 15.6 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "300001",
+                            "close": 27.8,
+                            "pre_close": 25.3,
+                            "open": 26.2,
+                            "high": 29.5,
+                            "low": 26.1,
+                            "volume": 15_000_000,
+                            "amount": 2_300_000_000,
+                            "change_pct": (27.8 / 25.3 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "600003",
+                            "close": 31.2,
+                            "pre_close": 31.02,
+                            "open": 31.05,
+                            "high": 31.3,
+                            "low": 30.9,
+                            "volume": 8_000_000,
+                            "amount": 950_000_000,
+                            "change_pct": (31.2 / 31.02 - 1.0) * 100.0,
+                        },
+                    ]
+                )
+
+            with mock.patch.object(
+                tab_scanner,
+                "_load_close_opportunities",
+                side_effect=AssertionError("force_latest_quotes should not fall back to close data"),
+            ):
+                today_df, today_date = tab_scanner.load_latest_opportunities(
+                    base_dir=base,
+                    trade_date=dates["next_trade_date"],
+                    use_intraday=False,
+                    prefer_latest_quotes=True,
+                    force_latest_quotes=True,
+                    fallback_trade_date=dates["next_trade_date"],
+                    snapshot_loader=fake_latest_quotes,
+                )
+            follow_df, previous_date, current_date = tab_scanner.load_previous_day_followups(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                force_latest_quotes=True,
+                fallback_trade_date=dates["next_trade_date"],
+                snapshot_loader=fake_latest_quotes,
+            )
+
+        self.assertEqual(today_date, dates["next_trade_date"])
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertEqual(current_date, dates["next_trade_date"])
+        self.assertFalse(follow_df.empty)
+        self.assertEqual(set(follow_df["status"]), {"最新价格"})
+
+    def test_intraday_momentum_prefilter_limits_history_lookup_codes(self) -> None:
+        import pandas as pd
+
+        from mining.scanners import momentum_breakout
+        from mining.streamlit_tabs import tab_scanner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            original_loader = momentum_breakout._load_stock_history
+            requested_codes: list[set[str]] = []
+
+            def fake_latest_quotes() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 16.8,
+                            "pre_close": 15.6,
+                            "open": 16.0,
+                            "high": 18.1,
+                            "low": 15.9,
+                            "volume": 12_000_000,
+                            "amount": 2_100_000_000,
+                            "change_pct": (16.8 / 15.6 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "300001",
+                            "close": 27.8,
+                            "pre_close": 25.3,
+                            "open": 26.2,
+                            "high": 29.5,
+                            "low": 26.1,
+                            "volume": 15_000_000,
+                            "amount": 2_300_000_000,
+                            "change_pct": (27.8 / 25.3 - 1.0) * 100.0,
+                        },
+                        {
+                            "code": "600003",
+                            "close": 31.2,
+                            "pre_close": 31.02,
+                            "open": 31.05,
+                            "high": 31.3,
+                            "low": 30.9,
+                            "volume": 8_000_000,
+                            "amount": 950_000_000,
+                            "change_pct": (31.2 / 31.02 - 1.0) * 100.0,
+                        },
+                    ]
+                )
+
+            def recording_loader(conn, sec_codes, dates_arg):
+                requested_codes.append(set(sec_codes))
+                return original_loader(conn, sec_codes, dates_arg)
+
+            with mock.patch.object(
+                momentum_breakout,
+                "_load_stock_history",
+                side_effect=recording_loader,
+            ):
+                today_df, today_date = tab_scanner.load_latest_opportunities(
+                    base_dir=base,
+                    trade_date=dates["next_trade_date"],
+                    use_intraday=True,
+                    snapshot_loader=fake_latest_quotes,
+                )
+
+        self.assertEqual(today_date, dates["next_trade_date"])
+        self.assertFalse(today_df.empty)
+        self.assertTrue(requested_codes)
+        self.assertEqual(requested_codes[0], {"600001", "300001"})
+
+    def test_intraday_momentum_prefilter_excludes_weak_shadow_pullback(self) -> None:
+        from mining.scanners.momentum_breakout import MomentumBreakoutScanner
+        from mining.streamlit_tabs.tab_scanner import _prefilter_momentum_universe
+
+        params = MomentumBreakoutScanner().params.copy()
+        params["early_strength_upper_shadow_min"] = 99.0
+        universe = pd.DataFrame(
+            [
+                {
+                    "sec_code": "600010",
+                    "sec_name": "Mild Pullback",
+                    "open": 10.0,
+                    "high": 11.0,
+                    "close": 10.4,
+                    "amount": 2_000_000_000,
+                    "change_pct": -2.5,
+                },
+                {
+                    "sec_code": "600011",
+                    "sec_name": "Weak Pullback",
+                    "open": 10.0,
+                    "high": 11.0,
+                    "close": 10.4,
+                    "amount": 2_000_000_000,
+                    "change_pct": -3.5,
+                },
+            ]
+        )
+
+        filtered = _prefilter_momentum_universe(universe, params)
+
+        self.assertEqual(set(filtered["sec_code"]), {"600010"})
+    def test_latest_quote_price_map_filters_to_requested_codes(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import _load_latest_quote_price_map
+
+        def fake_latest_quotes() -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {"code": "600001", "close": 16.8},
+                    {"code": "300001", "close": 27.8},
+                    {"code": "600003", "close": 31.2},
+                ]
+            )
+
+        prices = _load_latest_quote_price_map(
+            snapshot_loader=fake_latest_quotes,
+            sec_codes=["600001"],
+        )
+
+        self.assertEqual(prices, {"600001": 16.8})
+
+    def test_prepare_today_display_tolerates_legacy_rows_without_new_fields(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import _prepare_today_display
+
+        legacy_df = pd.DataFrame(
+            [
+                {
+                    "strategy_id": "momentum_breakout",
+                    "sec_code": "300001",
+                    "sec_name": "Legacy",
+                    "rank": 1,
+                    "change_pct": 6.5,
+                }
+            ]
+        )
+
+        display_df = _prepare_today_display(legacy_df)
+
+        self.assertEqual(
+            list(display_df.columns),
+            ["来源", "排名", "代码", "名称", "涨幅%", "最高比开盘%", "最高比收盘%", "强度分", "路径"],
+        )
+        self.assertEqual(display_df.iloc[0]["来源"], "异动")
+        self.assertTrue(pd.isna(display_df.iloc[0]["最高比开盘%"]))
+        self.assertTrue(pd.isna(display_df.iloc[0]["最高比收盘%"]))
+
+    def test_persisted_scanner_display_includes_new_strategy_labels(self) -> None:
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _load_persisted_candidates, _prepare_today_display
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            trade_date = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO strategy_runs (
+                      run_id, strategy_id, version, trade_date, run_at, universe_size,
+                      n_candidates, status, error_msg
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (1, "manual", "v1.0", trade_date, "2026-04-10 00:00:00", 4, 4, "ok", None),
+                )
+                rows = [
+                    ("momentum_breakout", "600001", "Alpha", 1),
+                    ("rps_stock_top20", "300001", "Beta", 2),
+                    ("trend_embryo", "601001", "Embryo", 3),
+                    ("true_leader", "600003", "Leader", 4),
+                    ("second_launch", "600005", "Second", 5),
+                ]
+                for strategy_id, sec_code, sec_name, rank in rows:
+                    conn.execute(
+                        """
+                        INSERT INTO candidates (
+                          run_id, strategy_id, version, trade_date, sec_type, sec_code,
+                          sec_name, entry_price, features_json, rank
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (1, strategy_id, "v1.0", trade_date, "stock", sec_code, sec_name, 10.0, "{}", rank),
+                    )
+                conn.commit()
+
+                loaded = _load_persisted_candidates(conn, trade_date)
+            finally:
+                conn.close()
+
+        self.assertEqual(
+            set(loaded["strategy_id"]),
+            {"momentum_breakout", "rps_stock_top20", "trend_embryo", "true_leader", "second_launch"},
+        )
+        display = _prepare_today_display(loaded)
+        self.assertIn("强趋势胚子", set(display["来源"]))
+        self.assertIn("真龙/中军", set(display["来源"]))
+        self.assertIn("二次启动低吸", set(display["来源"]))
+    def test_last_completed_trade_date_before_open_returns_previous_trade_day(self) -> None:
+        from app_panel import last_completed_trade_date_cn
+
+        result = last_completed_trade_date_cn(dt.datetime(2026, 4, 14, 8, 47, 56), 8)
+
+        self.assertEqual(result.strftime("%Y-%m-%d"), "2026-04-13")
+
+    def test_opportunity_plan_uses_previous_day_before_open(self) -> None:
+        from app_panel import resolve_opportunity_runtime
+
+        plan = resolve_opportunity_runtime(dt.datetime(2026, 4, 14, 9, 10, 0), 8)
+
+        self.assertEqual(plan["trade_date"], "2026-04-13")
+        self.assertEqual(plan["fallback_trade_date"], "2026-04-13")
+        self.assertFalse(plan["force_latest_quotes"])
+        self.assertFalse(plan["use_intraday"])
+
+    def test_opportunity_plan_uses_today_quotes_after_open_and_after_close(self) -> None:
+        from app_panel import resolve_opportunity_runtime
+
+        trading_plan = resolve_opportunity_runtime(dt.datetime(2026, 4, 14, 10, 5, 0), 8)
+        after_close_plan = resolve_opportunity_runtime(dt.datetime(2026, 4, 14, 15, 10, 0), 8)
+
+        self.assertEqual(trading_plan["trade_date"], "2026-04-14")
+        self.assertTrue(trading_plan["force_latest_quotes"])
+        self.assertTrue(trading_plan["use_intraday"])
+        self.assertEqual(after_close_plan["trade_date"], "2026-04-14")
+        self.assertTrue(after_close_plan["force_latest_quotes"])
+        self.assertFalse(after_close_plan["use_intraday"])
+
+    def test_call_with_timeout_returns_none_quickly_for_slow_probe(self) -> None:
+        from app_panel import _call_with_timeout
+
+        started = time.time()
+        result = _call_with_timeout(0.05, time.sleep, 0.2)
+        elapsed = time.time() - started
+
+        self.assertIsNone(result)
+        self.assertLess(elapsed, 0.2)
+
+    def test_discover_data_dates_bundle_keeps_source_t1_when_local_db_lags(self) -> None:
+        from app_panel import discover_data_dates_bundle
+
+        discover_data_dates_bundle.clear()
+        try:
+            with mock.patch(
+                "app_panel.last_completed_trade_date_cn",
+                return_value=pd.Timestamp("2026-04-22"),
+            ), mock.patch(
+                "app_panel.get_prev_trade_days",
+                return_value=["2026-04-22", "2026-04-21", "2026-04-20"],
+            ) as prev_days:
+                bundle = discover_data_dates_bundle(
+                    None,
+                    8,
+                    local_last_dates={
+                        "stock": "2026-04-21",
+                        "index": "2026-04-21",
+                        "concept": "2026-04-21",
+                        "etf": "2026-04-21",
+                    },
+                )
+        finally:
+            discover_data_dates_bundle.clear()
+
+        self.assertEqual(bundle["calendar_last_trade_day"], "2026-04-22")
+        self.assertEqual(bundle["remote_latest_stock_close_day"], "2026-04-22")
+        self.assertEqual(bundle["remote_latest_concept_close_day"], "2026-04-22")
+        self.assertEqual(bundle["t1_close_day"], "2026-04-22")
+        self.assertEqual(bundle["t2_close_day"], "2026-04-21")
+        prev_days.assert_called_once_with("2026-04-22", n_back=2)
+
+    def test_panel_close_date_is_not_downgraded_by_concept_lag(self) -> None:
+        from app_panel import resolve_panel_close_date
+
+        panel_dt = resolve_panel_close_date(
+            requested_close_day="2026-04-22",
+            close_ref_day="2026-04-22",
+            stock_day="2026-04-22",
+            index_day="2026-04-22",
+            concept_day="2026-04-21",
+        )
+
+        self.assertEqual(panel_dt, pd.Timestamp("2026-04-22"))
+
+    def test_panel_close_date_falls_back_when_stock_or_index_lags(self) -> None:
+        from app_panel import resolve_panel_close_date
+
+        panel_dt = resolve_panel_close_date(
+            requested_close_day="2026-04-22",
+            close_ref_day="2026-04-22",
+            stock_day="2026-04-21",
+            index_day="2026-04-22",
+            concept_day="2026-04-22",
+        )
+
+        self.assertEqual(panel_dt, pd.Timestamp("2026-04-21"))
+
+    def test_panel_close_date_uses_actual_stock_index_coverage_not_latest_date(self) -> None:
+        from app_panel import resolve_available_panel_close_date
+
+        stock_df = pd.DataFrame(
+            {
+                "trade_date": pd.to_datetime(["2026-04-21", "2026-04-23"]),
+                "sec_code": ["600001", "600001"],
+            }
+        )
+        index_df = pd.DataFrame(
+            [
+                {"trade_date": "2026-04-21", "sec_code": code}
+                for code in ("000001", "399001", "000300", "000852")
+            ]
+            + [
+                {"trade_date": "2026-04-23", "sec_code": code}
+                for code in ("000001", "399001", "000300", "000852")
+            ]
+        )
+
+        resolved, missing_requested, available = resolve_available_panel_close_date(
+            "2026-04-22",
+            stock_df,
+            index_df,
+            ["000001", "399001", "000300", "000852"],
+        )
+
+        self.assertEqual(resolved, pd.Timestamp("2026-04-21"))
+        self.assertTrue(missing_requested)
+        self.assertEqual(available, [pd.Timestamp("2026-04-21"), pd.Timestamp("2026-04-23")])
+
+    def test_close_mode_opportunity_runtime_follows_selected_close_day(self) -> None:
+        from app_panel import resolve_selected_opportunity_runtime
+
+        plan = resolve_selected_opportunity_runtime(
+            effective_mode="close",
+            panel_close_dt=pd.Timestamp("2026-04-21"),
+            now_cn=dt.datetime(2026, 4, 23, 10, 5, 0),
+            tz_offset_hours=8,
+        )
+
+        self.assertEqual(plan["trade_date"], "2026-04-21")
+        self.assertEqual(plan["fallback_trade_date"], "2026-04-21")
+        self.assertFalse(plan["force_latest_quotes"])
+        self.assertFalse(plan["use_intraday"])
+
+    def test_snapshot_close_catchup_is_allowed_before_open_for_previous_close(self) -> None:
+        from app_panel import can_use_snapshot_for_close_target
+
+        with mock.patch(
+            "app_panel._today_trade_date_cn",
+            return_value=pd.Timestamp("2026-04-23"),
+        ), mock.patch(
+            "app_panel.last_completed_trade_date_cn",
+            return_value=pd.Timestamp("2026-04-22"),
+        ):
+            allowed = can_use_snapshot_for_close_target(
+                "2026-04-22",
+                now_cn=dt.datetime(2026, 4, 23, 8, 55, 0),
+                tz_offset_hours=8,
+            )
+
+        self.assertTrue(allowed)
+
+    def test_snapshot_close_catchup_does_not_backfill_yesterday_after_open(self) -> None:
+        from app_panel import can_use_snapshot_for_close_target
+
+        with mock.patch(
+            "app_panel._today_trade_date_cn",
+            return_value=pd.Timestamp("2026-04-23"),
+        ), mock.patch(
+            "app_panel.last_completed_trade_date_cn",
+            return_value=pd.Timestamp("2026-04-22"),
+        ):
+            allowed = can_use_snapshot_for_close_target(
+                "2026-04-22",
+                now_cn=dt.datetime(2026, 4, 23, 9, 35, 0),
+                tz_offset_hours=8,
+            )
+
+        self.assertFalse(allowed)
+
+    def test_full_snapshot_normalization_excludes_non_shenzhen_shanghai_a_shares(self) -> None:
+        from app_panel import normalize_a_spot_df_full
+
+        raw = pd.DataFrame(
+            [
+                {"代码": "bj920000", "最新价": 16.73, "昨收": 16.66, "今开": 16.77, "最高": 16.82, "最低": 16.52, "成交量": 10, "成交额": 100, "涨跌幅": 0.42},
+                {"代码": "sh600001", "最新价": 8.2, "昨收": 8.0, "今开": 8.1, "最高": 8.5, "最低": 8.0, "成交量": 20, "成交额": 200, "涨跌幅": 2.5},
+                {"代码": "sz300001", "最新价": 12.1, "昨收": 12.0, "今开": 12.0, "最高": 12.4, "最低": 11.9, "成交量": 30, "成交额": 300, "涨跌幅": 0.83},
+            ]
+        )
+
+        normalized, _ = normalize_a_spot_df_full(raw)
+
+        self.assertEqual(set(normalized["sec_code"]), {"600001", "300001"})
+
+    def test_target_close_backfill_uses_snapshot_instead_of_slow_daily_backfill(self) -> None:
+        from app_panel import maybe_backfill_to_close_day
+
+        local_before = {"stock": "2026-04-21", "index": "2026-04-21", "concept": "2026-04-22", "etf": "2026-04-21"}
+        local_after = {"stock": "2026-04-22", "index": "2026-04-22", "concept": "2026-04-22", "etf": "2026-04-21"}
+        with mock.patch("app_panel.can_use_snapshot_for_close_target", return_value=True), mock.patch(
+            "app_panel.sync_close_snapshot_to_db_for_trade_date",
+            return_value=(True, ["snapshot ok"]),
+        ) as snapshot_sync, mock.patch(
+            "app_panel.get_local_last_dates",
+            return_value=local_after,
+        ), mock.patch(
+            "app_panel.run_cmd",
+            side_effect=AssertionError("startup catch-up must not run slow BaoStock backfill"),
+        ):
+            result, logs = maybe_backfill_to_close_day(
+                stock_db="a_share_mvp.db",
+                concept_db=None,
+                etf_db=None,
+                target_day="2026-04-22",
+                local_dates=local_before,
+                include_concept=False,
+                include_etf=False,
+            )
+
+        self.assertEqual(result, local_after)
+        snapshot_sync.assert_called_once()
+        self.assertTrue(any("[TARGET_STOCK_SNAPSHOT]" in line for line in logs))
+
+    def test_close_snapshot_sync_writes_target_day_stock_and_index_rows(self) -> None:
+        from app_panel import sync_close_snapshot_to_db_for_trade_date
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            stock_db = str(base / "a_share_mvp.db")
+            stock_codes = [f"sh600{idx:03d}" for idx in range(1000)]
+            stock_codes.extend(f"sh601{idx:03d}" for idx in range(1000))
+            stock_codes.append("sh603000")
+            stock_rows = [
+                {
+                    "代码": code,
+                    "名称": f"Stock{idx}",
+                    "最新价": 10.0 + idx / 1000,
+                    "昨收": 9.9 + idx / 1000,
+                    "今开": 10.0,
+                    "最高": 10.4,
+                    "最低": 9.8,
+                    "成交量": 1_000_000 + idx,
+                    "成交额": 100_000_000 + idx,
+                    "涨跌幅": 1.0,
+                }
+                for idx, code in enumerate(stock_codes)
+            ]
+            stock_rows.append(
+                {"代码": "bj920000", "名称": "BJ", "最新价": 16.0, "昨收": 15.8, "今开": 16.0, "最高": 16.2, "最低": 15.7, "成交量": 1, "成交额": 1, "涨跌幅": 1.0}
+            )
+            index_rows = pd.DataFrame(
+                [
+                    {"代码": "000001", "最新价": 4100, "昨收": 4090, "成交额": 100_000_000_000, "涨跌幅": 0.24},
+                    {"代码": "399001", "最新价": 15000, "昨收": 14900, "成交额": 120_000_000_000, "涨跌幅": 0.67},
+                    {"代码": "000300", "最新价": 4800, "昨收": 4790, "成交额": 80_000_000_000, "涨跌幅": 0.21},
+                    {"代码": "000852", "最新价": 8400, "昨收": 8390, "成交额": 70_000_000_000, "涨跌幅": 0.12},
+                ]
+            )
+
+            with mock.patch("app_panel.ak_fetch_a_spot_sina", return_value=pd.DataFrame(stock_rows)), mock.patch(
+                "app_panel.ak_fetch_index_spot_sina",
+                return_value=index_rows,
+            ):
+                ok, logs = sync_close_snapshot_to_db_for_trade_date(
+                    stock_db=stock_db,
+                    concept_db=None,
+                    trade_date="2026-04-22",
+                    include_concept=False,
+                )
+
+            conn = sqlite3.connect(stock_db)
+            try:
+                stock_count = conn.execute(
+                    "SELECT COUNT(*) FROM kline_daily WHERE sec_type='stock' AND trade_date='2026-04-22'"
+                ).fetchone()[0]
+                bj_count = conn.execute(
+                    "SELECT COUNT(*) FROM kline_daily WHERE sec_type='stock' AND trade_date='2026-04-22' AND sec_code='920000'"
+                ).fetchone()[0]
+                index_count = conn.execute(
+                    "SELECT COUNT(*) FROM kline_daily WHERE sec_type='index' AND trade_date='2026-04-22'"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertTrue(ok, logs)
+        self.assertEqual(stock_count, 2001)
+        self.assertEqual(bj_count, 0)
+        self.assertEqual(index_count, 4)
+
+    def test_close_history_is_persisted_for_review_when_db_has_close_days(self) -> None:
+        import sqlite3
+
+        from mining.streamlit_tabs.tab_scanner import ensure_close_history_persisted
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+
+            result = ensure_close_history_persisted(base_dir=base, up_to_trade_date=dates["target_trade_date"])
+
+            conn = sqlite3.connect(base / "mining_mvp.db")
+            try:
+                latest = conn.execute(
+                    """
+                    SELECT MAX(trade_date)
+                    FROM candidates
+                    WHERE strategy_id IN ('momentum_breakout', 'rps_stock_top20')
+                    """
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(latest, dates["target_trade_date"])
+        self.assertEqual(result["latest_persisted"], dates["target_trade_date"])
+
+    def test_daily_sync_also_pushes_new_close_day_into_mining_history(self) -> None:
+        import sqlite3
+
+        from app_panel import sync_mining_history_after_close_update
+        from mining.streamlit_tabs.tab_scanner import ensure_close_history_persisted
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            ensure_close_history_persisted(base_dir=base, up_to_trade_date=dates["target_trade_date"])
+
+            result = sync_mining_history_after_close_update(
+                base_dir=str(base),
+                up_to_trade_date=dates["next_trade_date"],
+            )
+
+            conn = sqlite3.connect(base / "mining_mvp.db")
+            try:
+                latest = conn.execute(
+                    """
+                    SELECT MAX(trade_date)
+                    FROM candidates
+                    WHERE strategy_id IN ('momentum_breakout', 'rps_stock_top20')
+                    """
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(latest, dates["next_trade_date"])
+        self.assertIn(dates["next_trade_date"], result["processed"])
+        self.assertEqual(result["latest_persisted"], dates["next_trade_date"])
+
+    def test_close_history_sync_only_processes_recent_tail_gaps(self) -> None:
+        from run_daily import execute_daily_pipeline
+        from mining.streamlit_tabs.tab_scanner import ensure_close_history_persisted
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            execute_daily_pipeline(
+                base_dir=base,
+                trade_date=dates["target_trade_date"],
+                refresh=False,
+                emit_reports=False,
+            )
+
+            result = ensure_close_history_persisted(
+                base_dir=base,
+                up_to_trade_date=dates["t_plus_2"],
+                limit=3,
+            )
+
+        self.assertEqual(result["processed"], [dates["next_trade_date"], dates["t_plus_2"]])
+        self.assertEqual(result["latest_persisted"], dates["t_plus_2"])
+
+    def test_followup_label_uses_recent_close_when_not_true_previous_trade_day(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _build_followup_label
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+
+            label = _build_followup_label(
+                base_dir=base,
+                previous_date=dates["target_trade_date"],
+                current_date=dates["t_plus_2"],
+            )
+
+        self.assertIn("最近收盘挖掘标的最新涨幅", label)
+        self.assertIn(dates["target_trade_date"], label)
+        self.assertIn(dates["t_plus_2"], label)
+
+    def test_followups_use_previous_trade_day_even_when_current_day_is_already_persisted(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import (
+            ensure_close_history_persisted,
+            load_previous_day_followups,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            ensure_close_history_persisted(base_dir=base, up_to_trade_date=dates["next_trade_date"])
+
+            def fake_latest_quotes() -> pd.DataFrame:
+                return pd.DataFrame(
+                    [
+                        {
+                            "code": "600001",
+                            "close": 16.3,
+                            "pre_close": 15.6,
+                            "open": 15.8,
+                            "high": 16.6,
+                            "low": 15.7,
+                            "volume": 11_000_000,
+                            "amount": 1_900_000_000,
+                            "change_pct": (16.3 / 15.6 - 1.0) * 100.0,
+                        }
+                    ]
+                )
+
+            follow_df, previous_date, current_date = load_previous_day_followups(
+                base_dir=base,
+                trade_date=dates["next_trade_date"],
+                use_intraday=False,
+                prefer_latest_quotes=True,
+                fallback_trade_date=dates["next_trade_date"],
+                snapshot_loader=fake_latest_quotes,
+            )
+
+        self.assertEqual(previous_date, dates["target_trade_date"])
+        self.assertEqual(current_date, dates["next_trade_date"])
+        self.assertFalse(follow_df.empty)
+
+    def test_close_opportunities_reuse_persisted_candidates_without_rescanning(self) -> None:
+        from mining.streamlit_tabs import tab_scanner
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            tab_scanner.ensure_close_history_persisted(base_dir=base, up_to_trade_date=dates["target_trade_date"])
+
+            with mock.patch.object(
+                tab_scanner,
+                "_run_display_scanners",
+                side_effect=AssertionError("should not rescan persisted close candidates"),
+            ):
+                today_df, today_date = tab_scanner.load_latest_opportunities(
+                    base_dir=base,
+                    trade_date=dates["target_trade_date"],
+                    use_intraday=False,
+                )
+
+        self.assertEqual(today_date, dates["target_trade_date"])
+        self.assertFalse(today_df.empty)
+
+    def test_cached_snapshot_loader_fetches_underlying_data_once(self) -> None:
+        import pandas as pd
+
+        from mining.streamlit_tabs.tab_scanner import _build_cached_snapshot_loader
+
+        calls = {"count": 0}
+
+        def fake_loader() -> pd.DataFrame:
+            calls["count"] += 1
+            return pd.DataFrame([{"code": "600001", "close": 10.0}])
+
+        loader = _build_cached_snapshot_loader(fake_loader)
+        first = loader()
+        second = loader()
+
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 1)
+        self.assertIsNot(first, second)
+
+    def test_display_scanners_reuse_rps_results_for_early_strength_exclusion(self) -> None:
+        from mining.db import connect
+        from mining.scanners import Candidate
+        from mining.streamlit_tabs import tab_scanner
+        from mining.universe import build_universe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            trade_days = trading_days("2026-02-20", 40)
+            target_index = trade_days.index(dates["target_trade_date"])
+            t_minus_2 = trade_days[target_index - 2]
+            conn = connect(base_dir=base)
+            try:
+                conn.execute(
+                    """
+                    UPDATE ash.kline_daily
+                    SET open = 31.9, high = 33.65, low = 31.5, close = 32.2, pre_close = 31.0, change = 1.2, change_pct = 3.87, amount = 1300000000
+                    WHERE sec_type='stock' AND sec_code='600003' AND trade_date=?
+                    """,
+                    (dates["target_trade_date"],),
+                )
+                conn.execute(
+                    """
+                    UPDATE ash.kline_daily
+                    SET open = 28.7, high = 31.1, low = 28.5, close = 30.85, pre_close = 28.5, change = 2.35, change_pct = 8.25
+                    WHERE sec_type='stock' AND sec_code='600003' AND trade_date=?
+                    """,
+                    (t_minus_2,),
+                )
+                universe = build_universe(conn, dates["target_trade_date"])
+                fake_rps_candidates = [
+                    Candidate(
+                        strategy_id="rps_stock_top20",
+                        version="v1.0",
+                        trade_date=dates["target_trade_date"],
+                        sec_type="stock",
+                        sec_code="600001",
+                        sec_name="Alpha",
+                        entry_price=15.6,
+                        rank=1,
+                    )
+                ]
+                with mock.patch.object(
+                    tab_scanner,
+                    "select_rps_candidates",
+                    return_value=fake_rps_candidates,
+                ), mock.patch(
+                    "mining.scanners.momentum_breakout._load_rps_exclusion_codes",
+                    side_effect=AssertionError("should reuse shared rps results"),
+                ):
+                    tab_scanner._run_display_scanners(conn, dates["target_trade_date"], universe)
+            finally:
+                conn.close()
+
+
+    def test_watchlist_display_uses_action_columns_without_edge_wording(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _prepare_watchlist_display
+        from mining.watchlist import split_actionable_watchlist
+
+        watchlist = pd.DataFrame(
+            [
+                {
+                    "sec_code": "600001",
+                    "sec_name": "Ready",
+                    "state": "回踩到位",
+                    "run_up_pct": 0.2,
+                    "flag_count": 3,
+                    "pullback_pct": -0.12,
+                    "shrink_ratio": 0.5,
+                    "ma_proximity": 0.02,
+                    "reclaim_ma10": False,
+                    "pullback_red_days": 1,
+                    "days_since_flag": 5,
+                    "flag_strategies": "trend_embryo",
+                    "triage": 2.0,
+                },
+                {
+                    "sec_code": "600002",
+                    "sec_name": "Trigger",
+                    "state": "再启动",
+                    "run_up_pct": 0.3,
+                    "flag_count": 2,
+                    "pullback_pct": -0.10,
+                    "shrink_ratio": 0.6,
+                    "ma_proximity": 0.01,
+                    "reclaim_ma10": True,
+                    "pullback_red_days": 0,
+                    "days_since_flag": 4,
+                    "flag_strategies": "true_leader",
+                    "triage": 3.0,
+                },
+            ]
+        )
+
+        ready, trigger = split_actionable_watchlist(watchlist, top_n=30)
+        display = _prepare_watchlist_display(pd.concat([ready, trigger], ignore_index=True))
+
+        self.assertEqual(list(ready["state"]), ["回踩到位"])
+        self.assertEqual(list(trigger["state"]), ["再启动"])
+        self.assertEqual(
+            list(display.columns),
+            [
+                "代码",
+                "名称",
+                "状态",
+                "原始强度%",
+                "标记次数",
+                "峰值回撤%",
+                "缩量比",
+                "距MA%",
+                "今日站回MA10",
+                "回踩大阴线",
+                "距标记日",
+                "来源策略",
+            ],
+        )
+        self.assertFalse(any("edge" in str(column).lower() for column in display.columns))
+        self.assertAlmostEqual(display.iloc[0]["原始强度%"], 20.0)
+        self.assertAlmostEqual(display.iloc[0]["峰值回撤%"], -12.0)
+if __name__ == "__main__":
+    unittest.main()
