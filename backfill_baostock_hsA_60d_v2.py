@@ -558,6 +558,7 @@ def main():
     ap.add_argument("--with-concepts", action="store_true", help="also backfill THS hot concepts (requires adata)")
     ap.add_argument("--concept-top", type=int, default=20, help="how many hot concepts to fetch")
     ap.add_argument("--limit", type=int, default=0, help="limit number of stocks (debug)")
+    ap.add_argument("--max-failures", type=int, default=3, help="abort after this many consecutive extraction errors")
     args = ap.parse_args()
 
     if args.probe:
@@ -570,7 +571,7 @@ def main():
     try:
         asof = args.asof or get_last_trading_day()
         td = last_n_trading_days(args.days, asof=asof)
-        if len(td) < 5:
+        if len(td) < 1:
             raise RuntimeError(f"too few trading days from baostock calendar: {len(td)}")
         start_date, end_date = td[0], td[-1]
         print(f"[RUN] days={len(td)} asof={asof} range={start_date}..{end_date}")
@@ -584,6 +585,7 @@ def main():
 
         total = len(stock_list)
         done, fail = 0, 0
+        consecutive_errors = 0
         t0 = time.time()
 
         batch_frames: List[pd.DataFrame] = []
@@ -598,12 +600,19 @@ def main():
                 else:
                     batch_frames.append(df)
                     done += 1
+                    consecutive_errors = 0
                 if args.sleep > 0:
                     time.sleep(args.sleep)
             except Exception as e:
                 fail += 1
+                consecutive_errors += 1
                 if i <= 5:
                     print(f"[STOCK] FAIL {bs_code}: {e}")
+                if consecutive_errors >= max(1, int(args.max_failures)):
+                    raise RuntimeError(
+                        f"baostock extraction failed {consecutive_errors} times in a row; "
+                        "aborting this interface so caller can switch data source"
+                    )
 
             if len(batch_frames) >= BATCH_N:
                 big = pd.concat(batch_frames, ignore_index=True)

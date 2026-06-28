@@ -182,7 +182,7 @@ def _etf_master_from_scale(df: pd.DataFrame, exchange: str) -> pd.DataFrame:
     return out
 
 
-def load_trade_dates_from_ref_db(ref_db: str, days: int) -> List[str]:
+def load_trade_dates_from_ref_db(ref_db: str, days: int, asof: Optional[str] = None) -> List[str]:
     if not ref_db or not os.path.exists(ref_db):
         return []
     conn = sqlite_connect(ref_db)
@@ -197,6 +197,9 @@ def load_trade_dates_from_ref_db(ref_db: str, days: int) -> List[str]:
                 rows = conn.execute(q, (max(days, 120),)).fetchall()
                 ds = [str(r[0]) for r in rows]
                 ds = [d.replace("/", "-") for d in ds]
+                if asof:
+                    target = str(asof).replace("/", "-")[:10]
+                    ds = [d for d in ds if d[:10] <= target]
                 ds = sorted(set(ds))
                 if len(ds) >= 10:
                     return ds[-days:]
@@ -227,6 +230,17 @@ def get_trade_dates_via_baostock(days: int, asof: str) -> List[str]:
         return items[-days:]
     finally:
         bs.logout()
+
+
+def ref_dates_cover_asof(dates: List[str], asof: Optional[str]) -> bool:
+    if not dates or not asof:
+        return bool(dates)
+    try:
+        latest = max(str(d).replace("/", "-")[:10] for d in dates if d)
+        target = str(asof).replace("/", "-")[:10]
+        return latest >= target
+    except Exception:
+        return False
 
 
 def _safe_call(fn, *args, **kwargs):
@@ -371,7 +385,10 @@ def main() -> None:
     asof = args.asof or dt.date.today().isoformat()
 
     # trade dates
-    dates = load_trade_dates_from_ref_db(args.ref_db, args.days)
+    dates = load_trade_dates_from_ref_db(args.ref_db, args.days, asof=asof)
+    if dates and not ref_dates_cover_asof(dates, asof):
+        log(f"ref-db latest trade date {dates[-1]} is behind asof {asof}; fallback to baostock calendar")
+        dates = []
     if not dates:
         log(f"ref-db trade dates unavailable, fallback to baostock calendar")
         dates = get_trade_dates_via_baostock(args.days, asof)
