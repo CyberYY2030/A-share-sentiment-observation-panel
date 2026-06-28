@@ -18,16 +18,22 @@ import datetime as dt
 import re
 import math
 import subprocess
+import multiprocessing
 import requests
 import sys
+from bisect import bisect_right
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Iterable
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
+from backfill_orchestrator import start_background_job
+from offline_daily_update import build_missing_update_plan, resolve_expected_trade_days
 from runtime_paths import build_runtime_paths, ensure_runtime_dirs
+from mining.streamlit_tabs import render_scanner_tab
+from mining.streamlit_tabs.tab_scanner import ensure_close_history_persisted
 
 
 def percentile_midrank(hist: pd.Series, x: float) -> Optional[float]:
@@ -53,10 +59,10 @@ def percentile_midrank(hist: pd.Series, x: float) -> Optional[float]:
         return None
 
 
-DEFAULT_STOCK_DB_CANDIDATES = ["ashare_mvp.db", "a_share_mvp.db", "a/ashare_mvp.db", "a/a_share_mvp.db", "./a/ashare_mvp.db", "./a/a_share_mvp.db"]
 DEFAULT_CONCEPT_DB = "ths_concept.db"
 DEFAULT_ETF_DB = "etf_mvp.db"
 DEFAULT_CSV_OUT = "daily_metrics_last40.csv"
+CATCHUP_THROTTLE_SECONDS = 1800.0
 
 
 # Backfill scripts (place them in the same folder as this Streamlit app)
@@ -65,6 +71,19 @@ SCRIPT_BAOSTOCK_CANDIDATES = [
     "backfill_baostock_hsA_60d_v2.py",
     "backfill_baostock_hsA_60d.py",
 ]
+
+
+def sync_mining_history_after_close_update(base_dir: str, up_to_trade_date: Optional[str]) -> Dict[str, Any]:
+    if not up_to_trade_date:
+        return {"processed": [], "latest_persisted": None}
+    try:
+        return ensure_close_history_persisted(base_dir=base_dir, up_to_trade_date=up_to_trade_date)
+    except Exception as exc:
+        return {
+            "processed": [],
+            "latest_persisted": None,
+            "error": str(exc),
+        }
 SCRIPT_CONCEPT_CANDIDATES = [
     "backfill_adata_ths_concept_index_kline_60d_v3.py",
     "backfill_adata_ths_concept_index_kline_60d_v2.py",
@@ -73,6 +92,9 @@ SCRIPT_CONCEPT_CANDIDATES = [
 SCRIPT_ETF_CANDIDATES = [
     "backfill_etf_equity_60d_v2.py",
     "backfill_etf_equity_60d.py",
+]
+SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES = [
+    "offline_daily_update.py",
 ]
 
 # Only treat these as A-share stock codes (prevents ETF codes being mis-tagged as 'stock')
@@ -91,6 +113,13 @@ CODE_ZZ1000 = "000852"
 # ----------------------------
 # Basic helpers
 # ----------------------------
+
+def _warn_user(message: str) -> None:
+    try:
+        st.warning(message)
+    except Exception:
+        pass
+
 
 # ----------------------------
 # Startup backfill & persistence helpers
@@ -246,6 +275,7 @@ def try_get_last_trade_day_baostock(include_today: bool, tz_offset_hours: int = 
     try:
         lg = bs.login()
         if getattr(lg, "error_code", "") != "0":
+            _warn_user(f"BaoStock login failed while reading trade calendar: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
             return None
 
         cn_today = _now_with_tz_offset(int(tz_offset_hours)).strftime("%Y-%m-%d")
@@ -267,7 +297,8 @@ def try_get_last_trade_day_baostock(include_today: bool, tz_offset_hours: int = 
             items = [d for d in items if d < cn_today]
 
         return items[-1] if items else None
-    except Exception:
+    except Exception as exc:
+        _warn_user(f"BaoStock trade calendar check failed: {exc}")
         return None
     finally:
         try:
@@ -319,6 +350,7 @@ def try_get_trade_dates_baostock(start_date: str, end_date: str) -> List[str]:
     try:
         lg = bs.login()
         if getattr(lg, "error_code", "") != "0":
+            _warn_user(f"BaoStock login failed while reading trade dates: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
             return []
         rs = bs.query_trade_dates(start_date=str(start_date), end_date=str(end_date))
         items: List[str] = []
@@ -327,7 +359,8 @@ def try_get_trade_dates_baostock(start_date: str, end_date: str) -> List[str]:
             if len(row) >= 2 and str(row[1]) == "1":
                 items.append(str(row[0]).replace("/", "-")[:10])
         return items
-    except Exception:
+    except Exception as exc:
+        _warn_user(f"BaoStock trade-date query failed: {exc}")
         return []
     finally:
         try:
@@ -340,27 +373,20 @@ def get_prev_trade_days(anchor_day: str, n_back: int = 2) -> List[str]:
     if not anchor_day:
         return []
     try:
-        a = pd.Timestamp(str(anchor_day).replace("/", "-")[:10]).date()
+        anchor = pd.Timestamp(str(anchor_day).replace("/", "-")[:10]).normalize()
     except Exception:
         return []
-    start = (a - dt.timedelta(days=90)).strftime("%Y-%m-%d")
-    end = a.strftime("%Y-%m-%d")
-    cal = try_get_trade_dates_baostock(start, end)
+    cal = _load_cn_trade_calendar()
+    anchor_str = anchor.strftime("%Y-%m-%d")
     if cal:
-        cal = [d for d in cal if d <= end]
-        if not cal:
-            return []
-        t = cal[-1]
-        out = [t]
-        for _ in range(n_back):
-            if len(cal) >= len(out) + 1:
-                out.append(cal[-(len(out) + 1)])
-            else:
-                break
-        return out
+        pos = bisect_right(cal, anchor_str) - 1
+        if pos >= 0:
+            end = min(pos + 1, len(cal))
+            start = max(0, end - (n_back + 1))
+            return list(reversed(cal[start:end]))
     # weekday fallback
     out: List[str] = []
-    t = pd.Timestamp(end).date()
+    t = anchor.date()
     while t.weekday() >= 5:
         t -= dt.timedelta(days=1)
     out.append(t.strftime("%Y-%m-%d"))
@@ -372,15 +398,79 @@ def get_prev_trade_days(anchor_day: str, n_back: int = 2) -> List[str]:
     return out
 
 
+def _timeout_worker(queue, func, args, kwargs):
+    try:
+        queue.put(func(*args, **kwargs))
+    except Exception:
+        queue.put(None)
+
+
+def _call_with_timeout(timeout_seconds: float, func, *args, **kwargs):
+    ctx = multiprocessing.get_context("spawn")
+    queue = ctx.Queue()
+    proc = ctx.Process(target=_timeout_worker, args=(queue, func, args, kwargs))
+    proc.start()
+    proc.join(timeout_seconds)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
+        return None
+    try:
+        return queue.get_nowait()
+    except Exception:
+        return None
+
+
+def _weekday_last_trade_day(tz_offset_hours: int = 8) -> str:
+    now_cn = _now_with_tz_offset(tz_offset_hours)
+    today = now_cn.date()
+    while today.weekday() >= 5:
+        today -= dt.timedelta(days=1)
+    return today.strftime("%Y-%m-%d")
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _load_cn_trade_calendar() -> List[str]:
+    try:
+        import akshare as ak  # type: ignore
+
+        if hasattr(ak, "tool_trade_date_hist_sina"):
+            cal = ak.tool_trade_date_hist_sina()
+            if cal is not None and not cal.empty:
+                col = cal.columns[0]
+                s = (
+                    pd.to_datetime(cal[col], errors="coerce")
+                    .dropna()
+                    .dt.normalize()
+                    .dt.strftime("%Y-%m-%d")
+                    .drop_duplicates()
+                    .sort_values()
+                )
+                return s.tolist()
+    except Exception as exc:
+        _warn_user(f"Stock DB latest-date read failed: {exc}")
+        pass
+    return []
+
+
 @st.cache_data(ttl=300, show_spinner=False)
-def discover_data_dates_bundle(concept_db: Optional[str], tz_offset_hours: int = 8) -> Dict[str, Optional[str]]:
-    cal_last = get_source_last_trade_day(tz_offset_hours=int(tz_offset_hours))
+def discover_data_dates_bundle(
+    concept_db: Optional[str],
+    tz_offset_hours: int = 8,
+    local_last_dates: Optional[Dict[str, Optional[str]]] = None,
+) -> Dict[str, Optional[str]]:
+    try:
+        cal_last = str(last_completed_trade_date_cn(tz_offset_hours=int(tz_offset_hours)).date())
+    except Exception:
+        cal_last = _weekday_last_trade_day(int(tz_offset_hours))
 
-    remote_stock = get_remote_latest_close_day_stock_indexes() or cal_last
-    remote_concept = get_remote_latest_close_day_concept(concept_db) or remote_stock or cal_last
-    remote_etf = remote_stock or cal_last
+    remote_stock = cal_last
+    remote_concept = cal_last
+    remote_etf = cal_last
 
-    candidates = [d for d in [remote_stock, remote_concept, remote_etf] if d]
+    # T-1/T-2 are source/calendar dates. Local DB availability is handled later by
+    # panel_close_dt and sync warnings; mixing it here makes the UI label stale.
+    candidates = [d for d in [remote_stock, remote_concept, remote_etf, cal_last] if d]
     t1 = min(candidates) if candidates else cal_last
 
     prevs = get_prev_trade_days(t1, n_back=2)
@@ -410,10 +500,11 @@ def sql_max_date(con: sqlite3.Connection, sql: str, params: Tuple = ()) -> Optio
         return None
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_local_last_dates(stock_db: str, concept_db: Optional[str], etf_db: Optional[str]) -> Dict[str, Optional[str]]:
     out: Dict[str, Optional[str]] = {"stock": None, "index": None, "concept": None, "etf": None}
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         if table_exists(con, "kline_daily"):
             out["stock"] = sql_max_date(con, "SELECT MAX(trade_date) FROM kline_daily WHERE sec_type='stock'")
             out["index"] = sql_max_date(
@@ -427,30 +518,39 @@ def get_local_last_dates(stock_db: str, concept_db: Optional[str], etf_db: Optio
 
     if concept_db and os.path.exists(concept_db):
         try:
-            con = connect(concept_db)
+            con = _raw_db_connect(concept_db)
             if table_exists(con, "concept_kline"):
                 out["concept"] = sql_max_date(con, "SELECT MAX(substr(replace(trade_date, '/', '-'),1,10)) FROM concept_kline")
             elif table_exists(con, "concept_kline_ths"):
                 out["concept"] = sql_max_date(con, "SELECT MAX(substr(replace(trade_date, '/', '-'),1,10)) FROM concept_kline_ths")
             con.close()
-        except Exception:
+        except Exception as exc:
+            _warn_user(f"Concept DB latest-date read failed: {exc}")
             pass
 
     if etf_db and os.path.exists(etf_db):
         try:
-            con = connect(etf_db)
+            con = _raw_db_connect(etf_db)
             if table_exists(con, "etf_total"):
                 out["etf"] = sql_max_date(con, "SELECT MAX(trade_date) FROM etf_total")
             con.close()
-        except Exception:
+        except Exception as exc:
+            _warn_user(f"ETF DB latest-date read failed: {exc}")
             pass
     return out
+
+
+def _clear_local_last_dates_cache() -> None:
+    try:
+        get_local_last_dates.clear()
+    except Exception:
+        pass
 
 
 def cleanup_stock_db_remove_non_a_share(stock_db: str) -> int:
     """Remove rows incorrectly tagged as stock (e.g. ETF codes 15xxxx/51xxxx/56xxxx etc)."""
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         if not table_exists(con, "kline_daily"):
             con.close()
             return 0
@@ -544,6 +644,7 @@ def try_get_latest_kline_day_baostock(code: str, lookback_days: int = 25) -> Opt
         start = end - dt.timedelta(days=lookback_days)
         lg = bs.login()
         if getattr(lg, "error_code", "0") != "0":
+            _warn_user(f"BaoStock login failed while checking latest kline day: {getattr(lg, 'error_code', '')} {getattr(lg, 'error_msg', '')}")
             try:
                 bs.logout()
             except Exception:
@@ -567,7 +668,8 @@ def try_get_latest_kline_day_baostock(code: str, lookback_days: int = 25) -> Opt
         except Exception:
             pass
         return latest
-    except Exception:
+    except Exception as exc:
+        _warn_user(f"BaoStock latest-kline check failed for {code}: {exc}")
         return None
 
 
@@ -586,7 +688,7 @@ def get_remote_latest_close_day_stock_indexes() -> Optional[str]:
 def _sample_concept_codes_from_db(concept_db: str, limit: int = 10) -> List[str]:
     codes: List[str] = []
     try:
-        con = connect(concept_db)
+        con = _raw_db_connect(concept_db)
         table = None
         if table_exists(con, "concept_kline_ths"):
             table = "concept_kline_ths"
@@ -645,9 +747,8 @@ def try_get_latest_day_adata_market(stock_code: str, lookback_days: int = 45) ->
             return None
         d = ts.max().date()
         return d.strftime("%Y-%m-%d")
-    except Exception:
-        return None
-    except Exception:
+    except Exception as exc:
+        _warn_user(f"adata latest market-day check failed for {stock_code}: {exc}")
         return None
 
 
@@ -681,6 +782,258 @@ def calc_backfill_days(local_d: Optional[str], remote_d: Optional[str], cap: int
         return int(min(max(delta + 2, 5), cap))
     except Exception:
         return min(60, cap)
+
+
+def _day_ts(day: Any) -> Optional[pd.Timestamp]:
+    if day is None:
+        return None
+    try:
+        return pd.Timestamp(str(day).replace("/", "-")[:10]).normalize()
+    except Exception:
+        return None
+
+
+def close_target_missing_domains(
+    local_dates: Dict[str, Optional[str]],
+    target_day: Optional[str],
+    include_concept: bool = False,
+    include_etf: bool = False,
+) -> List[str]:
+    target = _day_ts(target_day)
+    if target is None:
+        return []
+    domains = ["stock", "index"]
+    if include_concept:
+        domains.append("concept")
+    if include_etf:
+        domains.append("etf")
+
+    missing: List[str] = []
+    for key in domains:
+        local = _day_ts((local_dates or {}).get(key))
+        if local is None or local < target:
+            missing.append(key)
+    return missing
+
+
+def resolve_panel_close_date(
+    requested_close_day: Any,
+    close_ref_day: Any,
+    stock_day: Any,
+    index_day: Any,
+    concept_day: Any = None,
+) -> Optional[pd.Timestamp]:
+    """Resolve the close date used by the sentiment/opportunity panels.
+
+    Concept data is deliberately not part of this gate. A lagging concept DB should
+    not silently downgrade the stock/index driven sentiment panel or opportunity scanner.
+    """
+    candidates = [
+        _day_ts(requested_close_day),
+        _day_ts(close_ref_day),
+        _day_ts(stock_day),
+        _day_ts(index_day),
+    ]
+    candidates = [d for d in candidates if d is not None]
+    return min(candidates) if candidates else None
+
+
+def _stock_trade_date_set(stock_df: pd.DataFrame) -> set[pd.Timestamp]:
+    if stock_df is None or stock_df.empty or "trade_date" not in stock_df.columns:
+        return set()
+    try:
+        s = pd.to_datetime(stock_df["trade_date"], errors="coerce").dropna().dt.normalize()
+        return {pd.Timestamp(x) for x in s.tolist()}
+    except Exception:
+        return set()
+
+
+def _index_trade_date_set(
+    index_df: pd.DataFrame,
+    required_index_codes: Iterable[str],
+) -> set[pd.Timestamp]:
+    if index_df is None or index_df.empty or "trade_date" not in index_df.columns or "sec_code" not in index_df.columns:
+        return set()
+    try:
+        idx = index_df[["trade_date", "sec_code"]].copy()
+        idx["trade_date"] = pd.to_datetime(idx["trade_date"], errors="coerce").dt.normalize()
+        idx = idx.dropna(subset=["trade_date"])
+        idx["sec_code"] = idx["sec_code"].apply(canonical_code)
+        required = {canonical_code(code) for code in required_index_codes}
+        out: set[pd.Timestamp] = set()
+        for day, g in idx.groupby("trade_date"):
+            if required.issubset(set(g["sec_code"].dropna().astype(str))):
+                out.add(pd.Timestamp(day))
+        return out
+    except Exception:
+        return set()
+
+
+def resolve_available_panel_close_date(
+    requested_close_day: Any,
+    stock_df: pd.DataFrame,
+    index_df: pd.DataFrame,
+    required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
+) -> Tuple[Optional[pd.Timestamp], bool, List[pd.Timestamp]]:
+    """Resolve the panel close day from actual stock/index row coverage, not max dates."""
+    requested = _day_ts(requested_close_day)
+    available = sorted(
+        _stock_trade_date_set(stock_df)
+        & _index_trade_date_set(index_df, required_index_codes)
+    )
+    if not available:
+        return None, bool(requested is not None), []
+    if requested is None:
+        return available[-1], False, available
+    if requested in available:
+        return requested, False, available
+    previous = [day for day in available if day <= requested]
+    if previous:
+        return previous[-1], True, available
+    return available[-1], True, available
+
+
+def resolve_selected_opportunity_runtime(
+    effective_mode: str,
+    panel_close_dt: Optional[pd.Timestamp],
+    now_cn: dt.datetime,
+    tz_offset_hours: int,
+) -> Dict[str, Any]:
+    if effective_mode == "snapshot":
+        try:
+            runtime = resolve_opportunity_runtime(now_cn, int(tz_offset_hours))
+            if panel_close_dt is not None and not runtime.get("fallback_trade_date"):
+                runtime["fallback_trade_date"] = str(pd.Timestamp(panel_close_dt).date())
+            return runtime
+        except Exception:
+            pass
+
+    trade_date = str(pd.Timestamp(panel_close_dt).date()) if panel_close_dt is not None else None
+    return {
+        "trade_date": trade_date,
+        "fallback_trade_date": trade_date,
+        "force_latest_quotes": False,
+        "use_intraday": False,
+    }
+
+
+def maybe_backfill_to_close_day(
+    stock_db: str,
+    concept_db: Optional[str],
+    etf_db: Optional[str],
+    target_day: Optional[str],
+    local_dates: Optional[Dict[str, Optional[str]]] = None,
+    include_concept: bool = True,
+    include_etf: bool = True,
+) -> Tuple[Dict[str, Optional[str]], List[str]]:
+    """Narrow startup catch-up for the selected completed close day.
+
+    This avoids the slow remote discovery path: the caller already resolved the target
+    close day, so scripts run only for the small missing window ending at target_day.
+    """
+    logs: List[str] = []
+    if not target_day:
+        return local_dates or get_local_last_dates(stock_db, concept_db, etf_db), ["target close day is empty"]
+
+    target = str(pd.Timestamp(str(target_day).replace("/", "-")[:10]).date())
+    local = local_dates or get_local_last_dates(stock_db, concept_db, etf_db)
+    missing = close_target_missing_domains(
+        local,
+        target,
+        include_concept=bool(include_concept and concept_db),
+        include_etf=bool(include_etf and etf_db),
+    )
+    logs.append(f"target_close_day={target}")
+    logs.append(f"local_before={local}")
+    logs.append(f"missing_domains={missing}")
+    if not missing:
+        return local, logs
+
+    if "stock" in missing or "index" in missing:
+        if can_use_snapshot_for_close_target(target):
+            ok, snap_logs = sync_close_snapshot_to_db_for_trade_date(
+                stock_db=stock_db,
+                concept_db=concept_db if include_concept else None,
+                trade_date=target,
+                include_concept=bool(include_concept and concept_db),
+            )
+            _clear_local_last_dates_cache()
+            logs.append(f"[TARGET_STOCK_SNAPSHOT] ok={ok} asof={target}")
+            logs.extend(snap_logs[:20])
+            local = get_local_last_dates(stock_db, concept_db, etf_db)
+            missing = close_target_missing_domains(
+                local,
+                target,
+                include_concept=bool(include_concept and concept_db),
+                include_etf=bool(include_etf and etf_db),
+            )
+        else:
+            sp = pick_existing_script(SCRIPT_BAOSTOCK_CANDIDATES)
+            if sp:
+                local_stock_ref = local.get("stock") or local.get("index")
+                if local.get("stock") and local.get("index"):
+                    try:
+                        local_stock_ref = min(local.get("stock"), local.get("index"))
+                    except Exception:
+                        local_stock_ref = local.get("stock") or local.get("index")
+                days = str(max(calc_backfill_days(local_stock_ref, target, cap=10), 5))
+                cmd = [sys.executable, sp, "--db", stock_db, "--days", days, "--asof", target, "--with-indexes"]
+                job = start_background_job(
+                    cmd=cmd,
+                    cwd=app_dir(),
+                    log_dir=Path(app_dir()) / "output" / "backfill_jobs",
+                    name=f"target_baostock_{target}",
+                )
+                logs.append(
+                    f"[TARGET_BAOSTOCK_BACKGROUND] pid={job.get('pid')} days={days} asof={target} "
+                    f"log={job.get('log_path')}"
+                )
+            else:
+                logs.append("[TARGET_BAOSTOCK] baostock backfill script not found")
+
+    if concept_db and ("concept" in missing):
+        sp = pick_existing_script(SCRIPT_CONCEPT_CANDIDATES)
+        if sp:
+            days = str(max(calc_backfill_days(local.get("concept"), target, cap=10), 5))
+            for asof in [target.replace("-", ""), target, target.replace("-", "/")]:
+                cmd = [sys.executable, sp, "--db", concept_db, "--days", days, "--asof", asof]
+                rc, out = run_cmd(cmd, timeout_sec=600)
+                _clear_local_last_dates_cache()
+                logs.append(f"[TARGET_CONCEPT] rc={rc} days={days} asof={asof}")
+                if out:
+                    logs.append(out[:2000])
+                if rc == 0:
+                    break
+        else:
+            logs.append("[TARGET_CONCEPT] concept backfill script not found")
+
+    if etf_db and ("etf" in missing):
+        sp = pick_existing_script(SCRIPT_ETF_CANDIDATES)
+        if sp:
+            days = str(max(calc_backfill_days(local.get("etf"), target, cap=10), 5))
+            cmd = [sys.executable, sp, "--db", etf_db, "--days", days, "--asof", target]
+            rc, out = run_cmd(cmd, timeout_sec=600)
+            _clear_local_last_dates_cache()
+            logs.append(f"[TARGET_ETF] rc={rc} days={days} asof={target}")
+            if out:
+                logs.append(out[:2000])
+        else:
+            logs.append("[TARGET_ETF] etf backfill script not found")
+
+    local_after = get_local_last_dates(stock_db, concept_db, etf_db)
+    logs.append(f"local_after={local_after}")
+    logs.append(
+        "remaining_missing_domains="
+        + str(
+            close_target_missing_domains(
+                local_after,
+                target,
+                include_concept=bool(include_concept and concept_db),
+                include_etf=bool(include_etf and etf_db),
+            )
+        )
+    )
+    return local_after, logs
 
 
 
@@ -740,7 +1093,7 @@ def maybe_backfill_all(stock_db: str, concept_db: Optional[str], etf_db: Optiona
 
     # Ensure required indices exist on remote_stock day (quality check)
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         ok = True
         for c in REQUIRED_INDEX_CODES:
             r = con.execute(
@@ -764,13 +1117,14 @@ def maybe_backfill_all(stock_db: str, concept_db: Optional[str], etf_db: Optiona
             d = str(max(days_stock, 5)) if (not force) else "60"
             cmd = [sys.executable, sp, "--db", stock_db, "--days", d, "--asof", remote_stock, "--with-indexes"]
             rc, out = run_cmd(cmd)
+            _clear_local_last_dates_cache()
             logs.append(f"[BAOSTOCK] rc={rc} days={d} asof={remote_stock}")
             if out:
                 logs.append(out[:2000])
 
             # post-check: required indices on remote_stock
             try:
-                con2 = connect(stock_db)
+                con2 = _raw_db_connect(stock_db)
                 missing = []
                 for c in REQUIRED_INDEX_CODES:
                     r = con2.execute(
@@ -806,6 +1160,7 @@ def maybe_backfill_all(stock_db: str, concept_db: Optional[str], etf_db: Optiona
             for asof in asof_variants:
                 cmd = [sys.executable, sp, "--db", concept_db, "--days", d, "--asof", asof]
                 rc, out = run_cmd(cmd)
+                _clear_local_last_dates_cache()
                 last_rc, last_out = rc, out
                 logs.append(f"[CONCEPT] rc={rc} days={d} asof={asof}")
                 if out:
@@ -825,6 +1180,7 @@ def maybe_backfill_all(stock_db: str, concept_db: Optional[str], etf_db: Optiona
             d = str(max(days_etf, 5)) if (not force) else "60"
             cmd = [sys.executable, sp, "--db", etf_db, "--days", d, "--asof", remote_etf]
             rc, out = run_cmd(cmd)
+            _clear_local_last_dates_cache()
             logs.append(f"[ETF] rc={rc} days={d} asof={remote_etf}")
             if out:
                 logs.append(out[:2000])
@@ -876,7 +1232,7 @@ def validate_db_latest_day(stock_db: str, concept_db: Optional[str], tz_offset_h
 
     # ---- stock/index DB checks ----
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         if not table_exists(con, "kline_daily"):
             issues.append("stock_db: missing table kline_daily")
             con.close()
@@ -948,7 +1304,7 @@ def validate_db_latest_day(stock_db: str, concept_db: Optional[str], tz_offset_h
     # ---- concept DB checks ----
     if concept_db and os.path.exists(concept_db):
         try:
-            conC = connect(concept_db)
+            conC = _raw_db_connect(concept_db)
             table = "concept_kline_ths" if table_exists(conC, "concept_kline_ths") else ("concept_kline" if table_exists(conC, "concept_kline") else None)
             if table is None:
                 issues.append("concept_db: missing concept_kline_ths / concept_kline table")
@@ -1018,7 +1374,7 @@ def validate_db_latest_day(stock_db: str, concept_db: Optional[str], tz_offset_h
 def _delete_rows_for_trade_date_stock_index(stock_db: str, trade_date: str, codes: Optional[List[str]] = None) -> int:
     """Delete index rows on a given trade_date (best-effort)."""
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         if not table_exists(con, "kline_daily"):
             con.close()
             return 0
@@ -1046,7 +1402,7 @@ def _delete_rows_for_trade_date_stock_index(stock_db: str, trade_date: str, code
 def _delete_rows_for_trade_date_concept(concept_db: str, trade_date: str) -> int:
     """Delete concept rows on a given trade_date (best-effort)."""
     try:
-        con = connect(concept_db)
+        con = _raw_db_connect(concept_db)
         table = "concept_kline_ths" if table_exists(con, "concept_kline_ths") else ("concept_kline" if table_exists(con, "concept_kline") else None)
         if table is None:
             con.close()
@@ -1101,7 +1457,7 @@ def pick_existing_path(candidates: List[str]) -> Optional[str]:
     return None
 
 
-def connect(db_path: str) -> sqlite3.Connection:
+def _raw_db_connect(db_path: str) -> sqlite3.Connection:
     con = sqlite3.connect(db_path, check_same_thread=False)
     con.row_factory = sqlite3.Row
     return con
@@ -1200,18 +1556,12 @@ def get_latest_cn_trade_date(today: Optional[pd.Timestamp] = None) -> Optional[p
     try:
         if today is None:
             today = pd.Timestamp(pd.Timestamp.today().date())
-        try:
-            import akshare as ak  # type: ignore
-            if hasattr(ak, "tool_trade_date_hist_sina"):
-                cal = ak.tool_trade_date_hist_sina()
-                if cal is not None and not cal.empty:
-                    col = cal.columns[0]
-                    s = pd.to_datetime(cal[col], errors="coerce").dropna()
-                    s = s[s <= pd.Timestamp(today.date())]
-                    if not s.empty:
-                        return pd.Timestamp(s.max().date())
-        except Exception:
-            pass
+        today = pd.Timestamp(today).normalize()
+        cal = _load_cn_trade_calendar()
+        if cal:
+            pos = bisect_right(cal, today.strftime("%Y-%m-%d")) - 1
+            if pos >= 0:
+                return pd.Timestamp(cal[pos])
         # fallback: if weekend, use last Friday
         d = pd.Timestamp(today.date())
         if d.weekday() >= 5:
@@ -1401,7 +1751,8 @@ def load_stock_cross_section(con: sqlite3.Connection, dates: List[pd.Timestamp])
         raise RuntimeError(f"kline_daily schema missing columns: {schema}")
 
     date_strs = [d.strftime("%Y-%m-%d") for d in dates]
-    placeholders = ",".join(["?"] * len(date_strs))
+    raw_date_strs = sorted({*date_strs, *[d.strftime("%Y/%m/%d") for d in dates]})
+    placeholders = ",".join(["?"] * len(raw_date_strs))
     sql = f"""
     SELECT
       {schema['sec_type']} as sec_type,
@@ -1411,15 +1762,24 @@ def load_stock_cross_section(con: sqlite3.Connection, dates: List[pd.Timestamp])
       {schema['amount']} as amount,
       {schema['close']} as close
     FROM kline_daily
-    WHERE substr(replace({schema['date']}, '/', '-'),1,10) IN ({placeholders})
+    WHERE {schema['date']} IN ({placeholders})
       AND {schema['sec_type']} = 'stock'
     """
-    df = df_from_sql(con, sql, tuple(date_strs))
-    df["trade_date"] = df["trade_date_raw"].apply(normalize_date)
-    df["sec_code"] = df["sec_code"].apply(canonical_code)
-    df["change_pct"] = df["change_pct"].apply(safe_to_float)
-    df["amount"] = df["amount"].apply(safe_to_float)
-    df["close"] = df["close"].apply(safe_to_float)
+    df = df_from_sql(con, sql, tuple(raw_date_strs))
+    if df.empty:
+        return df
+    df["trade_date"] = pd.to_datetime(
+        df["trade_date_raw"].astype(str).str.replace("/", "-", regex=False).str[:10],
+        errors="coerce",
+    ).dt.normalize()
+    valid_dates = {pd.Timestamp(d) for d in date_strs}
+    df = df[df["trade_date"].isin(valid_dates)].copy()
+    df["sec_code"] = (
+        df["sec_code"].astype(str).str.replace(r"\D", "", regex=True).str[-6:].str.zfill(6)
+    )
+    df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
     return df.dropna(subset=["trade_date", "sec_code"])
 
 
@@ -1429,7 +1789,8 @@ def load_index_series(con: sqlite3.Connection, codes: List[str], dates: List[pd.
         raise RuntimeError(f"kline_daily schema missing columns: {schema}")
 
     date_strs = [d.strftime("%Y-%m-%d") for d in dates]
-    placeholders = ",".join(["?"] * len(date_strs))
+    raw_date_strs = sorted({*date_strs, *[d.strftime("%Y/%m/%d") for d in dates]})
+    placeholders = ",".join(["?"] * len(raw_date_strs))
     sql = f"""
     SELECT
       {schema['sec_type']} as sec_type,
@@ -1439,17 +1800,24 @@ def load_index_series(con: sqlite3.Connection, codes: List[str], dates: List[pd.
       {schema['amount']} as amount,
       {schema['close']} as close
     FROM kline_daily
-    WHERE substr(replace({schema['date']}, '/', '-'),1,10) IN ({placeholders})
+    WHERE {schema['date']} IN ({placeholders})
       AND {schema['sec_type']} = 'index'
     """
-    df = df_from_sql(con, sql, tuple(date_strs))
+    df = df_from_sql(con, sql, tuple(raw_date_strs))
     if df.empty:
         return df
-    df["trade_date"] = df["trade_date_raw"].apply(normalize_date)
-    df["sec_code"] = df["sec_code_raw"].apply(canonical_code)
-    df["change_pct"] = df["change_pct"].apply(safe_to_float)
-    df["amount"] = df["amount"].apply(safe_to_float)
-    df["close"] = df["close"].apply(safe_to_float)
+    df["trade_date"] = pd.to_datetime(
+        df["trade_date_raw"].astype(str).str.replace("/", "-", regex=False).str[:10],
+        errors="coerce",
+    ).dt.normalize()
+    valid_dates = {pd.Timestamp(d) for d in date_strs}
+    df = df[df["trade_date"].isin(valid_dates)].copy()
+    df["sec_code"] = (
+        df["sec_code_raw"].astype(str).str.replace(r"\D", "", regex=True).str[-6:].str.zfill(6)
+    )
+    df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
 
     need = set(digits_code(c) for c in codes)
     df = df[df["sec_code"].isin(need)]
@@ -1464,6 +1832,27 @@ def compute_market_turnover(index_df: pd.DataFrame) -> pd.Series:
     if df.empty:
         return pd.Series(dtype=float)
     return df.groupby("trade_date")["amount"].sum().sort_index()
+
+
+def _ensure_trade_dates(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype="datetime64[ns]")
+    if pd.api.types.is_datetime64_any_dtype(series):
+        return pd.to_datetime(series, errors="coerce").dt.normalize()
+    s = series.astype(str).str.replace("/", "-", regex=False).str.strip()
+    mask_8d = s.str.fullmatch(r"\d{8}")
+    if mask_8d.any():
+        s = s.where(
+            ~mask_8d,
+            s.str.slice(0, 4) + "-" + s.str.slice(4, 6) + "-" + s.str.slice(6, 8),
+        )
+    return pd.to_datetime(s.str.slice(0, 10), errors="coerce").dt.normalize()
+
+
+def _ensure_canonical_codes(series: pd.Series) -> pd.Series:
+    if series is None:
+        return pd.Series(dtype=str)
+    return series.astype(str).str.replace(r"\D", "", regex=True).str[-6:].str.zfill(6)
 
 
 def infer_amount_scale_to_yuan_with_target(
@@ -1540,12 +1929,11 @@ def build_market_turnover(
 
     # --- index turnover (preferred) ---
     if index_df is not None and not index_df.empty and "amount" in index_df.columns:
-        t = index_df.copy()
-        if "trade_date" in t.columns:
-            t["trade_date"] = t["trade_date"].apply(normalize_date)
-        t["sec_code"] = t["sec_code"].apply(canonical_code)
-        t["amount"] = t["amount"].apply(safe_to_float)
-        t = t.dropna(subset=["trade_date", "sec_code"])
+        t = index_df[["trade_date", "sec_code", "amount"]].copy()
+        t["trade_date"] = _ensure_trade_dates(t["trade_date"])
+        t["sec_code"] = _ensure_canonical_codes(t["sec_code"])
+        t["amount"] = pd.to_numeric(t["amount"], errors="coerce")
+        t = t.dropna(subset=["trade_date", "sec_code", "amount"])
         sub = t[t["sec_code"].isin([CODE_SH000001, CODE_SZ399001])][["trade_date", "sec_code", "amount"]]
         if not sub.empty:
             piv = sub.pivot_table(index="trade_date", columns="sec_code", values="amount", aggfunc="last")
@@ -1555,11 +1943,10 @@ def build_market_turnover(
 
     # --- stock turnover sum (fallback) ---
     if stock_df is not None and not stock_df.empty and "amount" in stock_df.columns:
-        s = stock_df.copy()
-        if "trade_date" in s.columns:
-            s["trade_date"] = s["trade_date"].apply(normalize_date)
-        s["amount"] = s["amount"].apply(safe_to_float)
-        s = s.dropna(subset=["trade_date"])
+        s = stock_df[["trade_date", "amount"]].copy()
+        s["trade_date"] = _ensure_trade_dates(s["trade_date"])
+        s["amount"] = pd.to_numeric(s["amount"], errors="coerce")
+        s = s.dropna(subset=["trade_date", "amount"])
         stk_amt = s.groupby("trade_date")["amount"].sum().reindex(dates).astype(float)
 
     stk_amt = stk_amt.where(stk_amt > 0)
@@ -1590,11 +1977,7 @@ def build_market_turnover(
     # market turnover shouldn't jump 5x day-to-day in a normal regime; treat as data glitch
     med = base.rolling(7, min_periods=3).median()
     ratio = base / med
-    glitch = ratio.where(np.isfinite(ratio)).apply(lambda x: False)  # placeholder
-    try:
-        glitch = (ratio > 5.0) | (ratio < 0.2)
-    except Exception:
-        glitch = pd.Series(False, index=base.index)
+    glitch = ((ratio > 5.0) | (ratio < 0.2)).fillna(False)
 
     if glitch.any():
         base.loc[glitch] = med.loc[glitch]
@@ -1669,7 +2052,7 @@ def load_etf_total_df(etf_db_path: str) -> pd.DataFrame:
     if not etf_db_path or not os.path.exists(etf_db_path):
         return pd.DataFrame(columns=cols_out)
 
-    con = connect(etf_db_path)
+    con = _raw_db_connect(etf_db_path)
     try:
         table, date_col, cols = detect_etf_schema(con)
 
@@ -1773,6 +2156,7 @@ def compute_daily_sentiment(
     dates: List[pd.Timestamp],
     weights: Dict[str, float],
     hot_top_n: int = 100,
+    market_turnover: Optional[pd.Series] = None,
 ) -> Tuple[pd.DataFrame, List[str]]:
     """Compute daily sentiment metrics from local DB data.
 
@@ -1785,11 +2169,10 @@ def compute_daily_sentiment(
     if stock_df is None or stock_df.empty:
         return pd.DataFrame(), ["stock_df empty (no stock cross-section in DB for selected dates)"]
 
-    df = stock_df.copy()
-    df = df.dropna(subset=["trade_date", "change_pct", "amount"]).copy()
-    df["trade_date"] = df["trade_date"].apply(normalize_date)
-    df["change_pct"] = df["change_pct"].apply(safe_to_float)
-    df["amount"] = df["amount"].apply(safe_to_float)
+    df = stock_df[["trade_date", "sec_code", "change_pct", "amount", "close"]].copy()
+    df["trade_date"] = _ensure_trade_dates(df["trade_date"])
+    df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
+    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
     df = df.dropna(subset=["trade_date"]).copy()
     df["is_flat"] = np.isclose(df["change_pct"].fillna(0), 0.0)
@@ -1798,34 +2181,33 @@ def compute_daily_sentiment(
     allA_ew_pct = g["change_pct"].mean()  # unit: percent
     allA_ew_ret = (allA_ew_pct / 100.0).reindex(dates)
 
-    non_flat = df[~df["is_flat"]]
-    g2 = non_flat.groupby("trade_date")
-    up_cnt = g2["change_pct"].apply(lambda s: int((s > 0).sum()))
-    down_cnt = g2["change_pct"].apply(lambda s: int((s < 0).sum()))
+    non_flat = df.loc[~df["is_flat"], ["trade_date", "change_pct"]].copy()
+    non_flat["up_cnt"] = (non_flat["change_pct"] > 0).astype(int)
+    non_flat["down_cnt"] = (non_flat["change_pct"] < 0).astype(int)
+    counts = non_flat.groupby("trade_date")[["up_cnt", "down_cnt"]].sum()
+    up_cnt = counts["up_cnt"].reindex(dates)
+    down_cnt = counts["down_cnt"].reindex(dates)
     denom = (up_cnt + down_cnt).replace(0, np.nan)
     up_ratio = (up_cnt / denom).reindex(dates)
     up_down_ratio = (up_cnt / down_cnt.replace(0, np.nan)).reindex(dates)
 
     # hot proxy: daily top N by amount
-    def hot_mean(gdf: pd.DataFrame) -> float:
-        sub = gdf.nlargest(int(hot_top_n), "amount")
-        return float(sub["change_pct"].mean()) if len(sub) else np.nan
-
-    try:
-        hot_ret_pct = df.groupby("trade_date")[["amount","change_pct"]].apply(hot_mean, include_groups=False).reindex(dates)  # percent
-    except TypeError:
-        hot_ret_pct = df.groupby("trade_date")[["amount","change_pct"]].apply(hot_mean).reindex(dates)  # percent
+    hot_top = (
+        df.sort_values(["trade_date", "amount"], ascending=[True, False])
+        .groupby("trade_date", group_keys=False)
+        .head(int(hot_top_n))
+    )
+    hot_ret_pct = hot_top.groupby("trade_date")["change_pct"].mean().reindex(dates)
     hot_excess = ((hot_ret_pct - allA_ew_pct.reindex(dates)) / 100.0).reindex(dates)
 
     # style: zz1000 - hs300 (decimal returns)
     rel = pd.Series(index=dates, dtype=float)
     if index_df is not None and not index_df.empty:
-        idx = index_df.copy()
-        idx["trade_date"] = idx["trade_date"].apply(normalize_date)
-        idx["sec_code"] = idx["sec_code"].apply(canonical_code)
-        idx["change_pct"] = idx["change_pct"].apply(safe_to_float)
-        idx["close"] = idx.get("close", np.nan)
-        idx["close"] = idx["close"].apply(safe_to_float)
+        idx = index_df[["trade_date", "sec_code", "change_pct", "close"]].copy()
+        idx["trade_date"] = _ensure_trade_dates(idx["trade_date"])
+        idx["sec_code"] = _ensure_canonical_codes(idx["sec_code"])
+        idx["change_pct"] = pd.to_numeric(idx["change_pct"], errors="coerce")
+        idx["close"] = pd.to_numeric(idx["close"], errors="coerce")
 
         def ret_series(code: str) -> pd.Series:
             sub = idx[idx["sec_code"] == code].dropna(subset=["trade_date"]).sort_values("trade_date")
@@ -1847,7 +2229,10 @@ def compute_daily_sentiment(
         msgs.append("index_df empty: cannot compute 小盘-大盘相对(1000-300)")
 
     # market turnover (amount): prefer stock turnover; patch with index turnover; repair bad zeros/outliers
-    mkt_amt = build_market_turnover(index_df=index_df, stock_df=df, dates=dates, msgs=msgs)
+    if market_turnover is not None:
+        mkt_amt = pd.to_numeric(market_turnover, errors="coerce").reindex(dates).astype(float)
+    else:
+        mkt_amt = build_market_turnover(index_df=index_df, stock_df=df, dates=dates, msgs=msgs)
 
     ma10 = mkt_amt.rolling(10, min_periods=5).mean()
     turnover_rel_ma10 = (mkt_amt / ma10) - 1.0
@@ -2554,13 +2939,78 @@ def last_completed_trade_date_cn(now_cn: Optional[dt.datetime] = None, tz_offset
         if _today_trade_date_cn(now_cn, tz_offset_hours) is not None:
             if now_cn.time() >= CN_CLOSE_DATA_READY_TIME:
                 return today
-            prev = get_cn_last_trade_date(today - pd.Timedelta(days=1))
+            prev = get_latest_cn_trade_date(today - pd.Timedelta(days=1))
             return prev if prev is not None else today
-        last_td = get_cn_last_trade_date(today)
+        last_td = get_latest_cn_trade_date(today)
         return last_td if last_td is not None else today
     except Exception:
         # very defensive fallback
         return today
+
+
+def can_use_snapshot_for_close_target(
+    target_day: Optional[str],
+    now_cn: Optional[dt.datetime] = None,
+    tz_offset_hours: int = 8,
+) -> bool:
+    """Whether latest quote snapshot can safely be persisted as a close-day row.
+
+    The important guard is before-open T-1 catch-up: before 09:30 on a trading day,
+    quote endpoints still represent the latest completed close, so they can fill a
+    missing previous close day. Once the market opens, the same endpoints become
+    today's intraday data and must not be written to yesterday.
+    """
+    target = _day_ts(target_day)
+    if target is None:
+        return False
+    if now_cn is None:
+        now_cn = _now_with_tz_offset(tz_offset_hours)
+
+    today_trade_dt = _today_trade_date_cn(now_cn, tz_offset_hours)
+    if today_trade_dt is None:
+        return False
+
+    if now_cn.time() < dt.time(9, 30):
+        previous_close_dt = last_completed_trade_date_cn(now_cn, tz_offset_hours)
+        return _day_ts(previous_close_dt) == target
+
+    return False
+
+
+def resolve_opportunity_runtime(
+    now_cn: Optional[dt.datetime] = None,
+    tz_offset_hours: int = 8,
+) -> Dict[str, Any]:
+    if now_cn is None:
+        now_cn = _now_with_tz_offset(tz_offset_hours)
+
+    today_trade_dt = _today_trade_date_cn(now_cn, tz_offset_hours)
+    previous_close_dt = last_completed_trade_date_cn(now_cn, tz_offset_hours)
+
+    if today_trade_dt is None:
+        trade_dt = previous_close_dt
+        return {
+            "trade_date": str(trade_dt.date()) if trade_dt is not None else None,
+            "fallback_trade_date": str(trade_dt.date()) if trade_dt is not None else None,
+            "force_latest_quotes": False,
+            "use_intraday": False,
+        }
+
+    if now_cn.time() < dt.time(9, 30):
+        trade_dt = previous_close_dt
+        return {
+            "trade_date": str(trade_dt.date()) if trade_dt is not None else None,
+            "fallback_trade_date": str(trade_dt.date()) if trade_dt is not None else None,
+            "force_latest_quotes": False,
+            "use_intraday": False,
+        }
+
+    return {
+        "trade_date": str(today_trade_dt.date()),
+        "fallback_trade_date": str(previous_close_dt.date()) if previous_close_dt is not None else str(today_trade_dt.date()),
+        "force_latest_quotes": True,
+        "use_intraday": bool(is_cn_trading_time(now_cn, tz_offset_hours)),
+    }
 
 def _scale_amount_to_yuan(series: pd.Series) -> pd.Series:
     """Best-effort: infer成交额单位并统一到 元."""
@@ -2629,7 +3079,7 @@ def normalize_a_spot_df_full(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
     out.loc[mask_need, "change_pct"] = (out.loc[mask_need, "close"] / out.loc[mask_need, "pre_close"] - 1.0) * 100.0
 
     out = out.dropna(subset=["sec_code", "close"])
-    out = out[out["sec_code"].astype(str).str.len() == 6]
+    out = out[out["sec_code"].astype(str).map(lambda code: bool(A_SHARE_PREFIX_RE.match(code)))]
     return out, note
 
 
@@ -2664,7 +3114,7 @@ def _write_kline_daily_snapshot(stock_db: str, sec_type: str, trade_date: str, s
     msgs: List[str] = []
     if snap_df is None or snap_df.empty:
         return 0, [f"{sec_type}: snapshot empty"]
-    con = connect(stock_db)
+    con = _raw_db_connect(stock_db)
     try:
         if not table_exists(con, "kline_daily"):
             return 0, [f"{sec_type}: kline_daily not found in {stock_db}"]
@@ -2691,8 +3141,8 @@ def _write_kline_daily_snapshot(stock_db: str, sec_type: str, trade_date: str, s
 
         # build write frame
         w = pd.DataFrame()
-        w["sec_type"] = sec_type
         w["sec_code"] = snap_df["sec_code"].astype(str).str.zfill(6)
+        w["sec_type"] = sec_type
         w["trade_date"] = trade_date
         w["close"] = pd.to_numeric(snap_df["close"], errors="coerce")
         w["change_pct"] = pd.to_numeric(snap_df.get("change_pct", np.nan), errors="coerce")
@@ -2759,7 +3209,7 @@ def _write_concept_kline_snapshot(concept_db: str, trade_date: str, rt_concept_d
     if rt_concept_df is None or rt_concept_df.empty:
         return 0, ["concept: realtime snapshot empty"]
 
-    con = connect(concept_db)
+    con = _raw_db_connect(concept_db)
     try:
         table = "concept_kline_ths" if table_exists(con, "concept_kline_ths") else None
         if table is None:
@@ -2866,6 +3316,82 @@ def _write_concept_kline_snapshot(concept_db: str, trade_date: str, rt_concept_d
             pass
 
 
+def sync_close_snapshot_to_db_for_trade_date(
+    stock_db: str,
+    concept_db: Optional[str],
+    trade_date: str,
+    include_concept: bool = True,
+) -> Tuple[bool, List[str]]:
+    """Persist the latest quote snapshot as the specified close day.
+
+    Callers must guard that the snapshot actually represents `trade_date` (for
+    example: T+1 before open). This function only handles fetch/normalize/write.
+    """
+    msgs: List[str] = []
+    trade_date = str(pd.Timestamp(str(trade_date).replace("/", "-")[:10]).date())
+
+    stock_rows = 0
+    a_spot = None
+    a_note = ""
+    try:
+        a_spot = ak_fetch_a_spot_sina()
+        a_note = "ak.stock_zh_a_spot (sina)"
+    except Exception as e1:
+        try:
+            a_spot = ak_fetch_a_spot_em()
+            a_note = "ak.stock_zh_a_spot_em"
+        except Exception as e2:
+            msgs.append(f"stock spot fetch failed: sina={e1}; em={e2}")
+
+    if a_spot is not None:
+        a_full, note = normalize_a_spot_df_full(a_spot)
+        msgs.append(f"stock spot source={a_note}, {note}, n={len(a_full)}")
+        if len(a_full) >= 2000:
+            stock_rows, stock_msgs = _write_kline_daily_snapshot(stock_db, "stock", trade_date, a_full)
+            msgs.extend(stock_msgs)
+        else:
+            msgs.append("stock: coverage too low, will not write to DB")
+    else:
+        msgs.append("stock: no spot dataframe, skip write")
+
+    idx_rows = 0
+    idx_spot = None
+    idx_note = ""
+    try:
+        idx_spot = ak_fetch_index_spot_sina()
+        idx_note = "ak.stock_zh_index_spot_sina"
+    except Exception as e1:
+        try:
+            idx_spot = ak_fetch_index_spot_em("沪深重要指数")
+            idx_note = "ak.stock_zh_index_spot_em"
+        except Exception as e2:
+            msgs.append(f"index spot fetch failed: sina={e1}; em={e2}")
+
+    if idx_spot is not None:
+        idx_full, note = normalize_index_spot_df_full(pd.DataFrame(idx_spot))
+        idx_full = idx_full[idx_full["sec_code"].isin(REQUIRED_INDEX_CODES)].copy()
+        msgs.append(f"index spot source={idx_note}, {note}, n={len(idx_full)}")
+        if not idx_full.empty:
+            idx_rows, idx_msgs = _write_kline_daily_snapshot(stock_db, "index", trade_date, idx_full)
+            msgs.extend(idx_msgs)
+        else:
+            msgs.append("index: required index snapshot empty, skip write")
+
+    concept_rows = 0
+    if include_concept and concept_db:
+        try:
+            rt = adata_fetch_concept_current_ths()
+            concept_rows, concept_msgs = _write_concept_kline_snapshot(concept_db, trade_date, rt)
+            msgs.extend(concept_msgs)
+        except Exception as e:
+            msgs.append(f"concept snapshot failed: {e}")
+
+    ok = bool(stock_rows >= 2000 and idx_rows > 0)
+    if not ok:
+        msgs.append(f"snapshot sync result: stock_rows={stock_rows}, idx_rows={idx_rows}, concept_rows={concept_rows}")
+    return ok, msgs
+
+
 
 def sync_today_close_to_db_if_available(stock_db: str, concept_db: Optional[str], tz_offset_hours: int = 8, force: bool = False) -> Tuple[bool, List[str]]:
     """If after close and today is trading day, try to write today's close snapshot into DB.
@@ -2888,7 +3414,7 @@ def sync_today_close_to_db_if_available(stock_db: str, concept_db: Optional[str]
     has_stock_today = False
     has_index_today = False
     try:
-        con = connect(stock_db)
+        con = _raw_db_connect(stock_db)
         if table_exists(con, "kline_daily"):
             schema = detect_kline_schema_stock(con)
             if all(schema.get(k) is not None for k in ["sec_type","date"]):
@@ -2912,14 +3438,14 @@ def sync_today_close_to_db_if_available(stock_db: str, concept_db: Optional[str]
         a_spot = None
         a_note = ""
         try:
-            a_spot = ak_fetch_a_spot_em()
-            a_note = "ak.stock_zh_a_spot_em"
+            a_spot = ak_fetch_a_spot_sina()
+            a_note = "ak.stock_zh_a_spot (sina)"
         except Exception as e1:
             try:
-                a_spot = ak_fetch_a_spot_sina()
-                a_note = "ak.stock_zh_a_spot (sina)"
+                a_spot = ak_fetch_a_spot_em()
+                a_note = "ak.stock_zh_a_spot_em"
             except Exception as e2:
-                msgs.append(f"stock spot fetch failed: em={e1}; sina={e2}")
+                msgs.append(f"stock spot fetch failed: sina={e1}; em={e2}")
                 a_spot = None
 
         if a_spot is not None:
@@ -3039,8 +3565,8 @@ def ak_fetch_a_spot_any() -> Tuple[pd.DataFrame, str]:
     """Try multiple AkShare endpoints for all A-share realtime quotes."""
     last = None
     for fn, name in [
-        (ak_fetch_a_spot_em, "stock_zh_a_spot_em"),
         (ak_fetch_a_spot_sina, "stock_zh_a_spot"),
+        (ak_fetch_a_spot_em, "stock_zh_a_spot_em"),
         (ak_fetch_ah_spot, "stock_zh_ah_spot"),
     ]:
         try:
@@ -3501,7 +4027,7 @@ def main():
     ensure_runtime_dirs(runtime_paths)
     stock_db = runtime_paths.stock_db
     if not stock_db:
-        st.error(f"未找到股票/指数DB：{DEFAULT_STOCK_DB_CANDIDATES}。请把DB放到当前目录。")
+        st.error(f"未找到股票/指数DB：{stock_db}。请检查 runtime_paths.py 的数据路径配置。")
         return
 
     concept_db = runtime_paths.concept_db
@@ -3523,9 +4049,13 @@ def main():
     st.sidebar.subheader("数据日期切换")
     tz_offset = st.sidebar.number_input("北京时间偏移(UTC+?)", min_value=-12, max_value=14, value=8, step=1)
     now_cn = _now_with_tz_offset(int(tz_offset))
+    local_before = get_local_last_dates(stock_db, concept_db, etf_db)
 
-    remote_bundle = discover_data_dates_bundle(concept_db if (concept_db and os.path.exists(concept_db)) else None,
-                                               tz_offset_hours=int(tz_offset))
+    remote_bundle = discover_data_dates_bundle(
+        concept_db if (concept_db and os.path.exists(concept_db)) else None,
+        tz_offset_hours=int(tz_offset),
+        local_last_dates=local_before,
+    )
     st.session_state["remote_bundle"] = remote_bundle
 
     t1_close = remote_bundle.get("t1_close_day") or remote_bundle.get(
@@ -3569,15 +4099,133 @@ def main():
 
     # --- 启动时补齐缺失数据（只在本次会话启动时跑一次）---
     st.sidebar.subheader("数据库追平（对齐接口最新收盘）")
-    auto_catchup = st.sidebar.checkbox("自动追平（DB落后时自动更新）", value=True)
-    force_backfill = st.sidebar.checkbox("强制全量 backfill（60日）", value=False)
-    show_catchup_log = st.sidebar.checkbox("显示追平日志", value=False)
+    if "auto_catchup_state" not in st.session_state:
+        st.session_state["auto_catchup_state"] = {"target": None, "ok": False, "ts": 0.0}
+    if "catchup_log" not in st.session_state:
+        st.session_state["catchup_log"] = []
 
-    local_before = get_local_last_dates(stock_db, concept_db, etf_db)
+    required_close_missing = close_target_missing_domains(
+        local_before,
+        requested_close_day if effective_mode == "close" else None,
+        include_concept=False,
+        include_etf=False,
+    )
+    if effective_mode == "close" and requested_close_day and required_close_missing:
+        required_key = f"required_close_sync_{requested_close_day}"
+        required_state = st.session_state.get(required_key) or {}
+        required_throttled = bool(
+            required_state.get("target") == requested_close_day
+            and (
+                float(dt.datetime.utcnow().timestamp()) - float(required_state.get("ts") or 0.0)
+                < CATCHUP_THROTTLE_SECONDS
+            )
+        )
+        if not required_throttled:
+            if can_use_snapshot_for_close_target(requested_close_day):
+                with st.spinner(f"正在用收盘快照补齐 {requested_close_day} 数据..."):
+                    local_after_required, required_logs = maybe_backfill_to_close_day(
+                        stock_db=stock_db,
+                        concept_db=concept_db,
+                        etf_db=etf_db,
+                        target_day=requested_close_day,
+                        local_dates=local_before,
+                        include_concept=False,
+                        include_etf=False,
+                    )
+                mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after_required.get("stock"))
+                required_logs = list(required_logs) + [
+                    f"mining history sync target={local_after_required.get('stock')}, processed={mining_sync.get('processed', [])}, "
+                    f"latest_persisted={mining_sync.get('latest_persisted')}"
+                    + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
+                ]
+            else:
+                local_after_required = local_before
+                required_logs = [
+                    f"target_close_day={requested_close_day}",
+                    f"local_before={local_before}",
+                    f"missing_domains={required_close_missing}",
+                    "[TARGET_CLOSE_DEFER_OFFLINE] historical stock/index gaps are handled by offline_daily_update background job",
+                ]
+            local_before = local_after_required
+            still_missing_required = close_target_missing_domains(
+                local_before,
+                requested_close_day,
+                include_concept=False,
+                include_etf=False,
+            )
+            st.session_state[required_key] = {
+                "target": requested_close_day,
+                "ok": not bool(still_missing_required),
+                "ts": float(dt.datetime.utcnow().timestamp()),
+            }
+            st.session_state["catchup_log"] = (required_logs or [])[-200:]
+
     remote_stock_day = remote_bundle.get("remote_latest_stock_close_day") or remote_bundle.get(
         "calendar_last_trade_day")
     remote_concept_day = remote_bundle.get("remote_latest_concept_close_day") or remote_stock_day
     remote_etf_day = remote_bundle.get("remote_latest_etf_close_day") or remote_stock_day
+    now_ts = float(dt.datetime.utcnow().timestamp())
+
+    try:
+        offline_expected_dates = resolve_expected_trade_days(
+            runtime_paths.stock_db,
+            asof=remote_stock_day,
+            days=10,
+        )
+        offline_plan = build_missing_update_plan(runtime_paths.base_dir, offline_expected_dates)
+    except Exception as exc:
+        offline_expected_dates = []
+        offline_plan = {"ok": True, "missing_by_day": {}, "missing_by_domain": {}, "error": str(exc)}
+
+    offline_missing = offline_plan.get("missing_by_domain") or {}
+    if offline_missing:
+        st.sidebar.warning(f"DB date gaps detected: {offline_missing}")
+        offline_key = str(offline_plan.get("missing_by_day") or {})
+        offline_state = st.session_state.get("offline_daily_update_state") or {}
+        offline_throttled = bool(
+            offline_state.get("target") == offline_key
+            and (now_ts - float(offline_state.get("ts") or 0.0) < CATCHUP_THROTTLE_SECONDS)
+        )
+        if not offline_throttled:
+            sp = pick_existing_script(SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES)
+            if sp:
+                job = start_background_job(
+                    cmd=[
+                        sys.executable,
+                        sp,
+                        "--base-dir",
+                        runtime_paths.base_dir,
+                        "--asof",
+                        str(remote_stock_day or ""),
+                        "--days",
+                        "10",
+                        "--timeout-sec",
+                        "180",
+                    ],
+                    cwd=app_dir(),
+                    log_dir=Path(app_dir()) / "output" / "backfill_jobs",
+                    name=f"offline_daily_update_{remote_stock_day or 'latest'}",
+                )
+                st.session_state["offline_daily_update_state"] = {
+                    "target": offline_key,
+                    "ts": now_ts,
+                    "pid": job.get("pid"),
+                    "log_path": job.get("log_path"),
+                }
+                st.session_state["catchup_log"] = (
+                    [
+                        f"[OFFLINE_DAILY_UPDATE_BACKGROUND] pid={job.get('pid')} "
+                        f"asof={remote_stock_day} log={job.get('log_path')}",
+                        f"missing_by_domain={offline_missing}",
+                    ]
+                    + list(st.session_state.get("catchup_log", []))
+                )[-200:]
+            else:
+                st.sidebar.warning("offline_daily_update.py not found; DB gaps cannot be auto-filled.")
+
+    auto_catchup = st.sidebar.checkbox("自动追平（DB落后时自动更新）", value=False)
+    force_backfill = st.sidebar.checkbox("强制全量 backfill（60日）", value=False)
+    show_catchup_log = st.sidebar.checkbox("显示追平日志", value=False)
 
     need_sync = False
     if is_date_behind(local_before.get("stock"), remote_stock_day) or is_date_behind(local_before.get("index"),
@@ -3591,6 +4239,20 @@ def main():
     st.sidebar.caption(
         f"本地最新：stock={local_before.get('stock')}｜index={local_before.get('index')}｜concept={local_before.get('concept')}｜etf={local_before.get('etf')}"
     )
+    try:
+        required_missing_after_sync = close_target_missing_domains(
+            local_before,
+            requested_close_day if effective_mode == "close" else None,
+            include_concept=False,
+            include_etf=False,
+        )
+        if requested_close_day and required_missing_after_sync:
+            st.sidebar.warning(
+                f"本地 stock/index 尚未覆盖 {requested_close_day}：{required_missing_after_sync}。"
+                "本次会先回退到本地可用日；需要查看补齐细节可打开追平日志。"
+            )
+    except Exception:
+        pass
 
     if "auto_catchup_state" not in st.session_state:
         st.session_state["auto_catchup_state"] = {"target": None, "ok": False, "ts": 0.0}
@@ -3598,17 +4260,22 @@ def main():
         st.session_state["catchup_log"] = []
 
     target_key = f"{remote_stock_day}|{remote_concept_day}|{remote_etf_day}"
-    now_ts = float(dt.datetime.utcnow().timestamp())
     state = st.session_state.get("auto_catchup_state") or {}
     throttled = bool(
         (state.get("target") == target_key)
-        and (now_ts - float(state.get("ts") or 0.0) < 300.0)
+        and (now_ts - float(state.get("ts") or 0.0) < CATCHUP_THROTTLE_SECONDS)
         and bool(state.get("ok") or (not force_backfill))
     )
 
     if (force_backfill or (auto_catchup and need_sync)) and (not throttled):
         with st.spinner("正在追平数据库到接口最新收盘日..."):
             local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=bool(force_backfill))
+        mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+        logs = list(logs) + [
+            f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
+            f"latest_persisted={mining_sync.get('latest_persisted')}"
+            + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
+        ]
         st.session_state["catchup_log"] = (logs or [])[-200:]
 
         local2 = get_local_last_dates(stock_db, concept_db, etf_db)
@@ -3630,7 +4297,7 @@ def main():
 
         # --- 数据库日线更新（adata/baostock；仅日线接口写库） ---
     st.sidebar.subheader("数据库日线更新（adata/baostock）")
-    auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算", value=True)
+    auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算", value=False)
     validate_db_btn = st.sidebar.button("核验DB最新交易日数据")
     manual_daily_sync = st.sidebar.button("手动更新DB（日线接口）")
     repair_latest_btn = st.sidebar.button("修复最新交易日（日线接口，覆写当日数据）")
@@ -3648,8 +4315,35 @@ def main():
 
     # Manual daily update (no snapshot write)
     if manual_daily_sync:
-        with st.spinner("正在使用日收盘接口更新数据库（baostock/adata）..."):
-            local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=True)
+        logs: List[str] = []
+        with st.spinner("正在运行离线日更脚本（检查缺失日期并补齐DB）..."):
+            sp = pick_existing_script(SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES)
+            if sp:
+                rc, out = run_cmd(
+                    [
+                        sys.executable,
+                        sp,
+                        "--base-dir",
+                        runtime_paths.base_dir,
+                        "--asof",
+                        str(remote_stock_day or ""),
+                        "--days",
+                        "10",
+                    ],
+                    timeout_sec=3600,
+                )
+                logs = [f"[OFFLINE_DAILY_UPDATE] rc={rc} asof={remote_stock_day}"]
+                if out:
+                    logs.append(out[:4000])
+                _clear_local_last_dates_cache()
+            else:
+                local_after, fallback_logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=True)
+                mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+                logs = list(fallback_logs) + [
+                    f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
+                    f"latest_persisted={mining_sync.get('latest_persisted')}"
+                    + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
+                ]
         st.session_state["daily_sync_log"] = logs
         st.session_state["db_validate_result"] = validate_db_latest_day(
             stock_db=stock_db, concept_db=concept_db, tz_offset_hours=int(tz_offset)
@@ -3662,21 +4356,63 @@ def main():
             ok, logs, val = repair_latest_trade_day_daily(
                 stock_db=stock_db, concept_db=concept_db, etf_db=etf_db, tz_offset_hours=int(tz_offset)
             )
+        repair_target_day = val.get("expected_day") if isinstance(val, dict) else None
+        mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, repair_target_day if ok else None)
+        logs = list(logs) + [
+            f"mining history sync target={repair_target_day if ok else None}, processed={mining_sync.get('processed', [])}, "
+            f"latest_persisted={mining_sync.get('latest_persisted')}"
+            + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
+        ]
         st.session_state["daily_sync_log"] = logs
         st.session_state["db_validate_result"] = val
         if ok:
             _st_rerun_safe()
 
-    # Auto: once per trading day after close
+    # Auto: catch up to the latest completed close day once per day
     try:
         if auto_daily_sync:
             now_cn = _now_with_tz_offset(int(tz_offset))
-            td = _today_trade_date_cn(now_cn, int(tz_offset))
-            if td is not None and _is_after_close_cn(now_cn, int(tz_offset)):
-                key = f"auto_daily_sync_done_{td.strftime('%Y-%m-%d')}"
-                if not st.session_state.get(key, False):
+            completed_td = last_completed_trade_date_cn(now_cn, int(tz_offset))
+            completed_day = completed_td.strftime('%Y-%m-%d') if completed_td is not None else None
+            need_completed_catchup = bool(
+                completed_day
+                and (
+                    is_date_behind(local_before.get("stock"), completed_day)
+                    or is_date_behind(local_before.get("index"), completed_day)
+                    or (concept_db and os.path.exists(concept_db) and is_date_behind(local_before.get("concept"), completed_day))
+                    or (etf_db and os.path.exists(etf_db) and is_date_behind(local_before.get("etf"), completed_day))
+                )
+            )
+            if completed_day and need_completed_catchup:
+                key = f"auto_daily_sync_state_{completed_day}"
+                daily_state = st.session_state.get(key) or {}
+                daily_throttled = bool(
+                    daily_state.get("target") == completed_day
+                    and (
+                        float(dt.datetime.utcnow().timestamp()) - float(daily_state.get("ts") or 0.0)
+                        < CATCHUP_THROTTLE_SECONDS
+                    )
+                    and bool(daily_state.get("ok"))
+                )
+                if not daily_throttled:
                     local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=False)
-                    st.session_state[key] = True
+                    mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+                    logs = list(logs) + [
+                        f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
+                        f"latest_persisted={mining_sync.get('latest_persisted')}"
+                        + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
+                    ]
+                    still_behind_completed = bool(
+                        is_date_behind(local_after.get("stock"), completed_day)
+                        or is_date_behind(local_after.get("index"), completed_day)
+                        or (concept_db and os.path.exists(concept_db) and is_date_behind(local_after.get("concept"), completed_day))
+                        or (etf_db and os.path.exists(etf_db) and is_date_behind(local_after.get("etf"), completed_day))
+                    )
+                    st.session_state[key] = {
+                        "target": completed_day,
+                        "ok": not still_behind_completed,
+                        "ts": float(dt.datetime.utcnow().timestamp()),
+                    }
                     st.session_state["daily_sync_log"] = logs
                     st.session_state["db_validate_result"] = validate_db_latest_day(
                         stock_db=stock_db, concept_db=concept_db, tz_offset_hours=int(tz_offset)
@@ -3704,7 +4440,7 @@ def main():
 
     with st.spinner("读取本地DB..."):
         # stock/index
-        conS = connect(stock_db)
+        conS = _raw_db_connect(stock_db)
         try:
             if not table_exists(conS, "kline_daily"):
                 st.error(f"{stock_db} 中不存在表 kline_daily")
@@ -3738,7 +4474,7 @@ def main():
         concept_df = pd.DataFrame()
         name_map = {}
         if concept_db and os.path.exists(concept_db):
-            conC = connect(concept_db)
+            conC = _raw_db_connect(concept_db)
             try:
                 if table_exists(conC, "concept_kline"):
                     concept_df = load_concept_kline(conC, dates, "concept_kline")
@@ -3773,8 +4509,27 @@ def main():
     except Exception:
         db_latest_concept_dt = db_latest_stock_dt
 
-    # 为保证跨表一致性：收盘口径统一使用“各数据表都覆盖到的最近日期”
-    panel_close_dt = min([d for d in [requested_close_dt0, close_ref_dt_cal, db_latest_stock_dt, db_latest_index_dt, db_latest_concept_dt] if d is not None])
+    # 情绪/机会挖掘由 stock/index 驱动；concept 滞后不能把这两个模块静默降级到更早日期。
+    panel_close_dt_by_latest = resolve_panel_close_date(
+        requested_close_dt0,
+        close_ref_dt_cal,
+        db_latest_stock_dt,
+        db_latest_index_dt,
+        db_latest_concept_dt,
+    )
+    panel_close_dt, missing_requested_close, available_panel_close_dates = resolve_available_panel_close_date(
+        requested_close_dt0,
+        stock_df,
+        index_df,
+        REQUIRED_INDEX_CODES,
+    )
+    if panel_close_dt is None:
+        panel_close_dt = panel_close_dt_by_latest
+    if missing_requested_close and requested_close_dt0 is not None:
+        st.sidebar.warning(
+            f"本地 stock/index 未覆盖所选日期 {pd.Timestamp(requested_close_dt0).date()}，"
+            f"本次先显示最近可用日 {panel_close_dt.date() if panel_close_dt is not None else 'N/A'}。"
+        )
 
     # 盘中快照的目标交易日：仅在交易日使用“今天”，否则回退到 panel_close_dt
     snapshot_trade_dt = today_ts if _today_trade_date_cn(now_cn2, int(tz_offset)) is not None else None
@@ -3839,7 +4594,15 @@ def main():
             st.write("核验信息读取失败：", e)
 
 
-    daily, msgs = compute_daily_sentiment(stock_df, index_df, etf_df, dates, weights, int(hot_top))
+    daily, msgs = compute_daily_sentiment(
+        stock_df,
+        index_df,
+        etf_df,
+        dates,
+        weights,
+        int(hot_top),
+        market_turnover=market_turnover,
+    )
     # intraday snapshot placeholders (defined early to avoid NameError)
     intraday_row = None
     intraday_msgs: List[str] = []
@@ -3865,7 +4628,7 @@ def main():
 
     # 同步写入 daily_matrics 表（存在则 upsert；不存在则创建/补列）
     try:
-        con_metrics = connect(stock_db)
+        con_metrics = _raw_db_connect(stock_db)
         _ = upsert_daily_matrics(con_metrics, daily)
         con_metrics.close()
     except Exception as e:
@@ -3888,10 +4651,14 @@ def main():
     # DB 收盘口径：优先使用 panel_close_dt 对齐（避免与题材/指数日期不一致）
     try:
         _hit = daily[daily["trade_date"] == panel_close_dt]
-        last_db = _hit.iloc[-1] if not _hit.empty else daily.iloc[-1]
+        if not _hit.empty:
+            last_db = _hit.iloc[-1]
+        else:
+            st.warning(f"指标日表未找到 {panel_close_dt.date() if panel_close_dt is not None else 'N/A'}，已回退到最近可用日。")
+            _daily_before = daily[daily["trade_date"] <= panel_close_dt] if panel_close_dt is not None else daily
+            last_db = (_daily_before.iloc[-1] if not _daily_before.empty else daily.iloc[-1])
     except Exception:
         last_db = daily.iloc[-1]
-    last = last_db
     last = last_db
     intraday_row = None
     qvix_info = {'qvix': np.nan, 'qvix_pctile': np.nan}
@@ -4085,6 +4852,24 @@ def main():
     else:
         st.info("情绪总分可用日线不足（需更多历史）。")
 
+    st.markdown("---")
+    st.subheader("机会挖掘")
+    opportunity_runtime = resolve_selected_opportunity_runtime(
+        effective_mode=effective_mode,
+        panel_close_dt=panel_close_dt,
+        now_cn=now_cn2,
+        tz_offset_hours=int(tz_offset),
+    )
+    render_scanner_tab(
+        runtime_paths.base_dir,
+        fallback_trade_date=opportunity_runtime.get("fallback_trade_date")
+        or (str(panel_close_dt.date()) if panel_close_dt is not None else None),
+        latest_quote_trade_date=opportunity_runtime.get("trade_date"),
+        use_intraday=bool(opportunity_runtime.get("use_intraday")),
+        prefer_latest_quotes=bool(opportunity_runtime.get("force_latest_quotes")),
+        force_latest_quotes=bool(opportunity_runtime.get("force_latest_quotes")),
+    )
+
     # ---- Theme Cycle ----
     st.markdown("---")
     st.subheader("指标体系B：同花顺概念板块（Theme Cycle）")
@@ -4256,7 +5041,6 @@ def main():
             f"ETF份额本地最新日期：{etf_df['trade_date'].max().date()}。"
             f"若深市历史不完整，常见原因是数据源不提供历史，只能从开始运行后每日累积快照。"
         )
-
 
 if __name__ == "__main__":
     main()

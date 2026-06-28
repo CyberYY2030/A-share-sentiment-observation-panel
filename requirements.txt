@@ -4,6 +4,7 @@ baostock>=0.8.9
 easyquotation>=0.7
 numpy>=1.26.0
 pandas>=2.0.0
+openpyxl>=3.1.0
 plotly>=5.18.0
 pqquotation>=0.0.8
 py-mini-racer>=0.6.0

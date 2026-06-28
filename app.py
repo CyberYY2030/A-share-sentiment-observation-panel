@@ -1,4 +1,4 @@
-from app_panel_auto_update_v44 import main
+from app_panel import main
 
 
 if __name__ == "__main__":
