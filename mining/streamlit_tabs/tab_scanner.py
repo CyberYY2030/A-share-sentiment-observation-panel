@@ -733,12 +733,23 @@ def load_watchlist_snapshot(
     base_dir: str | Path,
     trade_date: str | None,
     lookback: int = 40,
-) -> pd.DataFrame:
+) -> tuple[pd.DataFrame, str | None]:
+    """Build the strong-stock funnel for the latest daily-bar date at or before trade_date.
+
+    The panel's trade_date can be an intraday/latest-quote date with no daily kline yet
+    (e.g. mid-session today). The funnel is derived purely from daily bars (MA10, pullback,
+    volume-shrink), so it can only be computed up to the last completed daily bar. We resolve
+    down to that date and return it so the label reflects the day actually computed.
+    """
     if not trade_date:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
     conn = connect(base_dir=base_dir)
     try:
-        return build_watchlist(conn, trade_date, lookback=lookback)
+        available = list_stock_trade_dates(conn, end_date=trade_date, limit=1, include_end=True)
+        effective_date = available[-1] if available else None
+        if not effective_date:
+            return pd.DataFrame(), None
+        return build_watchlist(conn, effective_date, lookback=lookback), effective_date
     finally:
         conn.close()
 
@@ -955,9 +966,9 @@ def render_scanner_tab(
         else:
             st.dataframe(_prepare_followup_display(follow_df), width="stretch", hide_index=True)
 
-    watchlist_df = load_watchlist_snapshot(base_dir=base_dir, trade_date=today_date)
+    watchlist_df, watchlist_date = load_watchlist_snapshot(base_dir=base_dir, trade_date=today_date)
     ready_df, trigger_df = split_actionable_watchlist(watchlist_df, top_n=30)
-    st.markdown(f"**强势沉淀行动漏斗（{today_date}，近40日）**")
+    st.markdown(f"**强势股回踩与再启动跟踪（{watchlist_date or today_date}，近40日）**")
     ready_col, trigger_col = st.columns(2)
     with ready_col:
         st.markdown(f"**回踩到位·预备（{len(ready_df)}）**")
