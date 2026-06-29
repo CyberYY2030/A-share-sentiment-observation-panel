@@ -7,7 +7,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
-from .db import list_stock_trade_dates
+from .db import list_stock_trade_dates, now_str
 from .features import moving_average, volume_shrink_ratio
 
 WATCHLIST_DEFAULT_PARAMS: dict[str, float | int] = {
@@ -360,6 +360,84 @@ def build_watchlist(
         return _empty_watchlist()
     result = pd.DataFrame(rows)
     return result.sort_values(["triage", "last_flag_date", "pullback_pct"], ascending=[False, False, True]).reset_index(drop=True)
+
+
+SNAPSHOT_COLUMNS = [
+    "snapshot_date",
+    "sec_code",
+    "sec_name",
+    "state",
+    "triage",
+    "entry_price",
+    "run_up_pct",
+    "shrink_ratio",
+    "ma_proximity",
+    "pullback_pct",
+    "reclaim_ma10",
+    "vol_expand_up",
+    "flag_count",
+    "days_since_flag",
+    "flag_strategies",
+    "created_at",
+]
+
+
+def _snapshot_value(row: pd.Series, column: str) -> Any:
+    value = row.get(column)
+    if pd.isna(value):
+        return None
+    return value
+
+
+def persist_watchlist_snapshot(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    params: dict[str, Any] | None = None,
+) -> int:
+    """Persist the full watchlist funnel for later forward validation."""
+    watchlist = build_watchlist(conn, trade_date, params=params)
+    if watchlist.empty:
+        conn.commit()
+        return 0
+
+    written = 0
+    created_at = now_str()
+    for _, row in watchlist.iterrows():
+        entry_price = _safe_float(row.get("close"))
+        if not math.isfinite(entry_price) or entry_price <= 0:
+            continue
+        values = {
+            "snapshot_date": str(trade_date),
+            "sec_code": str(row.get("sec_code") or "").zfill(6),
+            "sec_name": _snapshot_value(row, "sec_name"),
+            "state": str(row.get("state") or ""),
+            "triage": _snapshot_value(row, "triage"),
+            "entry_price": entry_price,
+            "run_up_pct": _snapshot_value(row, "run_up_pct"),
+            "shrink_ratio": _snapshot_value(row, "shrink_ratio"),
+            "ma_proximity": _snapshot_value(row, "ma_proximity"),
+            "pullback_pct": _snapshot_value(row, "pullback_pct"),
+            "reclaim_ma10": int(bool(row.get("reclaim_ma10"))),
+            "vol_expand_up": int(bool(row.get("vol_expand_up"))),
+            "flag_count": _snapshot_value(row, "flag_count"),
+            "days_since_flag": _snapshot_value(row, "days_since_flag"),
+            "flag_strategies": _snapshot_value(row, "flag_strategies"),
+            "created_at": created_at,
+        }
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO watchlist_snapshots (
+              snapshot_date, sec_code, sec_name, state, triage, entry_price,
+              run_up_pct, shrink_ratio, ma_proximity, pullback_pct,
+              reclaim_ma10, vol_expand_up, flag_count, days_since_flag,
+              flag_strategies, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            tuple(values[column] for column in SNAPSHOT_COLUMNS),
+        )
+        written += 1
+    conn.commit()
+    return written
 
 
 def split_actionable_watchlist(

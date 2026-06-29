@@ -73,6 +73,51 @@ CREATE TABLE IF NOT EXISTS outcomes (
 );
 CREATE INDEX IF NOT EXISTS idx_outcomes_win ON outcomes(is_win);
 
+CREATE TABLE IF NOT EXISTS watchlist_snapshots (
+  snapshot_date    TEXT NOT NULL,
+  sec_code         TEXT NOT NULL,
+  sec_name         TEXT,
+  state            TEXT NOT NULL,
+  triage           REAL,
+  entry_price      REAL NOT NULL,
+  run_up_pct       REAL,
+  shrink_ratio     REAL,
+  ma_proximity     REAL,
+  pullback_pct     REAL,
+  reclaim_ma10     INTEGER,
+  vol_expand_up    INTEGER,
+  flag_count       INTEGER,
+  days_since_flag  INTEGER,
+  flag_strategies  TEXT,
+  created_at       TEXT,
+  PRIMARY KEY (snapshot_date, sec_code, state)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_snapshots_state_date
+ON watchlist_snapshots(state, snapshot_date);
+
+CREATE TABLE IF NOT EXISTS watchlist_outcomes (
+  snapshot_date    TEXT NOT NULL,
+  sec_code         TEXT NOT NULL,
+  state            TEXT NOT NULL,
+  open_t1          REAL,
+  high_t1          REAL,
+  low_t1           REAL,
+  close_t1         REAL,
+  close_t2         REAL,
+  close_t5         REAL,
+  r1               REAL,
+  r2               REAL,
+  r3               REAL,
+  r4               REAL,
+  r5               REAL,
+  is_win           INTEGER,
+  backfilled_at    TEXT,
+  status           TEXT,
+  PRIMARY KEY (snapshot_date, sec_code, state)
+);
+CREATE INDEX IF NOT EXISTS idx_watchlist_outcomes_status
+ON watchlist_outcomes(status);
+
 CREATE TABLE IF NOT EXISTS stock_market_cap (
   sec_code        TEXT PRIMARY KEY,
   total_mv        REAL,

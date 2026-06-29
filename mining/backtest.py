@@ -14,6 +14,74 @@ def _compute_return(numerator: float | None, entry_price: float) -> float | None
     return (float(numerator) - entry_price) / entry_price
 
 
+def _forward_bars(conn: sqlite3.Connection, sec_code: str, trade_date: str) -> dict[str, object] | None:
+    calendar = list_stock_trade_dates(conn)
+    calendar_index = {day: idx for idx, day in enumerate(calendar)}
+    idx = calendar_index.get(trade_date)
+    if idx is None:
+        return None
+
+    target_dates = {
+        "t1": calendar[idx + 1] if idx + 1 < len(calendar) else None,
+        "t2": calendar[idx + 2] if idx + 2 < len(calendar) else None,
+        "t5": calendar[idx + 5] if idx + 5 < len(calendar) else None,
+    }
+    future_rows = conn.execute(
+        """
+        SELECT trade_date, open, high, low, close
+        FROM ash.kline_daily
+        WHERE sec_type='stock'
+          AND sec_code=?
+          AND trade_date > ?
+        ORDER BY trade_date
+        """,
+        (sec_code, trade_date),
+    ).fetchall()
+    future_map = {future["trade_date"]: future for future in future_rows}
+    t1 = future_map.get(target_dates["t1"]) if target_dates["t1"] else None
+    t2 = future_map.get(target_dates["t2"]) if target_dates["t2"] else None
+    t5 = future_map.get(target_dates["t5"]) if target_dates["t5"] else None
+
+    if not future_rows:
+        status = "delisted"
+    elif t1 is None:
+        status = "halted"
+    elif t2 is None or t5 is None:
+        status = "partial"
+    else:
+        status = "complete"
+    return {"t1": t1, "t2": t2, "t5": t5, "status": status}
+
+
+def _forward_outcome_values(entry_price: float, bars: dict[str, object]) -> dict[str, object]:
+    t1 = bars.get("t1")
+    t2 = bars.get("t2")
+    t5 = bars.get("t5")
+    r1 = _compute_return(None if t1 is None else t1["open"], entry_price)
+    r2 = _compute_return(None if t1 is None else t1["high"], entry_price)
+    r3 = _compute_return(None if t1 is None else t1["low"], entry_price)
+    r4 = _compute_return(None if t2 is None else t2["close"], entry_price)
+    r5 = _compute_return(None if t5 is None else t5["close"], entry_price)
+    is_win = None
+    if r2 is not None and r3 is not None:
+        is_win = 1 if (r2 > 0.02 and r3 > -0.03) else 0
+    return {
+        "open_t1": None if t1 is None else t1["open"],
+        "high_t1": None if t1 is None else t1["high"],
+        "low_t1": None if t1 is None else t1["low"],
+        "close_t1": None if t1 is None else t1["close"],
+        "close_t2": None if t2 is None else t2["close"],
+        "close_t5": None if t5 is None else t5["close"],
+        "r1": r1,
+        "r2": r2,
+        "r3": r3,
+        "r4": r4,
+        "r5": r5,
+        "is_win": is_win,
+        "status": bars["status"],
+    }
+
+
 def backfill_outcomes(
     conn: sqlite3.Connection, trade_date: str | None = None, force: bool = False
 ) -> dict[str, int]:
@@ -41,59 +109,19 @@ def backfill_outcomes(
             (trade_date, trade_date),
         ).fetchall()
 
-    calendar = list_stock_trade_dates(conn)
-    calendar_index = {day: idx for idx, day in enumerate(calendar)}
-
     processed = 0
     completed = 0
     partial = 0
     for row in rows:
         processed += 1
-        idx = calendar_index.get(row["trade_date"])
-        if idx is None:
+        bars = _forward_bars(conn, row["sec_code"], row["trade_date"])
+        if bars is None:
             continue
-
-        target_dates = {
-            "t1": calendar[idx + 1] if idx + 1 < len(calendar) else None,
-            "t2": calendar[idx + 2] if idx + 2 < len(calendar) else None,
-            "t5": calendar[idx + 5] if idx + 5 < len(calendar) else None,
-        }
-        future_rows = conn.execute(
-            """
-            SELECT trade_date, open, high, low, close
-            FROM ash.kline_daily
-            WHERE sec_type='stock'
-              AND sec_code=?
-              AND trade_date > ?
-            ORDER BY trade_date
-            """,
-            (row["sec_code"], row["trade_date"]),
-        ).fetchall()
-        future_map = {future["trade_date"]: future for future in future_rows}
-        t1 = future_map.get(target_dates["t1"]) if target_dates["t1"] else None
-        t2 = future_map.get(target_dates["t2"]) if target_dates["t2"] else None
-        t5 = future_map.get(target_dates["t5"]) if target_dates["t5"] else None
-
-        if not future_rows:
-            status = "delisted"
-        elif t1 is None:
-            status = "halted"
-        elif t2 is None or t5 is None:
-            status = "partial"
-            partial += 1
-        else:
-            status = "complete"
+        values = _forward_outcome_values(float(row["entry_price"]), bars)
+        if values["status"] == "complete":
             completed += 1
-
-        entry_price = float(row["entry_price"])
-        r1 = _compute_return(None if t1 is None else t1["open"], entry_price)
-        r2 = _compute_return(None if t1 is None else t1["high"], entry_price)
-        r3 = _compute_return(None if t1 is None else t1["low"], entry_price)
-        r4 = _compute_return(None if t2 is None else t2["close"], entry_price)
-        r5 = _compute_return(None if t5 is None else t5["close"], entry_price)
-        is_win = None
-        if r2 is not None and r3 is not None:
-            is_win = 1 if (r2 > 0.02 and r3 > -0.03) else 0
+        elif values["status"] == "partial":
+            partial += 1
 
         conn.execute(
             """
@@ -104,20 +132,98 @@ def backfill_outcomes(
             """,
             (
                 row["candidate_id"],
-                None if t1 is None else t1["open"],
-                None if t1 is None else t1["high"],
-                None if t1 is None else t1["low"],
-                None if t1 is None else t1["close"],
-                None if t2 is None else t2["close"],
-                None if t5 is None else t5["close"],
-                r1,
-                r2,
-                r3,
-                r4,
-                r5,
-                is_win,
+                values["open_t1"],
+                values["high_t1"],
+                values["low_t1"],
+                values["close_t1"],
+                values["close_t2"],
+                values["close_t5"],
+                values["r1"],
+                values["r2"],
+                values["r3"],
+                values["r4"],
+                values["r5"],
+                values["is_win"],
                 now_str(),
-                status,
+                values["status"],
+            ),
+        )
+
+    conn.commit()
+    return {"processed": processed, "complete": completed, "partial": partial}
+
+
+def backfill_snapshot_outcomes(
+    conn: sqlite3.Connection,
+    snapshot_date: str | None = None,
+    force: bool = False,
+) -> dict[str, int]:
+    if force:
+        rows = conn.execute(
+            """
+            SELECT snapshot_date, sec_code, state, entry_price
+            FROM watchlist_snapshots
+            WHERE (? IS NULL OR snapshot_date=?)
+            ORDER BY snapshot_date, sec_code, state
+            """,
+            (snapshot_date, snapshot_date),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """
+            SELECT s.snapshot_date, s.sec_code, s.state, s.entry_price
+            FROM watchlist_snapshots s
+            LEFT JOIN watchlist_outcomes o
+              ON o.snapshot_date=s.snapshot_date
+             AND o.sec_code=s.sec_code
+             AND o.state=s.state
+            WHERE (? IS NULL OR s.snapshot_date=?)
+              AND (o.snapshot_date IS NULL OR o.status='partial')
+            ORDER BY s.snapshot_date, s.sec_code, s.state
+            """,
+            (snapshot_date, snapshot_date),
+        ).fetchall()
+
+    processed = 0
+    completed = 0
+    partial = 0
+    for row in rows:
+        processed += 1
+        bars = _forward_bars(conn, row["sec_code"], row["snapshot_date"])
+        if bars is None:
+            continue
+        values = _forward_outcome_values(float(row["entry_price"]), bars)
+        if values["status"] == "complete":
+            completed += 1
+        elif values["status"] == "partial":
+            partial += 1
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO watchlist_outcomes (
+              snapshot_date, sec_code, state, open_t1, high_t1, low_t1,
+              close_t1, close_t2, close_t5, r1, r2, r3, r4, r5,
+              is_win, backfilled_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                row["snapshot_date"],
+                row["sec_code"],
+                row["state"],
+                values["open_t1"],
+                values["high_t1"],
+                values["low_t1"],
+                values["close_t1"],
+                values["close_t2"],
+                values["close_t5"],
+                values["r1"],
+                values["r2"],
+                values["r3"],
+                values["r4"],
+                values["r5"],
+                values["is_win"],
+                now_str(),
+                values["status"],
             ),
         )
 

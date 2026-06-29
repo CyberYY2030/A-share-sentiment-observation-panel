@@ -730,6 +730,207 @@ def compute_baseline_universe(
     pairs = pd.concat(pair_frames, ignore_index=True)
     metrics = _forward_metrics_from_pivots(pairs, calendar, pivots, hit_threshold=hit_threshold)
     return _baseline_from_forward_metrics(metrics)
+
+WATCHLIST_SNAPSHOT_SUMMARY_COLUMNS = [
+    "state",
+    "triage_bucket",
+    "n_snapshots",
+    "n_evaluated",
+    "sample_status",
+    "win_rate",
+    "avg_r5",
+    "median_r5",
+    "mfe_median",
+    "mae_median",
+    "discovery_hit",
+    "median_r5_vs_baseline",
+    "win_rate_vs_baseline",
+    "discovery_hit_vs_baseline",
+]
+
+
+def _empty_watchlist_snapshot_summary() -> pd.DataFrame:
+    return pd.DataFrame(columns=WATCHLIST_SNAPSHOT_SUMMARY_COLUMNS)
+
+
+def _add_triage_buckets(rows: pd.DataFrame) -> pd.DataFrame:
+    result = rows.copy()
+    result["triage_bucket"] = pd.NA
+    if result.empty or "state" not in result.columns:
+        return result
+    for state, index_labels in result.groupby("state", sort=False).groups.items():
+        triage = pd.to_numeric(result.loc[index_labels, "triage"], errors="coerce")
+        valid = triage.dropna()
+        if valid.empty:
+            continue
+        ranks = valid.rank(method="first", ascending=False)
+        n = len(valid)
+        labels = pd.Series("q2", index=valid.index, dtype="object")
+        labels.loc[ranks <= max(1, math.ceil(n / 4))] = "top_q1"
+        labels.loc[ranks > max(0, math.floor(n * 3 / 4))] = "bottom_q4"
+        labels.loc[(labels != "top_q1") & (labels != "bottom_q4")] = "middle"
+        result.loc[labels.index, "triage_bucket"] = labels
+    return result
+
+
+def evaluate_watchlist_snapshots(
+    conn: Any,
+    start: str | None = None,
+    end: str | None = None,
+    min_sample: int = 50,
+    hit_threshold: float = DEFAULT_HIT_THRESHOLD,
+) -> pd.DataFrame:
+    params: list[Any] = []
+    where = []
+    if start:
+        where.append("s.snapshot_date >= ?")
+        params.append(start)
+    if end:
+        where.append("s.snapshot_date <= ?")
+        params.append(end)
+    where_sql = "WHERE " + " AND ".join(where) if where else ""
+    rows = pd.read_sql_query(
+        f"""
+        SELECT
+          s.snapshot_date AS trade_date,
+          s.sec_code,
+          s.state,
+          s.triage,
+          o.r1,
+          o.r2,
+          o.r3,
+          o.r4,
+          o.r5,
+          o.is_win,
+          o.status
+        FROM watchlist_snapshots s
+        LEFT JOIN watchlist_outcomes o
+          ON o.snapshot_date=s.snapshot_date
+         AND o.sec_code=s.sec_code
+         AND o.state=s.state
+        {where_sql}
+        """,
+        conn,
+        params=params,
+    )
+    if rows.empty:
+        return _empty_watchlist_snapshot_summary()
+
+    rows = _add_triage_buckets(rows)
+    complete = rows[
+        (rows["status"] == "complete")
+        & pd.to_numeric(rows["r5"], errors="coerce").notna()
+    ].copy()
+    candidate_counts = rows.groupby("state").size().to_dict()
+    completed_counts = complete.groupby("state").size().to_dict() if not complete.empty else {}
+
+    eval_start = start or str(rows["trade_date"].min())
+    eval_end = end or str(rows["trade_date"].max())
+    baseline = compute_baseline_universe(conn, eval_start, eval_end, hit_threshold=hit_threshold)
+    baseline_median = baseline.get("baseline_median_r5")
+    baseline_win = baseline.get("baseline_win_rate")
+    baseline_discovery = baseline.get("baseline_discovery_hit")
+
+    if not complete.empty:
+        metrics = compute_forward_window_metrics(
+            conn,
+            complete[["trade_date", "sec_code"]],
+            hit_threshold=hit_threshold,
+        )
+        for column in metrics.columns:
+            complete[column] = metrics[column]
+    else:
+        complete = pd.DataFrame(columns=list(rows.columns) + ["mfe", "mae", "discovery_hit"])
+
+    summary_rows: list[dict[str, Any]] = []
+
+    def append_summary(state: str, bucket: str, frame: pd.DataFrame, n_snapshots: int) -> None:
+        n_evaluated = int(len(frame))
+        state_completed = int(completed_counts.get(state, 0))
+        sample_status = "ok" if state_completed >= min_sample else "insufficient_sample"
+        win_rate = float(pd.to_numeric(frame["is_win"], errors="coerce").mean()) if n_evaluated else math.nan
+        avg_r5 = float(pd.to_numeric(frame["r5"], errors="coerce").mean()) if n_evaluated else math.nan
+        median_r5 = float(pd.to_numeric(frame["r5"], errors="coerce").median()) if n_evaluated else math.nan
+        mfe_median = float(pd.to_numeric(frame.get("mfe"), errors="coerce").median()) if n_evaluated else math.nan
+        mae_median = float(pd.to_numeric(frame.get("mae"), errors="coerce").median()) if n_evaluated else math.nan
+        discovery_hit = float(pd.to_numeric(frame.get("discovery_hit"), errors="coerce").mean()) if n_evaluated else math.nan
+        summary_rows.append(
+            {
+                "state": state,
+                "triage_bucket": bucket,
+                "n_snapshots": int(n_snapshots),
+                "n_evaluated": n_evaluated,
+                "sample_status": sample_status,
+                "win_rate": win_rate,
+                "avg_r5": avg_r5,
+                "median_r5": median_r5,
+                "mfe_median": mfe_median,
+                "mae_median": mae_median,
+                "discovery_hit": discovery_hit,
+                "median_r5_vs_baseline": median_r5 - baseline_median if baseline_median is not None and not math.isnan(median_r5) else math.nan,
+                "win_rate_vs_baseline": win_rate - baseline_win if baseline_win is not None and not math.isnan(win_rate) else math.nan,
+                "discovery_hit_vs_baseline": discovery_hit - baseline_discovery if baseline_discovery is not None and not math.isnan(discovery_hit) else math.nan,
+            }
+        )
+
+    states = sorted(str(state) for state in rows["state"].dropna().unique())
+    for state in states:
+        state_rows = rows[rows["state"] == state]
+        state_complete = complete[complete["state"] == state]
+        append_summary(state, "all", state_complete, int(candidate_counts.get(state, 0)))
+        for bucket in ["top_q1", "middle", "bottom_q4"]:
+            bucket_rows = state_rows[state_rows["triage_bucket"] == bucket]
+            if bucket_rows.empty:
+                continue
+            bucket_complete = state_complete[state_complete["triage_bucket"] == bucket]
+            append_summary(state, bucket, bucket_complete, len(bucket_rows))
+
+    if not summary_rows:
+        return _empty_watchlist_snapshot_summary()
+    return pd.DataFrame(summary_rows, columns=WATCHLIST_SNAPSHOT_SUMMARY_COLUMNS).sort_values(
+        ["state", "triage_bucket"]
+    ).reset_index(drop=True)
+
+
+def write_watchlist_snapshot_report(
+    summary: pd.DataFrame,
+    start: str | None,
+    end: str | None,
+    out_dir: str | Path = "output",
+    min_sample: int = 50,
+) -> str:
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    start_label = start or "all"
+    end_label = end or "all"
+    path = out_path / f"watchlist_snapshot_eval_{start_label}_{end_label}.md"
+    lines = [
+        f"# Watchlist Snapshot Forward Validation {start_label} -> {end_label}",
+        "",
+        "Scope: forward samples only; completed snapshots are evaluated, unfinished snapshots remain outside conclusions.",
+        f"Minimum completed samples per state: {min_sample}",
+        "",
+    ]
+    if summary.empty:
+        lines.append("No watchlist snapshots available.")
+    else:
+        table = summary.copy()
+        for column in [
+            "win_rate",
+            "avg_r5",
+            "median_r5",
+            "mfe_median",
+            "mae_median",
+            "discovery_hit",
+            "median_r5_vs_baseline",
+            "win_rate_vs_baseline",
+            "discovery_hit_vs_baseline",
+        ]:
+            table[column] = table[column].map(_format_pct)
+        lines.append(table.to_markdown(index=False))
+    path.write_text("\n".join(lines), encoding="utf-8")
+    return str(path)
+
 def diagnose_trend_embryo(conn: Any, start: str, end: str) -> dict[str, pd.DataFrame]:
     rows = _load_eval_rows(conn, start, end, ["trend_embryo"])
     complete = rows[
@@ -1007,7 +1208,32 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=5)
     parser.add_argument("--hit-threshold", type=float, default=DEFAULT_HIT_THRESHOLD)
     parser.add_argument("--diagnose", choices=["trend_embryo"])
+    parser.add_argument("--snapshots", action="store_true")
+    parser.add_argument("--min-sample", type=int, default=50)
     args = parser.parse_args()
+
+    if args.snapshots:
+        conn = connect(base_dir=args.base_dir)
+        try:
+            summary = evaluate_watchlist_snapshots(
+                conn,
+                start=args.start,
+                end=args.end,
+                min_sample=args.min_sample,
+                hit_threshold=args.hit_threshold,
+            )
+        finally:
+            conn.close()
+        report = write_watchlist_snapshot_report(
+            summary,
+            start=args.start,
+            end=args.end,
+            out_dir=args.out_dir,
+            min_sample=args.min_sample,
+        )
+        print(summary.to_string(index=False) if not summary.empty else "no watchlist snapshots")
+        print(f"report={report}")
+        return
 
     result = evaluate_range(
         base_dir=args.base_dir,

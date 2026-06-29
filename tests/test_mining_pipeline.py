@@ -1101,5 +1101,133 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0][0], "600001")
         self.assertIn("pullback_pct", rows[0][1])
         self.assertIn("stop_signal", rows[0][1])
+
+    def test_persist_watchlist_snapshot_is_idempotent_and_keeps_context(self) -> None:
+        from mining.db import connect
+        from mining.watchlist import persist_watchlist_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _seed_second_launch_path(conn, dates["target_trade_date"])
+                first_count = persist_watchlist_snapshot(conn, dates["target_trade_date"])
+                second_count = persist_watchlist_snapshot(conn, dates["target_trade_date"])
+                rows = conn.execute(
+                    """
+                    SELECT snapshot_date, sec_code, state, entry_price, flag_strategies,
+                           reclaim_ma10, vol_expand_up
+                    FROM watchlist_snapshots
+                    ORDER BY sec_code, state
+                    """
+                ).fetchall()
+            finally:
+                conn.close()
+
+        self.assertEqual(first_count, 1)
+        self.assertEqual(second_count, 1)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["snapshot_date"], dates["target_trade_date"])
+        self.assertEqual(rows[0]["sec_code"], "600001")
+        self.assertAlmostEqual(rows[0]["entry_price"], 10.90)
+        self.assertEqual(rows[0]["flag_strategies"], "trend_embryo")
+        self.assertTrue(rows[0]["state"])
+
+    def test_backfill_snapshot_outcomes_matches_candidate_outcome_values(self) -> None:
+        from mining.backtest import backfill_outcomes, backfill_snapshot_outcomes
+        from mining.db import connect
+        from mining.watchlist import persist_watchlist_snapshot
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _seed_second_launch_path(conn, dates["target_trade_date"])
+                persist_watchlist_snapshot(conn, dates["target_trade_date"])
+                conn.execute(
+                    """
+                    INSERT INTO strategy_runs (
+                      run_id, strategy_id, version, trade_date, run_at, universe_size,
+                      n_candidates, status, error_msg
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (991, "unit", "vtest", dates["target_trade_date"], "2026-04-10 00:00:00", 1, 1, "ok", None),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO candidates (
+                      run_id, strategy_id, version, trade_date, sec_type, sec_code,
+                      sec_name, entry_price, features_json, rank
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (991, "unit", "vtest", dates["target_trade_date"], "stock", "600001", "Alpha", 10.90, "{}", 1),
+                )
+                conn.commit()
+                candidate_result = backfill_outcomes(conn, trade_date=dates["target_trade_date"], force=True)
+                snapshot_result = backfill_snapshot_outcomes(conn, snapshot_date=dates["target_trade_date"], force=True)
+                candidate = conn.execute(
+                    """
+                    SELECT o.r1, o.r2, o.r3, o.r4, o.r5, o.is_win, o.status
+                    FROM outcomes o
+                    JOIN candidates c ON c.candidate_id=o.candidate_id
+                    WHERE c.strategy_id='unit'
+                    """
+                ).fetchone()
+                snapshot = conn.execute(
+                    """
+                    SELECT r1, r2, r3, r4, r5, is_win, status
+                    FROM watchlist_outcomes
+                    WHERE snapshot_date=? AND sec_code='600001'
+                    """,
+                    (dates["target_trade_date"],),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(candidate_result["processed"], 1)
+        self.assertEqual(snapshot_result["processed"], 1)
+        self.assertEqual(snapshot["status"], "complete")
+        for column in ["r1", "r2", "r3", "r4", "r5"]:
+            self.assertAlmostEqual(snapshot[column], candidate[column])
+        self.assertEqual(snapshot["is_win"], candidate["is_win"])
+
+    def test_backfill_snapshot_outcomes_marks_unfinished_snapshot_partial(self) -> None:
+        from mining.backtest import backfill_snapshot_outcomes
+        from mining.db import connect
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO watchlist_snapshots (
+                      snapshot_date, sec_code, sec_name, state, triage, entry_price,
+                      created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (dates["t_plus_2"], "600001", "Alpha", "????", 1.0, 10.0, "2026-04-10 00:00:00"),
+                )
+                conn.commit()
+                result = backfill_snapshot_outcomes(conn, snapshot_date=dates["t_plus_2"], force=True)
+                row = conn.execute(
+                    """
+                    SELECT status, r5
+                    FROM watchlist_outcomes
+                    WHERE snapshot_date=? AND sec_code='600001'
+                    """,
+                    (dates["t_plus_2"],),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["partial"], 1)
+        self.assertEqual(row["status"], "partial")
+        self.assertIsNone(row["r5"])
+
 if __name__ == "__main__":
     unittest.main()

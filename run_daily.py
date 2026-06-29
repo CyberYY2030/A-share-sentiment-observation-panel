@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 from typing import Any
 
-from mining.backtest import backfill_outcomes
+from mining.backtest import backfill_outcomes, backfill_snapshot_outcomes
 from mining.db import (
     connect,
     create_strategy_run,
@@ -25,6 +25,7 @@ from mining.scanners.rps_stock import (
     select_candidates_from_universe as select_rps_candidates,
 )
 from mining.universe import build_universe
+from mining.watchlist import persist_watchlist_snapshot
 
 
 def _run_scanners(conn: Any, trade_date: str) -> list[dict[str, Any]]:
@@ -113,6 +114,16 @@ def execute_daily_pipeline(
             refresh_result = refresh_basics(conn, trade_date=resolved_trade_date)
         scanner_results = _run_scanners(conn, resolved_trade_date)
         backfill_result = backfill_outcomes(conn, trade_date=resolved_trade_date)
+        watchlist_validation = None
+        try:
+            watchlist_rows = persist_watchlist_snapshot(conn, resolved_trade_date)
+            snapshot_backfill = backfill_snapshot_outcomes(conn)
+            watchlist_validation = {
+                "snapshots": watchlist_rows,
+                "backfill": snapshot_backfill,
+            }
+        except Exception as exc:
+            watchlist_validation = {"error": str(exc)}
 
         markdown_path = None
         excel_path = None
@@ -126,6 +137,7 @@ def execute_daily_pipeline(
             "refresh": refresh_result,
             "scanners": scanner_results,
             "backfill": backfill_result,
+            "watchlist_validation": watchlist_validation,
             "markdown": markdown_path,
             "excel": excel_path,
         }

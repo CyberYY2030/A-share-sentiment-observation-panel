@@ -119,4 +119,38 @@ J3 run_daily 接入 + evaluate.py --snapshots 读出 + 测试
 ```
 
 ## 6. 实现记录（Codex 填写）
-（待 Codex 实现后回填：建表/函数签名、测试数、首日冒烟输出、样本累积说明。）
+
+完成时间：2026-06-29
+
+### J1 每日留痕
+- 新增表 `watchlist_snapshots`，建在 `mining_mvp.db`，主键为 `(snapshot_date, sec_code, state)`。
+- 新增函数 `persist_watchlist_snapshot(conn, trade_date, params=None) -> int`，调用 `build_watchlist(conn, trade_date, params=params)` 后持久化完整 watchlist 漏斗样本，不只保存双清单中的可动作状态。
+- 入库字段包含：`snapshot_date`、`sec_code`、`sec_name`、`state`、`triage`、`entry_price`、`run_up_pct`、`shrink_ratio`、`ma_proximity`、`pullback_pct`、`reclaim_ma10`、`vol_expand_up`、`flag_count`、`days_since_flag`、`flag_strategies`、`created_at`。
+- `entry_price` 使用决策日 `build_watchlist` 输出的 `close`，即决策日收盘价；无有效收盘价的行跳过。
+- `INSERT OR REPLACE` 保证同日重复运行幂等。
+
+### J2 事后对账
+- `mining/backtest.py` 抽出共享 `_forward_bars(conn, sec_code, trade_date)` 和 `_forward_outcome_values(entry_price, bars)`。
+- 旧 `backfill_outcomes` 与新 `backfill_snapshot_outcomes(conn, snapshot_date=None, force=False)` 共用同一套 t+1/t+2/t+5 前向口径。
+- 新增表 `watchlist_outcomes`，主键为 `(snapshot_date, sec_code, state)`，字段包含 `open_t1/high_t1/low_t1/close_t1/close_t2/close_t5`、`r1..r5`、`is_win`、`backfilled_at`、`status`。
+- `is_win` 口径与旧 outcomes 一致：`r2 > 0.02 and r3 > -0.03`。
+- 未走完 t+5 的快照写入 `partial`，下次可继续补；evaluate 只统计 `status='complete'` 的样本。
+
+### J3 日更接入与读出
+- `run_daily.py` 在原 `backfill_outcomes` 后旁路执行 `persist_watchlist_snapshot(conn, resolved_trade_date)` 与 `backfill_snapshot_outcomes(conn)`。
+- 旁路用 `try` 包裹，失败只写入返回值 `watchlist_validation.error`，不阻断主日更流程。
+- `mining/evaluate.py` 新增 `evaluate_watchlist_snapshots(conn, start=None, end=None, min_sample=50, hit_threshold=DEFAULT_HIT_THRESHOLD) -> DataFrame`。
+- 新增 CLI：`python -m mining.evaluate --snapshots ...`，并新增 `--min-sample`。
+- 新增报告函数 `write_watchlist_snapshot_report(...)`，输出 `output/watchlist_snapshot_eval_<start>_<end>.md`。
+- 读出按 `state` 输出 `all/top_q1/middle/bottom_q4`，统计 `n_snapshots`、`n_evaluated`、`win_rate`、`avg_r5`、`median_r5`、`mfe_median`、`mae_median`、`discovery_hit` 及相对 `compute_baseline_universe` 的差值。
+- 样本不足时标记 `insufficient_sample`，不调整任何漏斗阈值或 scanner 默认参数。
+
+### 测试与冒烟
+- `python -m py_compile mining/watchlist.py mining/backtest.py mining/evaluate.py run_daily.py`：通过。
+- `python -m unittest tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui tests.test_mining_evaluate`：90 tests OK。
+- 合成 SQLite 冒烟：`execute_daily_pipeline(... refresh=False, emit_reports=False)` 后写入 `watchlist_snapshots=1`、`watchlist_outcomes=1`；`evaluate_watchlist_snapshots(...)` 返回 2 行分组结果，`sample_status=['insufficient_sample']`。
+
+### 约束确认
+- 未修改 scanner 算法、默认参数、`mining/universe.py`、watchlist 状态机逻辑。
+- 前向结果只使用 `snapshot_date` 之后的 bar；未完成样本保留为 `partial`。
+- 本轮只新增测量层留痕与读出，不对任何阈值做事后校准。

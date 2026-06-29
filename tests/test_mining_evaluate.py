@@ -414,5 +414,78 @@ class MiningEvaluateTests(unittest.TestCase):
         self.assertEqual(verdicts.loc["true_leader", "edge_verdict"], "discovery_only")
         self.assertEqual(verdicts.loc["trend_embryo", "edge_verdict"], "no_edge")
 
+
+    def test_evaluate_watchlist_snapshots_groups_state_and_triage_buckets(self) -> None:
+        from mining.db import connect
+        from mining.evaluate import evaluate_watchlist_snapshots
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                trade_date = dates["target_trade_date"]
+                snapshots = [
+                    (trade_date, "600001", "Alpha", "ready", 9.0, 15.6),
+                    (trade_date, "300001", "Beta", "ready", 1.0, 25.3),
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO watchlist_snapshots (
+                      snapshot_date, sec_code, sec_name, state, triage, entry_price,
+                      created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '2026-04-10 00:00:00')
+                    """,
+                    snapshots,
+                )
+                outcomes = [
+                    (trade_date, "600001", "ready", 0.01, 0.05, -0.01, 0.02, 0.06, 1, "complete"),
+                    (trade_date, "300001", "ready", -0.01, 0.01, -0.04, -0.02, -0.03, 0, "complete"),
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO watchlist_outcomes (
+                      snapshot_date, sec_code, state, r1, r2, r3, r4, r5,
+                      is_win, status, backfilled_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '2026-04-10 00:00:00')
+                    """,
+                    outcomes,
+                )
+                conn.commit()
+                summary = evaluate_watchlist_snapshots(conn, start=trade_date, end=trade_date, min_sample=3)
+            finally:
+                conn.close()
+
+        all_row = summary[(summary["state"] == "ready") & (summary["triage_bucket"] == "all")].iloc[0]
+        top_row = summary[(summary["state"] == "ready") & (summary["triage_bucket"] == "top_q1")].iloc[0]
+        bottom_row = summary[(summary["state"] == "ready") & (summary["triage_bucket"] == "bottom_q4")].iloc[0]
+
+        self.assertEqual(all_row["n_snapshots"], 2)
+        self.assertEqual(all_row["n_evaluated"], 2)
+        self.assertEqual(all_row["sample_status"], "insufficient_sample")
+        self.assertAlmostEqual(all_row["win_rate"], 0.5)
+        self.assertAlmostEqual(all_row["median_r5"], 0.015)
+        self.assertEqual(top_row["n_snapshots"], 1)
+        self.assertAlmostEqual(top_row["median_r5"], 0.06)
+        self.assertEqual(bottom_row["n_snapshots"], 1)
+        self.assertAlmostEqual(bottom_row["median_r5"], -0.03)
+        self.assertIn("discovery_hit_vs_baseline", summary.columns)
+
+    def test_evaluate_watchlist_snapshots_handles_empty_table(self) -> None:
+        from mining.db import connect
+        from mining.evaluate import evaluate_watchlist_snapshots
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                summary = evaluate_watchlist_snapshots(conn)
+            finally:
+                conn.close()
+
+        self.assertTrue(summary.empty)
+        self.assertIn("sample_status", summary.columns)
+
 if __name__ == "__main__":
     unittest.main()
