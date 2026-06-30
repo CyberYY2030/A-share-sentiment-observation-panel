@@ -252,10 +252,12 @@ def _seed_second_launch_path(conn: sqlite3.Connection, target_day: str, shrink: 
         -1: 10.88,
         0: 10.90,
     }
-    last_close = 10.0
+    last_close = 8.0
     for idx, trade_day in enumerate(trade_days):
         offset = idx - target_index
-        close = closes_by_offset.get(offset, 10.0 if offset < -10 else last_close)
+        # Pre-peak base sits at 8.0 so the run-up (peak 12.0) anchors to a real
+        # ~50% advance and clears the Phase L strength gate (run_up >= 0.30).
+        close = closes_by_offset.get(offset, 8.0 if offset < -10 else last_close)
         if offset > 0:
             close = last_close
         pre_close = last_close if idx else round(close * 0.99, 2)
@@ -292,6 +294,79 @@ def _seed_second_launch_path(conn: sqlite3.Connection, target_day: str, shrink: 
         )
         last_close = close
     _insert_source_candidate(conn, "trend_embryo", flag_day, "600001", "Alpha")
+    # Phase L: the funnel only admits prior strong stocks, so the canonical
+    # second-launch name must also carry a strength flag (true leader here).
+    _insert_source_candidate(conn, "true_leader", flag_day, "600001", "Alpha")
+    conn.commit()
+    return flag_day
+
+
+def _seed_strength_gate_stock(
+    conn: sqlite3.Connection,
+    code: str,
+    name: str,
+    target_day: str,
+    strategy_id: str,
+    *,
+    base: float = 8.0,
+    peak: float = 12.0,
+    flag_offset: int = -10,
+) -> str:
+    """Seed a prior-strength + pullback path for `code` and flag it once.
+
+    The stock advances from `base` to `peak` (peak at offset -8) then pulls back.
+    `flag_offset` controls where the source flag lands relative to the target day,
+    so tests can place a late flag (near the peak) to exercise the run-up anchor.
+    """
+    trade_days = trading_days("2026-02-20", 40)
+    target_index = trade_days.index(target_day)
+    flag_day = trade_days[target_index + flag_offset]
+    peak_offset = -8
+    closes_by_offset = {
+        peak_offset: peak,
+        -7: round(peak * 0.98, 2),
+        -6: round(peak * 0.96, 2),
+        -5: round(peak * 0.95, 2),
+        -4: round(peak * 0.94, 2),
+        -3: round(peak * 0.93, 2),
+        -2: round(peak * 0.92, 2),
+        -1: round(peak * 0.915, 2),
+        0: round(peak * 0.91, 2),
+    }
+    last_close = base
+    for idx, trade_day in enumerate(trade_days):
+        offset = idx - target_index
+        close = closes_by_offset.get(offset, base if offset < peak_offset else last_close)
+        if offset > 0:
+            close = last_close
+        pre_close = last_close if idx else round(close * 0.99, 2)
+        open_price = round(pre_close * 1.002, 2)
+        high = round(max(open_price, close) * 1.01, 2)
+        low = round(close - 0.2, 2)
+        change = round(close - pre_close, 2)
+        change_pct = round((close / pre_close - 1.0) * 100.0, 2) if pre_close else 0.0
+        conn.execute(
+            """
+            UPDATE ash.kline_daily
+            SET open=?, high=?, low=?, close=?, pre_close=?, change=?, change_pct=?, volume=?, amount=?
+            WHERE sec_type='stock' AND sec_code=? AND trade_date=?
+            """,
+            (
+                open_price,
+                high,
+                low,
+                round(close, 2),
+                round(pre_close, 2),
+                change,
+                change_pct,
+                10_000_000,
+                10_000_000 * close,
+                code,
+                trade_day,
+            ),
+        )
+        last_close = close
+    _insert_source_candidate(conn, strategy_id, flag_day, code, name)
     conn.commit()
     return flag_day
 class MiningPipelineTests(unittest.TestCase):
@@ -974,11 +1049,11 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual(row["sec_code"], "600001")
         self.assertEqual(row["first_flag_date"], flag_day)
         self.assertEqual(row["last_flag_date"], flag_day)
-        self.assertEqual(row["flag_count"], 1)
-        self.assertEqual(row["flag_strategies"], "trend_embryo")
+        self.assertEqual(row["flag_count"], 2)
+        self.assertEqual(row["flag_strategies"], "trend_embryo,true_leader")
         self.assertAlmostEqual(row["peak_close_since_flag"], 12.0)
         self.assertAlmostEqual(row["first_flag_close"], 10.0)
-        self.assertAlmostEqual(row["run_up_pct"], 0.2)
+        self.assertAlmostEqual(row["run_up_pct"], 0.5)
         self.assertAlmostEqual(row["pullback_pct"], 10.9 / 12.0 - 1.0)
         self.assertLessEqual(row["ma_proximity"], 0.03)
         self.assertLessEqual(row["shrink_ratio"], 0.7)
@@ -1025,6 +1100,89 @@ class MiningPipelineTests(unittest.TestCase):
 
         self.assertTrue(watchlist.empty)
 
+    def test_build_watchlist_strength_gate_admits_only_strong_stocks_with_runup(self) -> None:
+        from mining.db import connect
+        from mining.watchlist import build_watchlist
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            target = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                # Shape-only flag (trend_embryo) with a strong run-up: no strength → dropped.
+                _seed_strength_gate_stock(conn, "600001", "Alpha", target, "trend_embryo", base=8.0, peak=12.0)
+                # Strength flag (true_leader) with run_up 0.5 → kept.
+                _seed_strength_gate_stock(conn, "300001", "Beta", target, "true_leader", base=8.0, peak=12.0)
+                # Strength flag (rps) but run_up only 0.2 (< 0.30) → dropped.
+                _seed_strength_gate_stock(conn, "600003", "Gamma", target, "rps_stock_top20", base=10.0, peak=12.0)
+                watchlist = build_watchlist(conn, target, lookback=40)
+            finally:
+                conn.close()
+
+        self.assertEqual(list(watchlist["sec_code"]), ["300001"])
+        row = watchlist.iloc[0]
+        self.assertEqual(row["flag_strategies"], "true_leader")
+        self.assertGreaterEqual(row["run_up_pct"], 0.30)
+
+    def test_build_watchlist_runup_anchors_to_prepeak_base_not_late_flag(self) -> None:
+        from mining.db import connect
+        from mining.watchlist import build_watchlist
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            target = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                # Flag lands ON the peak (offset -8): a late mark a flag-anchored
+                # run-up would read as ~0, hiding a real ~50% prior advance.
+                _seed_strength_gate_stock(
+                    conn, "300001", "Beta", target, "true_leader", base=8.0, peak=12.0, flag_offset=-8
+                )
+                watchlist = build_watchlist(conn, target, lookback=40)
+            finally:
+                conn.close()
+
+        row = watchlist[watchlist["sec_code"] == "300001"].iloc[0]
+        # New anchor reflects the true pre-peak advance and clears the gate.
+        self.assertAlmostEqual(row["run_up_pct"], 0.5)
+        self.assertGreaterEqual(row["run_up_pct"], 0.30)
+        self.assertAlmostEqual(row["first_flag_close"], 12.0)
+        # Old flag-anchored formula would have been ~0 and failed the gate.
+        old_runup = row["peak_close_since_flag"] / row["first_flag_close"] - 1.0
+        self.assertLess(old_runup, 0.30)
+
+    def test_watchlist_triage_rewards_limit_up_imprint(self) -> None:
+        from mining.watchlist import WATCHLIST_DEFAULT_PARAMS, _triage
+
+        shape = {
+            "run_up_pct": 0.5,
+            "flag_count": 2,
+            "shrink_ratio": 0.6,
+            "ma_proximity": 0.02,
+            "pullback_red_days": 0,
+            "reclaim_ma10": True,
+            "vol_expand_up": True,
+        }
+        without_limit = {**shape, "limit_up_count": 0}
+        with_limit = {**shape, "limit_up_count": 3}
+
+        self.assertGreater(
+            _triage(with_limit, WATCHLIST_DEFAULT_PARAMS),
+            _triage(without_limit, WATCHLIST_DEFAULT_PARAMS),
+        )
+
+    def test_limit_up_threshold_is_board_aware(self) -> None:
+        from mining.watchlist import WATCHLIST_DEFAULT_PARAMS, _limit_up_threshold
+
+        p = WATCHLIST_DEFAULT_PARAMS
+        self.assertEqual(_limit_up_threshold("600001", p), 9.8)
+        self.assertEqual(_limit_up_threshold("000001", p), 9.8)
+        self.assertEqual(_limit_up_threshold("300001", p), 19.5)
+        self.assertEqual(_limit_up_threshold("688001", p), 19.5)
+        self.assertEqual(_limit_up_threshold("830001", p), 19.5)
+
     def test_second_launch_selects_pullback_shrink_and_stop_setup(self) -> None:
         from mining.db import connect
         from mining.scanners.second_launch import SecondLaunchScanner
@@ -1045,7 +1203,7 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertLessEqual(features["ma_proximity"], 0.03)
         self.assertAlmostEqual(features["shrink_ratio"], 0.5)
         self.assertTrue(features["stop_signal"])
-        self.assertEqual(features["flag_strategies"], "trend_embryo")
+        self.assertEqual(features["flag_strategies"], "trend_embryo,true_leader")
 
     def test_second_launch_excludes_without_volume_shrink(self) -> None:
         from mining.db import connect
@@ -1131,7 +1289,7 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual(rows[0]["snapshot_date"], dates["target_trade_date"])
         self.assertEqual(rows[0]["sec_code"], "600001")
         self.assertAlmostEqual(rows[0]["entry_price"], 10.90)
-        self.assertEqual(rows[0]["flag_strategies"], "trend_embryo")
+        self.assertEqual(rows[0]["flag_strategies"], "trend_embryo,true_leader")
         self.assertTrue(rows[0]["state"])
 
     def test_backfill_snapshot_outcomes_matches_candidate_outcome_values(self) -> None:

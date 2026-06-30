@@ -8,9 +8,15 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .db import list_stock_trade_dates, now_str
-from .features import moving_average, volume_shrink_ratio
+from .features import board_kind, moving_average, volume_shrink_ratio
 
-WATCHLIST_DEFAULT_PARAMS: dict[str, float | int] = {
+# Phase L: scanners that certify a stock as "prior strength". A stock only enters
+# the funnel if it was flagged by one of these (true leader / relative-strength
+# leader / momentum breakout). Shape/relay detectors (trend_embryo, second_launch)
+# may appear as co-flags but never qualify a stock on their own.
+STRENGTH_SCANNERS: tuple[str, ...] = ("rps_stock_top20", "true_leader", "momentum_breakout")
+
+WATCHLIST_DEFAULT_PARAMS: dict[str, Any] = {
     "vol_recent_n": 5,
     "vol_run_n": 5,
     "stop_n": 3,
@@ -27,6 +33,13 @@ WATCHLIST_DEFAULT_PARAMS: dict[str, float | int] = {
     "w_support": 1.0,
     "w_trigger": 1.0,
     "w_dirty": 0.5,
+    # Phase L strength gate (all tunable in one place).
+    "min_runup": 0.30,
+    "runup_base_n": 20,
+    "strength_scanners": STRENGTH_SCANNERS,
+    "w_limit": 0.15,
+    "limit_up_main": 9.8,
+    "limit_up_growth": 19.5,
 }
 
 WATCHLIST_COLUMNS = [
@@ -42,6 +55,7 @@ WATCHLIST_COLUMNS = [
     "peak_close_since_flag",
     "peak_date",
     "run_up_pct",
+    "limit_up_count",
     "pullback_pct",
     "ma10",
     "ma20",
@@ -81,6 +95,14 @@ def _norm(value: float, cap: float) -> float:
     if not math.isfinite(value):
         return 0.0
     return max(0.0, min(float(value) / cap, 1.0))
+
+
+def _limit_up_threshold(code: str, params: dict[str, Any]) -> float:
+    """Daily change_pct threshold that counts as a limit-up for the code's board."""
+    code = str(code).zfill(6)
+    if board_kind(code) in {"gem", "star"} or code.startswith(("8", "4", "92")):
+        return float(params["limit_up_growth"])
+    return float(params["limit_up_main"])
 
 
 def _load_flagged_candidates(
@@ -187,6 +209,7 @@ def _triage(row: dict[str, Any], params: dict[str, Any]) -> float:
     shrink = _safe_float(row.get("shrink_ratio"))
     ma_proximity = _safe_float(row.get("ma_proximity"))
     red_days = _safe_float(row.get("pullback_red_days"))
+    limit_up_count = _safe_float(row.get("limit_up_count"))
     trigger = bool(row.get("reclaim_ma10")) and bool(row.get("vol_expand_up"))
     shrink_score = max(0.0, 1.0 - shrink) if math.isfinite(shrink) else 0.0
     support_score = (
@@ -200,6 +223,7 @@ def _triage(row: dict[str, Any], params: dict[str, Any]) -> float:
         + float(params["w_shrink"]) * min(shrink_score, 1.0)
         + float(params["w_support"]) * min(support_score, 1.0)
         + float(params["w_trigger"]) * float(trigger)
+        + float(params["w_limit"]) * _norm(limit_up_count, 5.0)
         - float(params["w_dirty"]) * max(red_days if math.isfinite(red_days) else 0.0, 0.0)
     )
 
@@ -208,7 +232,13 @@ def build_watchlist(
     conn: sqlite3.Connection,
     trade_date: str,
     lookback: int = 40,
-    source_strategies: Iterable[str] = ("trend_embryo", "true_leader"),
+    source_strategies: Iterable[str] = (
+        "trend_embryo",
+        "second_launch",
+        "true_leader",
+        "rps_stock_top20",
+        "momentum_breakout",
+    ),
     params: dict[str, Any] | None = None,
 ) -> pd.DataFrame:
     """Build the watchlist funnel for human review.
@@ -243,6 +273,18 @@ def build_watchlist(
         )
         .copy()
     )
+
+    # L1 strength gate (part 1): a stock must have been certified by a strength
+    # scanner. Shape/relay flags alone never qualify it. The run-up threshold is
+    # applied below once we have priced the peak.
+    strength_set = {str(name) for name in p["strength_scanners"]}
+    grouped = grouped[
+        grouped["flag_strategies"].map(
+            lambda value: bool(strength_set & {token for token in str(value).split(",") if token})
+        )
+    ].copy()
+    if grouped.empty:
+        return _empty_watchlist()
 
     all_dates = list_stock_trade_dates(conn, end_date=trade_date, limit=max(lookback + 65, 100), include_end=True)
     if not all_dates or trade_date not in all_dates:
@@ -283,6 +325,30 @@ def build_watchlist(
         if not math.isfinite(peak_close) or peak_close <= 0:
             continue
         peak_date = str(series_since_flag.idxmax())
+
+        # L2: anchor the run-up to the real launch base = lowest close within the
+        # `runup_base_n` bars up to the peak (the recent low before the surge),
+        # not the (possibly late) first-flag close. Fall back to first_flag_close.
+        peak_idx = calendar_index.get(peak_date)
+        runup_base_n = int(p["runup_base_n"])
+        base_close = math.nan
+        if peak_idx is not None:
+            base_start_date = all_dates[max(0, peak_idx - runup_base_n)]
+            base_window = close_pivot.loc[base_start_date:peak_date, code].dropna()
+            if not base_window.empty:
+                base_close = float(base_window.min())
+        if not (math.isfinite(base_close) and base_close > 0):
+            base_close = first_flag_close
+        run_up_pct = (
+            peak_close / base_close - 1.0
+            if math.isfinite(base_close) and base_close > 0
+            else math.nan
+        )
+
+        # L1 strength gate (part 2): require a clear prior main-up advance.
+        if not (math.isfinite(run_up_pct) and run_up_pct >= float(p["min_runup"])):
+            continue
+
         ma10_value = _safe_float(ma10.at[trade_date, code]) if code in ma10.columns else math.nan
         ma20_value = _safe_float(ma20.at[trade_date, code]) if code in ma20.columns else math.nan
         ma60_value = _safe_float(ma60.at[trade_date, code]) if code in ma60.columns else math.nan
@@ -323,7 +389,14 @@ def build_watchlist(
             and today_volume > previous_volume_avg
         )
         below_ma60 = math.isfinite(ma60_value) and today_close < ma60_value
-        run_up_pct = peak_close / first_flag_close - 1.0 if math.isfinite(first_flag_close) and first_flag_close > 0 else math.nan
+
+        # L3: count limit-up days over the lookback window (soft triage bonus only,
+        # no hard gate). Approximated from change_pct against the board threshold.
+        limit_up_thr = _limit_up_threshold(code, p)
+        window_changes = pd.to_numeric(
+            change_pivot.loc[flag_dates[0]:trade_date, code].dropna(), errors="coerce"
+        )
+        limit_up_count = int((window_changes >= limit_up_thr).sum()) if not window_changes.empty else 0
         row = {
             "sec_code": code,
             "sec_name": item.sec_name,
@@ -337,6 +410,7 @@ def build_watchlist(
             "peak_close_since_flag": peak_close,
             "peak_date": peak_date,
             "run_up_pct": run_up_pct,
+            "limit_up_count": limit_up_count,
             "pullback_pct": today_close / peak_close - 1.0,
             "ma10": ma10_value,
             "ma20": ma20_value,

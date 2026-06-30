@@ -98,7 +98,35 @@ python -c "from mining.streamlit_tabs.tab_scanner import load_watchlist_snapshot
 
 ---
 
-## 6. 实现记录（Codex 填写）
+## 6. 实现记录（由 Claude 实现）
 
-完成时间：
-（实现要点、实际名单收敛前后对比、测试数）
+完成时间：2026-06-30
+
+### 实现要点（全部落在 `mining/watchlist.py`，状态机未动）
+
+- **L1 强度合格池**：新增模块常量 `STRENGTH_SCANNERS = ("rps_stock_top20","true_leader","momentum_breakout")`，并放入 `_params`（`strength_scanners`）。按 code 聚合 candidates 后，先按 `flag_strategies` 是否含强度扫描器做第一道硬筛（不含的整只剔除，连"查看全部"都不出现）；定价拿到峰值后，再按 `run_up_pct >= min_runup(0.30)` 做第二道筛。
+- **关键修复（前置依赖）**：把 `build_watchlist` 默认 `source_strategies` 从 `("trend_embryo","true_leader")` 扩成 5 个扫描器（加 `second_launch`/`rps_stock_top20`/`momentum_breakout`）。原默认根本没把 `rps_stock_top20`/`momentum_breakout` 载入候选池，`flag_strategies` 里检测不到这两个强度标记——不扩 source，L1 的"rps 或 momentum"分支永远是死代码。`second_launch` 扫描器自带显式 source，不受默认改动影响。
+- **L2 修正 run_up 锚点**：`run_up_pct = peak_close / base_close - 1`，`base_close = close_pivot 中 [peak 前 runup_base_n(20) 根 .. peak] 的最小收盘`；base 无效时回退 `first_flag_close`（向后兼容）。`first_flag_close` 字段保留供展示。run_up gate 紧跟峰值计算放在循环前段，被剔除的票直接 `continue`，省掉后续 MA/缩量计算。
+- **L3 涨停加分**：新增 `_limit_up_threshold(code)`，复用现成 `mining/features.py::board_kind`（300/301→创业、688/689→科创 取 19.5%，其余主板 9.8%，北交所前缀另判 19.5%）；`limit_up_count` 统计 lookback 窗口内 `change_pct >= 阈值` 天数，写入 row；`_triage` 加一项 `w_limit(0.15) * _norm(limit_up_count, 5.0)`，纯加分、不设硬门槛，既有权重含义不变。
+
+### 名单收敛前后对比（真实数据，2026-06-26）
+
+| 口径 | 数量 |
+| --- | --- |
+| 旧候选池（trend_embryo+true_leader，无闸门） | 909 |
+| 新原始池（5 扫描器并集） | 1357 |
+| 强度合格池（rps/true_leader/momentum 去重） | 851 |
+| **闸门后漏斗总数**（强度 + run_up≥0.30） | **634**（全部 run_up≥0.30） |
+
+- 状态分布：可动作短名单 = 回踩到位 12 + 再启动 12 = **24**；破位失效 150；延伸中/回踩中合计约 460。漏斗全程只含"曾被强度认证 + 明显主升"的票，弱回撤形态票（仅 trend_embryo、无强度）已整体剔除。
+- `limit_up_count > 0` 的票 410/634，涨停印记进入排序加权。
+
+### 诚实边界 / 数据质量观察
+
+- 新锚点把**上游既有的脏数据**放大暴露：`000852`、`000001` 两只以"指数级价格"（8381、4112）混入股票池，导致 run_up 异常（1307、379）。这是行情库里指数代码/价格串入 `sec_type='stock'` 的历史问题，**不属本轮逻辑缺陷**；二者均被判为"破位失效"，**未进入可动作 24 名单**。run_up 仅用于"≥0.30 闸门"与上限封顶（`_norm(run_up,0.8)`）的 triage 加权，异常大值不扭曲排序。若要根治需在上游候选/universe 层过滤指数代码，已超出 Phase L 范围。
+
+### 测试
+
+- 新增 4 个 Phase L 测试（`tests/test_mining_pipeline.py`）：强度池三选一（trend_embryo 剔除 / true_leader+run_up0.5 保留 / rps+run_up0.2 剔除）、run_up 锚点（标记落在峰值时旧口径≈0、新口径=0.5）、涨停 triage 加分、板块阈值。
+- 更新 canonical seed `_seed_second_launch_path`：`600001` 增 `true_leader` 强度标记并把前期基准压到 8.0（run_up=0.5），相应回归断言改 `flag_count=2`、`flag_strategies="trend_embryo,true_leader"`、`run_up_pct=0.5`。
+- **全量 `python -m unittest` 110 通过**；spec 指定四套件 94 通过（含 4 个新增）；`python -m py_compile mining/watchlist.py` 通过。
