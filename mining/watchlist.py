@@ -12,9 +12,14 @@ from .features import board_kind, moving_average, volume_shrink_ratio
 
 # Phase L: scanners that certify a stock as "prior strength". A stock only enters
 # the funnel if it was flagged by one of these (true leader / relative-strength
-# leader / momentum breakout). Shape/relay detectors (trend_embryo, second_launch)
+# leader / momentum breakout / first launch). Shape/relay detectors (trend_embryo, second_launch)
 # may appear as co-flags but never qualify a stock on their own.
-STRENGTH_SCANNERS: tuple[str, ...] = ("rps_stock_top20", "true_leader", "momentum_breakout")
+STRENGTH_SCANNERS: tuple[str, ...] = (
+    "rps_stock_top20",
+    "true_leader",
+    "momentum_breakout",
+    "launch_burst",
+)
 
 WATCHLIST_DEFAULT_PARAMS: dict[str, Any] = {
     "vol_recent_n": 5,
@@ -238,6 +243,7 @@ def build_watchlist(
         "true_leader",
         "rps_stock_top20",
         "momentum_breakout",
+        "launch_burst",
     ),
     params: dict[str, Any] | None = None,
 ) -> pd.DataFrame:

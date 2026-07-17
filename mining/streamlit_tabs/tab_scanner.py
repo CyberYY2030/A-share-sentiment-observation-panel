@@ -344,7 +344,7 @@ def _persisted_candidate_dates(conn) -> list[str]:
         SELECT DISTINCT trade_date
         FROM candidates
         WHERE sec_type='stock'
-          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch')
+          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch', 'launch_burst')
         ORDER BY trade_date
         """
     ).fetchall()
@@ -357,7 +357,7 @@ def _load_persisted_candidates(conn, trade_date: str) -> pd.DataFrame:
         SELECT strategy_id, trade_date, sec_type, sec_code, sec_name, entry_price, rank, features_json
         FROM candidates
         WHERE sec_type='stock'
-          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch')
+          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch', 'launch_burst')
           AND trade_date=?
         ORDER BY strategy_id, rank, sec_code
         """,
@@ -664,6 +664,7 @@ def _prepare_today_display(today_df: pd.DataFrame) -> pd.DataFrame:
             "trend_embryo": "强趋势胚子",
             "true_leader": "真龙/中军",
             "second_launch": "二次启动低吸",
+            "launch_burst": "主升启动",
         }
     ).fillna(df["来源"])
     return df[
@@ -704,9 +705,32 @@ def _prepare_followup_display(follow_df: pd.DataFrame) -> pd.DataFrame:
             "trend_embryo": "强趋势胚子",
             "true_leader": "真龙/中军",
             "second_launch": "二次启动低吸",
+            "launch_burst": "主升启动",
         }
     ).fillna(df["来源"])
     return df[["来源", "排名", "代码", "名称", "今日涨幅%", "最新价", "口径"]]
+
+
+def _prepare_launch_display(launch_df: pd.DataFrame) -> pd.DataFrame:
+    df = launch_df.copy()
+    for column in ("rank", "pct", "volume_ratio", "sigma_multiple", "cluster_days", "cluster_width"):
+        if column not in df.columns:
+            df[column] = pd.NA
+    df["pct"] = pd.to_numeric(df["pct"], errors="coerce") * 100.0
+    df["cluster_width"] = pd.to_numeric(df["cluster_width"], errors="coerce") * 100.0
+    df = df.rename(
+        columns={
+            "rank": "排名",
+            "sec_code": "代码",
+            "sec_name": "名称",
+            "pct": "涨幅%",
+            "volume_ratio": "量比",
+            "sigma_multiple": "σ倍数",
+            "cluster_days": "横盘天数",
+            "cluster_width": "均线簇宽度%",
+        }
+    )
+    return df[["排名", "代码", "名称", "涨幅%", "量比", "σ倍数", "横盘天数", "均线簇宽度%"]]
 
 
 def _build_followup_label(base_dir: str | Path, previous_date: str | None, current_date: str | None) -> str:
@@ -951,13 +975,30 @@ def render_scanner_tab(
         st.info("还没有机会挖掘结果，先跑一次日任务。")
         return
 
+    launch_df = (
+        today_df[today_df["strategy_id"].eq("launch_burst")].copy()
+        if "strategy_id" in today_df.columns
+        else pd.DataFrame()
+    )
+    general_today_df = (
+        today_df[~today_df["strategy_id"].eq("launch_burst")].copy()
+        if "strategy_id" in today_df.columns
+        else today_df
+    )
+    st.markdown(f"**主升启动（初期异动，{today_date}）**")
+    if launch_df.empty:
+        st.info("当天没有主升启动信号。")
+    else:
+        st.dataframe(_prepare_launch_display(launch_df), width="stretch", hide_index=True)
+        _render_watchlist_playbooks(launch_df)
+
     left, right = st.columns(2)
     with left:
         st.markdown(f"**当日挖掘标的（{today_date}）**")
-        if today_df.empty:
-            st.info("当天没有挖掘结果。")
+        if general_today_df.empty:
+            st.info("当天没有其他挖掘结果。")
         else:
-            st.dataframe(_prepare_today_display(today_df), width="stretch", hide_index=True)
+            st.dataframe(_prepare_today_display(general_today_df), width="stretch", hide_index=True)
 
     with right:
         st.markdown(_build_followup_label(base_dir, previous_date, current_date))

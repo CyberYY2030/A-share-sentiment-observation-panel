@@ -1,6 +1,6 @@
 # 规格：主升启动扫描器 —— 抓"低波动横盘后的首次放量大阳"（Phase M）
 
-状态：📝 已验证原型，待用户审阅后交 Codex
+状态：✅ Phase M 已实现并验证
 作者：规划 by Claude（规则已在本地全市场数据 + 用户标注样本图上验证）
 背景：Phase L 强度闸门数据上通过，但用户看图否决——量化指标过了 ≠ 图形对。本轮从用户标注的 11 张主升浪启动图（`交易记录/主升启动/`）反推形态,从第一性原理重新设计。
 
@@ -106,3 +106,38 @@ python -c "from mining.db import connect; ..."  # 跑 2026-06-18,应含 002821 �
 ---
 
 ## 6. 实现记录（Codex 填写）
+
+### 2026-07-17 Phase M 完成
+
+**审阅后修正**
+
+- 原规格直接使用 `close/pre_close-1`，但本地 `002821` 在 `2026-06-18` 的 `pre_close` 为 `NULL`，固定窗口 60 根中共有 11 个空值。实现改为优先使用有效 `pre_close`，缺失时回退到同股票前一交易日 `close`；仍完全禁用 `change_pct`。
+- 原规格的 `reclaim` 只约束收盘站上均线，不能排除启动前已经位于均线上方的票。实现补为“当日 `open <= T-1` 均线簇上沿，且当日 `close > T` 全部均线”，把“一阳穿线”变成可验证条件。
+- 面板要求“横盘天数”但原规格未定义。实现定义为截至 T-1、MA5/10/20/50 全部形成后，均线簇宽度连续不超过 `ma_cluster_max` 的交易日数。
+- `mining/reports.py` 使用 `DataFrame.to_markdown()`，仓库依赖中缺少其必需的 `tabulate`；已在 `requirements.txt` 补充 `tabulate>=0.9.0`，保证全新环境可运行管线测试。
+
+**M1 扫描器与验收集**
+
+- 新增 `mining/scanners/launch_burst.py`，`strategy_id="launch_burst"`、`version="v1.0"`。全部窗口和阈值集中在 `default_params`；排序分数为 `(pct/sigma20) * volume_ratio`，按日截断 `daily_cap=10`。
+- `features_json` 持久化 `pct`、`volume_ratio`、`sigma20`、`sigma_multiple`、`cluster_width`、`cluster_days`、`volume_contract_ratio`、`first_max_pct`、`close_strength`、`amount`、`score`。
+- 增加不改变结果的当日廉价预筛后，本地全市场单日扫描从约 15 秒降到约 3.3 秒。
+- 新增固定 fixture `tests/fixtures/launch_samples/002821.csv`，覆盖 `2026-03-23` 至 `2026-06-18` 共 60 根；`2026-06-18` 精确触发。已有 `000725.csv` 在 `2017-09-18` 触发。`000063`、`002466` fixture 尚未缓存，测试按规格标记 skip，没有伪造或联网补数。
+- 新增 `tests/test_launch_burst.py`，覆盖八项入选条件、`pre_close` 回退、阈值包含边界、`sec_type='index'` 排除、价格 sanity、top-N、固定样本、通用日管线与 evaluate harness。
+
+**M2 管线与观察名单**
+
+- 在 `mining/scanners/__init__.py` 注册后，`run_daily.py` 和 `mining/evaluate.py` 均通过现有通用扫描器分支自动执行，无专用分支。
+- `mining/watchlist.py::STRENGTH_SCANNERS` 与默认观察名单来源加入 `launch_burst`；未修改任何现有扫描器算法、阈值或默认参数。
+
+**M3 面板**
+
+- 手工扩展 `mining/streamlit_tabs/tab_scanner.py` 两处持久化候选白名单和两处中文名映射，显示名为“主升启动”。
+- 挖掘页增加独立清单“主升启动（初期异动）”，展示涨幅、量比、σ倍数、横盘天数、均线簇宽度；该信号从通用当日表中分离，避免重复展示。
+- `knowledge/cards/setups/SET-launch-breakthrough.md` 增加 `maps_to: launch_burst`，复用 Phase K 复盘卡片挂钩。
+
+**验证证据**
+
+- `python -m unittest tests.test_mining_pipeline tests.test_mining_ui tests.test_launch_burst`：81 项通过，2 项缺失 fixture 按规格 skip。
+- 扩展回归 `tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui tests.test_mining_evaluate tests.test_launch_burst`：108 项通过，2 项 skip。
+- 本地 `2026-06-18` 全市场实跑：4 只候选，依次为 `688131`、`603358`、`688306`、`002821`；`002821` 排名 4，候选数不超过 10。
+- `python -m py_compile` 覆盖新增扫描器、注册、watchlist、面板和测试文件，通过。

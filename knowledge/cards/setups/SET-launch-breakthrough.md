@@ -6,7 +6,7 @@ themes: [启动, 突破, 板块扩散]
 source_docs: [D0619]
 data_quantifiable: true
 maturity: medium
-maps_to: [momentum_breakout, trend_embryo]
+maps_to: [momentum_breakout, trend_embryo, launch_burst]
 ---
 
 ## 模式定义

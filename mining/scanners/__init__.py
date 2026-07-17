@@ -55,6 +55,7 @@ def load_builtin_scanners() -> None:
     from . import trend_embryo  # noqa: F401
     from . import true_leader  # noqa: F401
     from . import second_launch  # noqa: F401
+    from . import launch_burst  # noqa: F401
 
     _LOADED = True
 
@@ -62,4 +63,3 @@ def load_builtin_scanners() -> None:
 def get_registered_scanners() -> list[type[Scanner]]:
     load_builtin_scanners()
     return list(SCANNER_REGISTRY)
-

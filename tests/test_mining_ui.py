@@ -497,6 +497,7 @@ class MiningUiSmokeTests(unittest.TestCase):
                     ("trend_embryo", "601001", "Embryo", 3),
                     ("true_leader", "600003", "Leader", 4),
                     ("second_launch", "600005", "Second", 5),
+                    ("launch_burst", "600006", "Launch", 6),
                 ]
                 for strategy_id, sec_code, sec_name, rank in rows:
                     conn.execute(
@@ -516,12 +517,47 @@ class MiningUiSmokeTests(unittest.TestCase):
 
         self.assertEqual(
             set(loaded["strategy_id"]),
-            {"momentum_breakout", "rps_stock_top20", "trend_embryo", "true_leader", "second_launch"},
+            {
+                "momentum_breakout",
+                "rps_stock_top20",
+                "trend_embryo",
+                "true_leader",
+                "second_launch",
+                "launch_burst",
+            },
         )
         display = _prepare_today_display(loaded)
         self.assertIn("强趋势胚子", set(display["来源"]))
         self.assertIn("真龙/中军", set(display["来源"]))
         self.assertIn("二次启动低吸", set(display["来源"]))
+        self.assertIn("主升启动", set(display["来源"]))
+
+    def test_launch_burst_display_exposes_decision_features(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _prepare_launch_display
+
+        display = _prepare_launch_display(
+            pd.DataFrame(
+                [
+                    {
+                        "rank": 1,
+                        "sec_code": "002821",
+                        "sec_name": "Launch",
+                        "pct": 0.0767,
+                        "volume_ratio": 1.586,
+                        "sigma_multiple": 3.024,
+                        "cluster_days": 14,
+                        "cluster_width": 0.0429,
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(
+            list(display.columns),
+            ["排名", "代码", "名称", "涨幅%", "量比", "σ倍数", "横盘天数", "均线簇宽度%"],
+        )
+        self.assertAlmostEqual(display.iloc[0]["涨幅%"], 7.67)
+        self.assertEqual(display.iloc[0]["横盘天数"], 14)
     def test_last_completed_trade_date_before_open_returns_previous_trade_day(self) -> None:
         from app_panel import last_completed_trade_date_cn
 
