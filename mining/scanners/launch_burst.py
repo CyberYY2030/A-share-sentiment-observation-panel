@@ -209,7 +209,10 @@ def select_candidates_from_history(
 
     selected = (
         pd.DataFrame(rows)
-        .sort_values(["score", "sec_code"], ascending=[False, True])
+        .sort_values(
+            ["sigma_multiple", "cluster_days", "sec_code"],
+            ascending=[True, False, True],
+        )
         .head(int(params["daily_cap"]))
     )
     candidates: list[Candidate] = []

@@ -201,12 +201,17 @@ class LaunchBurstTests(unittest.TestCase):
 
         self.assertEqual(len(_scan(history, {"close_strength": 10.6 / 11.0})), 1)
 
-    def test_index_rows_are_excluded_and_daily_cap_keeps_highest_scores(self) -> None:
+    def test_index_rows_are_excluded_and_daily_cap_prefers_low_sigma_then_long_cluster(self) -> None:
+        shorter_cluster = _synthetic_history("600002", target_close=10.6)
+        prior_index = shorter_cluster.index[:-1]
+        shorter_cluster.loc[prior_index[:30], ["open", "high", "low", "close"]] = [8.5, 8.5, 8.5, 8.5]
+        shorter_cluster.loc[prior_index, "pre_close"] = shorter_cluster.loc[prior_index, "close"].shift(1)
+        shorter_cluster.loc[prior_index[0], "pre_close"] = 8.5
         stocks = pd.concat(
             [
-                _synthetic_history("600001", target_close=10.5),
-                _synthetic_history("600002", target_close=10.6),
-                _synthetic_history("600003", target_close=10.7),
+                _synthetic_history("600001", target_close=10.6),
+                shorter_cluster,
+                _synthetic_history("600003", target_close=10.5),
             ],
             ignore_index=True,
         )
@@ -215,8 +220,9 @@ class LaunchBurstTests(unittest.TestCase):
 
         candidates = _scan(pd.concat([stocks, index_rows], ignore_index=True), {"daily_cap": 2})
 
-        self.assertEqual([candidate.sec_code for candidate in candidates], ["600003", "600002"])
+        self.assertEqual([candidate.sec_code for candidate in candidates], ["600003", "600001"])
         self.assertEqual([candidate.rank for candidate in candidates], [1, 2])
+        self.assertLess(candidates[0].features["sigma_multiple"], candidates[1].features["sigma_multiple"])
 
     def test_kailaiying_fixture_hits_exact_2026_06_18(self) -> None:
         self.assertEqual(_fixture_hit_dates("002821", "2026-06-18", 0), ["2026-06-18"])

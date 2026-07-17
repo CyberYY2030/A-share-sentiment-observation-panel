@@ -71,7 +71,7 @@ sigma20 = std(pct, 20日).shift(1),下限 0.008
       ⑥volx:    volume ≥ p.vol_expand(1.5) × 前5日均量
       ⑦reclaim: close > max(MA5,MA10,MA20,MA50)   # 一阳穿线
       ⑧liquid:  amount ≥ p.amount_min(2e8);价格 sanity(close<3000)防指数串码(000852 等已实证混入)
-日内截断:按 (pct_t/sigma20)×量比 排序取 top p.daily_cap(10)——个别普涨日原始命中可到40+,必须截断
+日内截断:按 `sigma_multiple` 升序、`cluster_days` 降序、`sec_code` 升序取 top p.daily_cap(10)——个别普涨日原始命中可到40+,必须截断
 ```
 全部阈值进 params 一处集中。features_json 记录:pct、量比、sigma 倍数、cluster 宽度、run 前缩量比,供面板与复盘。
 
@@ -118,7 +118,7 @@ python -c "from mining.db import connect; ..."  # 跑 2026-06-18,应含 002821 �
 
 **M1 扫描器与验收集**
 
-- 新增 `mining/scanners/launch_burst.py`，`strategy_id="launch_burst"`、`version="v1.0"`。全部窗口和阈值集中在 `default_params`；排序分数为 `(pct/sigma20) * volume_ratio`，按日截断 `daily_cap=10`。
+- 新增 `mining/scanners/launch_burst.py`，`strategy_id="launch_burst"`、`version="v1.0"`。全部窗口和阈值集中在 `default_params`；按 `sigma_multiple` 升序、`cluster_days` 降序、`sec_code` 升序截断 `daily_cap=10`，`score` 仅保留为复盘特征。
 - `features_json` 持久化 `pct`、`volume_ratio`、`sigma20`、`sigma_multiple`、`cluster_width`、`cluster_days`、`volume_contract_ratio`、`first_max_pct`、`close_strength`、`amount`、`score`。
 - 增加不改变结果的当日廉价预筛后，本地全市场单日扫描从约 15 秒降到约 3.3 秒。
 - 新增固定 fixture `tests/fixtures/launch_samples/002821.csv`，覆盖 `2026-03-23` 至 `2026-06-18` 共 60 根；`2026-06-18` 精确触发。已有 `000725.csv` 在 `2017-09-18` 触发。`000063`、`002466` fixture 尚未缓存，测试按规格标记 skip，没有伪造或联网补数。
@@ -141,3 +141,4 @@ python -c "from mining.db import connect; ..."  # 跑 2026-06-18,应含 002821 �
 - 扩展回归 `tests.test_mining_features tests.test_mining_pipeline tests.test_mining_ui tests.test_mining_evaluate tests.test_launch_burst`：108 项通过，2 项 skip。
 - 本地 `2026-06-18` 全市场实跑：4 只候选，依次为 `688131`、`603358`、`688306`、`002821`；`002821` 排名 4，候选数不超过 10。
 - `python -m py_compile` 覆盖新增扫描器、注册、watchlist、面板和测试文件，通过。
+- 2026-07-17 M.1：根据同日配对检验将 top-N 排序改为温和启动优先；`2026-06-18` 的 `002821` 排名由 4 调整为 1，八项入选条件与参数未改。
