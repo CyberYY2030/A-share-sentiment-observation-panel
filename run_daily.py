@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from mining.db import (
     register_strategy,
     save_candidates,
 )
+from mining.intraday import scan_intraday
 from mining.refresh_basics import refresh_basics
 from mining.reports import generate_excel_report, generate_markdown_report
 from mining.scanners import get_registered_scanners
@@ -185,8 +187,25 @@ def main() -> None:
     parser.add_argument("--base-dir", default=Path.cwd())
     parser.add_argument("--backfill-only", action="store_true")
     parser.add_argument("--range", nargs=2, metavar=("START", "END"))
+    parser.add_argument("--intraday", action="store_true")
+    parser.add_argument("--intraday-start", default="14:00")
+    parser.add_argument("--intraday-end", default="15:00")
     args = parser.parse_args()
 
+    if args.intraday:
+        conn = connect(base_dir=args.base_dir)
+        try:
+            result = scan_intraday(
+                conn,
+                out_dir=Path(args.base_dir) / "output" / "intraday",
+                window_start=dt.time.fromisoformat(args.intraday_start),
+                window_end=dt.time.fromisoformat(args.intraday_end),
+            )
+        finally:
+            conn.close()
+        print(result["display"].to_string(index=False) if not result["display"].empty else "no intraday launch candidates")
+        print(f"report={result['report']}")
+        return
     if args.range:
         result = execute_range_pipeline(
             base_dir=args.base_dir,
