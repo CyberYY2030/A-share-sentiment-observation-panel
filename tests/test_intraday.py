@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -31,13 +32,22 @@ def _spot_from_history(history: pd.DataFrame) -> pd.DataFrame:
     )
 
 
+def _intraday_history(code: str = "601999", target_date: str = "2026-06-18") -> pd.DataFrame:
+    return _synthetic_history(
+        code,
+        target_date=target_date,
+        target_volume=30_000_000,
+        target_amount=318_000_000,
+    )
+
+
 class IntradayLaunchTests(unittest.TestCase):
     def test_intraday_matches_eod_when_synthetic_bar_matches_eod_bar(self) -> None:
         from mining.db import connect
         from mining.intraday import scan_intraday
         from mining.scanners.launch_burst import LaunchBurstScanner, select_candidates_from_history
 
-        history = _synthetic_history("601999", target_date="2026-06-18")
+        history = _intraday_history("601999", target_date="2026-06-18")
         scanner = LaunchBurstScanner()
         expected = select_candidates_from_history(
             history,
@@ -73,7 +83,7 @@ class IntradayLaunchTests(unittest.TestCase):
         from mining.db import connect
         from mining.intraday import build_synthetic_history
 
-        history = _synthetic_history("601999", target_date="2026-06-18")
+        history = _intraday_history("601999", target_date="2026-06-18")
         spot = _spot_from_history(history)
         spot.loc[0, "close"] = 10.8
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,31 +135,142 @@ class IntradayLaunchTests(unittest.TestCase):
             ["stock_zh_a_spot_em", "stock_zh_a_spot_em", "stock_zh_a_spot", "stock_zh_a_spot"],
         )
 
-    def test_spot_normalization_keeps_volume_and_scales_wan_yuan_amount(self) -> None:
+    def test_spot_normalization_keeps_share_volume_when_amount_implies_same_unit(self) -> None:
         from mining.intraday import normalize_spot_frame
 
         normalized = normalize_spot_frame(
             pd.DataFrame(
                 [
                     {
-                        "代码": "sh600001",
-                        "名称": "Alpha",
-                        "最新价": 10.6,
-                        "昨收": 10.0,
-                        "今开": 10.0,
-                        "最高": 10.6,
-                        "最低": 9.9,
-                        "成交量": 2_000_000,
-                        "成交额(万元)": 30_000,
+                        "code": "sh600001",
+                        "name": "Alpha",
+                        "price": 10.0,
+                        "pre_close": 9.8,
+                        "open": 9.9,
+                        "high": 10.1,
+                        "low": 9.7,
+                        "volume": 12_000_000,
+                        "amount": 120_000_000,
                     }
                 ]
             )
         )
 
         self.assertEqual(normalized.iloc[0]["sec_code"], "600001")
-        self.assertEqual(normalized.iloc[0]["volume"], 2_000_000)
-        self.assertEqual(normalized.iloc[0]["amount"], 300_000_000)
+        self.assertEqual(normalized.iloc[0]["volume"], 12_000_000)
+        self.assertEqual(normalized.iloc[0]["amount"], 120_000_000)
 
+    def test_spot_normalization_converts_lot_volume_when_amount_implies_lots(self) -> None:
+        from mining.intraday import normalize_spot_frame
+
+        normalized = normalize_spot_frame(
+            pd.DataFrame(
+                [
+                    {
+                        "code": "sh600001",
+                        "name": "Alpha",
+                        "price": 10.0,
+                        "pre_close": 9.8,
+                        "open": 9.9,
+                        "high": 10.1,
+                        "low": 9.7,
+                        "volume": 120_000,
+                        "amount": 120_000_000,
+                    }
+                ]
+            )
+        )
+
+        self.assertEqual(normalized.iloc[0]["volume"], 12_000_000)
+        self.assertEqual(normalized.iloc[0]["amount"], 120_000_000)
+
+    def test_spot_normalization_rejects_ambiguous_volume_amount_ratio(self) -> None:
+        from mining.intraday import normalize_spot_frame
+
+        with self.assertRaisesRegex(RuntimeError, "volume unit"):
+            normalize_spot_frame(
+                pd.DataFrame(
+                    [
+                        {
+                            "code": "sh600001",
+                            "name": "Alpha",
+                            "price": 10.0,
+                            "pre_close": 9.8,
+                            "open": 9.9,
+                            "high": 10.1,
+                            "low": 9.7,
+                            "volume": 1_000_000,
+                            "amount": 100_000_000,
+                        }
+                    ]
+                )
+            )
+
+    def test_frozen_snapshot_matching_latest_history_fails_closed(self) -> None:
+        from mining.db import connect
+        from mining.intraday import build_synthetic_history
+
+        history = _intraday_history("601999", target_date="2026-06-18")
+        spot = _spot_from_history(history)
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _insert_history(conn, history)
+                with self.assertRaisesRegex(RuntimeError, "frozen"):
+                    build_synthetic_history(conn, spot, "2026-06-19")
+            finally:
+                conn.close()
+
+    def test_stale_local_history_fails_closed(self) -> None:
+        from mining.db import connect
+        from mining.intraday import build_synthetic_history
+
+        history = _intraday_history("601999", target_date="2026-06-18")
+        spot = _spot_from_history(history)
+        spot.loc[0, "close"] = 10.9
+        spot.loc[0, "volume"] = 18_000_000
+        spot.loc[0, "amount"] = spot.loc[0, "close"] * spot.loc[0, "volume"]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _insert_history(conn, history)
+                with self.assertRaisesRegex(RuntimeError, "stale"):
+                    build_synthetic_history(conn, spot, "2026-06-22")
+            finally:
+                conn.close()
+
+    def test_stale_local_history_can_be_overridden_and_report_shows_baseline(self) -> None:
+        from mining.db import connect
+        from mining.intraday import scan_intraday
+
+        history = _intraday_history("601999", target_date="2026-06-18")
+        spot = _spot_from_history(history)
+        spot.loc[0, "close"] = 10.9
+        spot.loc[0, "volume"] = 18_000_000
+        spot.loc[0, "amount"] = spot.loc[0, "close"] * spot.loc[0, "volume"]
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _insert_history(conn, history)
+                with patch.dict(os.environ, {"INTRADAY_ALLOW_DB_LAG": "1"}):
+                    result = scan_intraday(
+                        conn,
+                        now=dt.datetime(2026, 6, 22, 14, 30),
+                        spot_df=spot,
+                        out_dir=base / "output" / "intraday",
+                    )
+                body = Path(result["report"]).read_text(encoding="utf-8")
+            finally:
+                conn.close()
+
+        self.assertIn("T-1=2026-06-18", body)
+        self.assertTrue(result["db_lag_allowed"])
 
 if __name__ == "__main__":
     unittest.main()
