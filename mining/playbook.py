@@ -91,9 +91,6 @@ def _raw_paths(cards_dir: Path, doc_ids: list[str]) -> dict[str, str]:
 
 
 def _card_paths(cards_dir: Path) -> list[Path]:
-    setup_dir = cards_dir / "setups"
-    if setup_dir.exists():
-        return sorted(setup_dir.glob("*.md"))
     return sorted(cards_dir.glob("**/*.md"))
 
 

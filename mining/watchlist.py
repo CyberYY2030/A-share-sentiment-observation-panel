@@ -21,6 +21,21 @@ STRENGTH_SCANNERS: tuple[str, ...] = (
     "launch_burst",
 )
 
+STATE_PULLBACK = "回踩中"
+STATE_BROKEN = "破位失效"
+STATE_RETRIGGER = "再启动"
+STATE_READY = "回踩到位"
+STATE_EXTEND = "延伸中"
+WATCHLIST_STATES = frozenset(
+    {
+        STATE_PULLBACK,
+        STATE_BROKEN,
+        STATE_RETRIGGER,
+        STATE_READY,
+        STATE_EXTEND,
+    }
+)
+
 WATCHLIST_DEFAULT_PARAMS: dict[str, Any] = {
     "vol_recent_n": 5,
     "vol_run_n": 5,
@@ -187,13 +202,13 @@ def classify_state(row: pd.Series | dict[str, Any], params: dict[str, Any] | Non
     vol_expand_up = bool(row.get("vol_expand_up"))
 
     if not math.isfinite(pullback):
-        return "回踩中"
+        return STATE_PULLBACK
     if pullback < float(p["broken_pullback"]) or (below_ma60 and made_new_low_recent):
-        return "破位失效"
+        return STATE_BROKEN
 
     in_ready_band = float(p["ready_hi"]) <= pullback <= float(p["ready_lo"])
     if in_ready_band and reclaim_ma10 and vol_expand_up and not made_new_low_recent:
-        return "再启动"
+        return STATE_RETRIGGER
     if (
         in_ready_band
         and math.isfinite(ma_proximity)
@@ -202,10 +217,10 @@ def classify_state(row: pd.Series | dict[str, Any], params: dict[str, Any] | Non
         and shrink <= float(p["shrink_max"])
         and not made_new_low_recent
     ):
-        return "回踩到位"
+        return STATE_READY
     if pullback < float(p["extend_max"]):
-        return "回踩中"
-    return "延伸中"
+        return STATE_PULLBACK
+    return STATE_EXTEND
 
 
 def _triage(row: dict[str, Any], params: dict[str, Any]) -> float:
@@ -527,6 +542,6 @@ def split_actionable_watchlist(
     if watchlist.empty:
         return watchlist.copy(), watchlist.copy()
     sorted_df = watchlist.sort_values("triage", ascending=False).reset_index(drop=True)
-    ready = sorted_df[sorted_df["state"] == "回踩到位"].head(top_n).reset_index(drop=True)
-    trigger = sorted_df[sorted_df["state"] == "再启动"].head(top_n).reset_index(drop=True)
+    ready = sorted_df[sorted_df["state"] == STATE_READY].head(top_n).reset_index(drop=True)
+    trigger = sorted_df[sorted_df["state"] == STATE_RETRIGGER].head(top_n).reset_index(drop=True)
     return ready, trigger
