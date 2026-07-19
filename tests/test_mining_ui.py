@@ -558,6 +558,124 @@ class MiningUiSmokeTests(unittest.TestCase):
         )
         self.assertAlmostEqual(display.iloc[0]["涨幅%"], 7.67)
         self.assertEqual(display.iloc[0]["横盘天数"], 14)
+
+    def test_scanner_panel_market_regime_summary_degrades_without_crashing(self) -> None:
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _format_market_regime, _load_market_regime_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                summary = _load_market_regime_summary(conn, dates["target_trade_date"])
+            finally:
+                conn.close()
+
+        self.assertTrue(summary["available"])
+        self.assertIn(str(summary["light"]), {"RED", "YELLOW", "GREEN"})
+        self.assertIn("上涨家数占比", _format_market_regime(summary))
+
+        broken_conn = sqlite3.connect(":memory:")
+        try:
+            broken = _load_market_regime_summary(broken_conn, dates["target_trade_date"])
+        finally:
+            broken_conn.close()
+        self.assertFalse(broken["available"])
+        self.assertIn("市场灯不可用", _format_market_regime(broken))
+
+    def test_scanner_panel_strategy_run_status_uses_latest_row_and_handles_empty(self) -> None:
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _load_strategy_run_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            trade_date = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                self.assertTrue(_load_strategy_run_status(conn, trade_date).empty)
+                conn.execute(
+                    """
+                    INSERT INTO strategy_runs (
+                      strategy_id, version, trade_date, run_at, universe_size,
+                      n_candidates, status, error_msg
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("launch_burst", "v1.0", trade_date, "2026-04-10 10:00:00", 10, 2, "ok", None),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO strategy_runs (
+                      strategy_id, version, trade_date, run_at, universe_size,
+                      n_candidates, status, error_msg
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("launch_burst", "v1.0", trade_date, "2026-04-10 11:00:00", 12, 0, "empty", None),
+                )
+                status = _load_strategy_run_status(conn, trade_date)
+            finally:
+                conn.close()
+
+        self.assertEqual(len(status), 1)
+        self.assertEqual(status.iloc[0]["strategy_id"], "launch_burst")
+        self.assertEqual(status.iloc[0]["status"], "empty")
+        self.assertEqual(int(status.iloc[0]["n_candidates"]), 0)
+
+    def test_scanner_panel_watchlist_state_dates_and_extend_rows_are_visible(self) -> None:
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import (
+            _load_last_watchlist_state_date,
+            _playbook_cards_for_row,
+            _watchlist_state_rows,
+        )
+        from mining.watchlist import STATE_EXTEND, STATE_READY, STATE_RETRIGGER
+
+        watchlist = pd.DataFrame(
+            [
+                {"sec_code": "600001", "sec_name": "Alpha", "state": STATE_EXTEND, "triage": 2.0},
+                {"sec_code": "600002", "sec_name": "Beta", "state": STATE_EXTEND, "triage": 5.0},
+                {"sec_code": "600003", "sec_name": "Ready", "state": STATE_READY, "triage": 9.0},
+            ]
+        )
+        extend = _watchlist_state_rows(watchlist, STATE_EXTEND, top_n=1)
+
+        self.assertEqual(extend["sec_code"].tolist(), ["600002"])
+        cards = _playbook_cards_for_row(
+            extend.iloc[0],
+            lookup=lambda key: [{"id": "extend-card", "title": "Extend"}] if key == STATE_EXTEND else [],
+        )
+        self.assertEqual([card["id"] for card in cards], ["extend-card"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO watchlist_snapshots (
+                      snapshot_date, sec_code, sec_name, state, triage, entry_price, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("2026-04-09", "600003", "Ready", STATE_READY, 1.0, 10.0, "2026-04-09 18:00:00"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO watchlist_snapshots (
+                      snapshot_date, sec_code, sec_name, state, triage, entry_price, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    ("2026-04-10", "600004", "Trigger", STATE_RETRIGGER, 1.0, 10.0, "2026-04-10 18:00:00"),
+                )
+                ready_date = _load_last_watchlist_state_date(conn, STATE_READY)
+                trigger_date = _load_last_watchlist_state_date(conn, STATE_RETRIGGER)
+            finally:
+                conn.close()
+
+        self.assertEqual(ready_date, "2026-04-09")
+        self.assertEqual(trigger_date, "2026-04-10")
+
     def test_last_completed_trade_date_before_open_returns_previous_trade_day(self) -> None:
         from app_panel import last_completed_trade_date_cn
 

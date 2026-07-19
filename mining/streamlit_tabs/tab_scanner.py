@@ -26,7 +26,14 @@ from ..scanners.rps_stock import (
     select_candidates_from_universe as select_rps_candidates,
 )
 from ..universe import build_universe
-from ..watchlist import build_watchlist, split_actionable_watchlist
+from ..reports import compute_market_regime
+from ..watchlist import (
+    STATE_EXTEND,
+    STATE_READY,
+    STATE_RETRIGGER,
+    build_watchlist,
+    split_actionable_watchlist,
+)
 from ..playbook import lookup_playbook
 from run_daily import execute_daily_pipeline
 
@@ -778,6 +785,85 @@ def load_watchlist_snapshot(
         conn.close()
 
 
+def _load_market_regime_summary(conn, trade_date: str | None) -> dict[str, object]:
+    if not trade_date:
+        return {"available": False, "message": "市场灯不可用：缺少交易日"}
+    try:
+        regime = compute_market_regime(conn, str(trade_date))
+    except Exception as exc:
+        return {"available": False, "message": f"市场灯不可用：{type(exc).__name__}"}
+    light = str(regime.get("light") or "UNKNOWN")
+    advancers_ratio = regime.get("advancers_ratio")
+    median_pct = regime.get("median_pct")
+    n = int(regime.get("n") or 0)
+    if n <= 0 or advancers_ratio is None:
+        return {"available": False, "light": light, "n": n, "message": "市场灯不可用：样本不足"}
+    return {
+        "available": True,
+        "light": light,
+        "advancers_ratio": float(advancers_ratio),
+        "median_pct": float(median_pct) if median_pct is not None else math.nan,
+        "n": n,
+    }
+
+
+def _format_market_regime(summary: dict[str, object]) -> str:
+    if not summary.get("available"):
+        return str(summary.get("message") or "市场灯不可用")
+    light = str(summary.get("light") or "UNKNOWN")
+    emoji = {"RED": "🔴", "YELLOW": "🟡", "GREEN": "🟢"}.get(light, "⚪")
+    advancers = _safe_float(summary.get("advancers_ratio")) * 100.0
+    median_pct = _safe_float(summary.get("median_pct")) * 100.0
+    return (
+        f"{emoji} {light} | 上涨家数占比 {advancers:.1f}% | "
+        f"中位涨跌 {median_pct:.2f}% | 阈值：<40% RED，>60% GREEN"
+    )
+
+
+def _load_strategy_run_status(conn, trade_date: str | None) -> pd.DataFrame:
+    columns = ["strategy_id", "status", "n_candidates", "universe_size", "run_at"]
+    if not trade_date:
+        return pd.DataFrame(columns=columns)
+    try:
+        df = pd.read_sql_query(
+            """
+            SELECT strategy_id, status, n_candidates, universe_size, run_at
+            FROM strategy_runs
+            WHERE trade_date=?
+            ORDER BY strategy_id, run_at DESC, run_id DESC
+            """,
+            conn,
+            params=[trade_date],
+        )
+    except Exception:
+        return pd.DataFrame(columns=columns)
+    if df.empty:
+        return pd.DataFrame(columns=columns)
+    return df.drop_duplicates("strategy_id", keep="first").reset_index(drop=True)
+
+
+def _load_last_watchlist_state_date(conn, state: str) -> str | None:
+    try:
+        row = conn.execute(
+            """
+            SELECT MAX(snapshot_date)
+            FROM watchlist_snapshots
+            WHERE state=?
+            """,
+            (state,),
+        ).fetchone()
+    except Exception:
+        return None
+    return str(row[0]) if row and row[0] else None
+
+
+def _watchlist_state_rows(watchlist_df: pd.DataFrame, state: str, top_n: int = 30) -> pd.DataFrame:
+    if watchlist_df.empty or "state" not in watchlist_df.columns:
+        return watchlist_df.iloc[0:0].copy()
+    sorted_df = watchlist_df.sort_values("triage", ascending=False).reset_index(drop=True)
+    return sorted_df[sorted_df["state"].eq(state)].head(top_n).reset_index(drop=True)
+
+
 def _prepare_watchlist_display(watchlist_df: pd.DataFrame) -> pd.DataFrame:
     columns = [
         "代码",
@@ -975,6 +1061,38 @@ def render_scanner_tab(
         st.info("还没有机会挖掘结果，先跑一次日任务。")
         return
 
+    try:
+        status_conn = connect(base_dir=base_dir)
+        try:
+            market_summary = _load_market_regime_summary(status_conn, today_date)
+            run_status_df = _load_strategy_run_status(status_conn, today_date)
+        finally:
+            status_conn.close()
+    except Exception:
+        market_summary = {"available": False, "message": "市场灯不可用"}
+        run_status_df = pd.DataFrame(columns=["strategy_id", "status", "n_candidates", "universe_size", "run_at"])
+
+    st.markdown("**市场状态灯**")
+    st.caption(_format_market_regime(market_summary))
+
+    st.markdown("**今日扫描运行状态**")
+    if run_status_df.empty:
+        st.caption("今日扫描未运行。")
+    else:
+        st.dataframe(
+            run_status_df.rename(
+                columns={
+                    "strategy_id": "策略",
+                    "status": "状态",
+                    "n_candidates": "候选数",
+                    "universe_size": "样本数",
+                    "run_at": "运行时间",
+                }
+            ),
+            width="stretch",
+            hide_index=True,
+        )
+
     launch_df = (
         today_df[today_df["strategy_id"].eq("launch_burst")].copy()
         if "strategy_id" in today_df.columns
@@ -1009,22 +1127,42 @@ def render_scanner_tab(
 
     watchlist_df, watchlist_date = load_watchlist_snapshot(base_dir=base_dir, trade_date=today_date)
     ready_df, trigger_df = split_actionable_watchlist(watchlist_df, top_n=30)
+    extend_df = _watchlist_state_rows(watchlist_df, STATE_EXTEND, top_n=30)
+    try:
+        watchlist_conn = connect(base_dir=base_dir)
+        try:
+            last_ready_date = _load_last_watchlist_state_date(watchlist_conn, STATE_READY)
+            last_trigger_date = _load_last_watchlist_state_date(watchlist_conn, STATE_RETRIGGER)
+        finally:
+            watchlist_conn.close()
+    except Exception:
+        last_ready_date = None
+        last_trigger_date = None
     st.markdown(f"**强势股回踩与再启动跟踪（{watchlist_date or today_date}，近40日）**")
     ready_col, trigger_col = st.columns(2)
     with ready_col:
-        st.markdown(f"**回踩到位·预备（{len(ready_df)}）**")
+        st.markdown(f"**{STATE_READY}·预备（{len(ready_df)}）**")
         if ready_df.empty:
-            st.info("暂无回踩到位的预备标的。")
+            st.info(f"暂无{STATE_READY}的预备标的。")
+            st.caption(f"最近一次出现：{last_ready_date or '历史上未出现过'}")
         else:
             st.dataframe(_prepare_watchlist_display(ready_df), width="stretch", hide_index=True)
             _render_watchlist_playbooks(ready_df)
     with trigger_col:
-        st.markdown(f"**再启动·触发今日（{len(trigger_df)}）**")
+        st.markdown(f"**{STATE_RETRIGGER}·触发今日（{len(trigger_df)}）**")
         if trigger_df.empty:
-            st.info("暂无再启动触发标的。")
+            st.info(f"暂无{STATE_RETRIGGER}触发标的。")
+            st.caption(f"最近一次出现：{last_trigger_date or '历史上未出现过'}")
         else:
             st.dataframe(_prepare_watchlist_display(trigger_df), width="stretch", hide_index=True)
             _render_watchlist_playbooks(trigger_df)
+
+    st.markdown(f"**持有管理·{STATE_EXTEND}（{len(extend_df)}）**")
+    if extend_df.empty:
+        st.info(f"暂无{STATE_EXTEND}持有管理标的。")
+    else:
+        st.dataframe(_prepare_watchlist_display(extend_df), width="stretch", hide_index=True)
+        _render_watchlist_playbooks(extend_df)
 
     with st.expander("查看全部沉淀名单", expanded=False):
         if watchlist_df.empty:
