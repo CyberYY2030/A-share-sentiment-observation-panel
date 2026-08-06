@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import datetime as dt
 from pathlib import Path
 from typing import Callable
 
@@ -9,6 +10,8 @@ import pandas as pd
 import streamlit as st
 
 from ..db import connect, list_stock_trade_dates
+from ..capabilities import LEGACY_STRATEGY_IDS, formal_definitions, visible_strategy_ids
+from ..data_quality import STATUS_CLEAN, inspect_stock_session
 from ..features import (
     board_kind,
     change_pct,
@@ -27,11 +30,29 @@ from ..scanners.rps_stock import (
 )
 from ..universe import build_universe
 from ..reports import compute_market_regime
+from ..selection_runtime import (
+    CHINA_TZ,
+    MODE_CLOSE_FINAL,
+    MODE_DATA_UNAVAILABLE,
+    SelectionRuntime,
+)
+from ..scanners.base_breakout import evaluate_base_breakout
+from ..scanners.counter_trend_rs import (
+    PRIMARY_BENCHMARK,
+    SENSITIVITY_BENCHMARKS,
+    _load_benchmark_close,
+    evaluate_counter_trend_rs,
+)
+from ..scanners.launch_burst import evaluate_compression_launch
+from ..scanners.momentum_breakout import evaluate_momentum_anomaly
+from ..scanners.strong_trend import evaluate_strong_trend
+from ..scanners.second_launch import select_candidates_from_pullback_support
 from ..watchlist import (
     STATE_EXTEND,
     STATE_READY,
     STATE_RETRIGGER,
     build_watchlist,
+    build_pullback_support,
     split_actionable_watchlist,
 )
 from ..playbook import lookup_playbook
@@ -101,6 +122,8 @@ def _normalize_snapshot_quotes(df: pd.DataFrame) -> pd.DataFrame:
     amount_col = _pick_col(df, ["amount", "turnover", "成交额", "成交金额"])
     pct_col = _pick_col(df, ["change_pct", "pct_chg", "pct", "changepercent", "涨跌幅"])
 
+    name_col = _pick_col(df, ["name", "sec_name"])
+
     if code_col is None or close_col is None:
         return pd.DataFrame(
             columns=[
@@ -118,6 +141,7 @@ def _normalize_snapshot_quotes(df: pd.DataFrame) -> pd.DataFrame:
 
     out = pd.DataFrame()
     out["sec_code"] = df[code_col].map(_canonical_code)
+    out["sec_name"] = df[name_col].astype(str).str.strip() if name_col else pd.NA
     out["close"] = df[close_col].map(_safe_float)
     out["pre_close"] = df[pre_close_col].map(_safe_float) if pre_close_col else math.nan
     out["open"] = df[open_col].map(_safe_float) if open_col else math.nan
@@ -184,11 +208,13 @@ def _snapshot_universe(conn, trade_date: str, latest_quotes: pd.DataFrame) -> pd
         return pd.DataFrame()
 
     keep = reference_universe[["sec_code", "sec_name"]].drop_duplicates()
-    universe = keep.merge(latest_quotes, on="sec_code", how="inner")
+    universe = keep.merge(latest_quotes, on="sec_code", how="inner", suffixes=("_metadata", "_snapshot"))
     if universe.empty:
         return universe
 
-    universe["sec_name"] = universe["sec_name"].fillna(universe["sec_code"])
+    snapshot_name = universe.get("sec_name_snapshot", pd.Series(pd.NA, index=universe.index))
+    metadata_name = universe.get("sec_name_metadata", pd.Series(pd.NA, index=universe.index))
+    universe["sec_name"] = snapshot_name.fillna(metadata_name).fillna(universe["sec_code"])
     universe["change_pct"] = universe["change_pct"].fillna(universe.apply(change_pct, axis=1))
     universe["board"] = universe["sec_code"].map(board_kind)
     universe = universe[
@@ -346,35 +372,319 @@ def _load_close_opportunities(conn, trade_date: str) -> pd.DataFrame:
 
 
 def _persisted_candidate_dates(conn) -> list[str]:
+    strategy_ids = visible_strategy_ids()
+    marks = ",".join("?" for _ in strategy_ids)
     rows = conn.execute(
-        """
+        f"""
         SELECT DISTINCT trade_date
         FROM candidates
         WHERE sec_type='stock'
-          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch', 'launch_burst')
+          AND strategy_id IN ({marks})
         ORDER BY trade_date
-        """
+        """,
+        strategy_ids,
     ).fetchall()
     return [str(row[0]) for row in rows]
 
 
 def _load_persisted_candidates(conn, trade_date: str) -> pd.DataFrame:
+    strategy_ids = visible_strategy_ids()
+    marks = ",".join("?" for _ in strategy_ids)
     df = pd.read_sql_query(
-        """
+        f"""
         SELECT strategy_id, trade_date, sec_type, sec_code, sec_name, entry_price, rank, features_json
         FROM candidates
         WHERE sec_type='stock'
-          AND strategy_id IN ('momentum_breakout', 'rps_stock_top20', 'trend_embryo', 'true_leader', 'second_launch', 'launch_burst')
+          AND strategy_id IN ({marks})
           AND trade_date=?
         ORDER BY strategy_id, rank, sec_code
         """,
         conn,
-        params=[trade_date],
+        params=[*strategy_ids, trade_date],
     )
     if df.empty:
         return df
     features = pd.json_normalize(df["features_json"].map(lambda text: json.loads(text or "{}")))
     return pd.concat([df.drop(columns=["features_json"]), features], axis=1)
+
+
+def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
+    """Panel consumer for the same A–E registry used by close-final reports."""
+    rows = _load_persisted_candidates(conn, trade_date)
+    if rows.empty:
+        return rows
+    definitions = {definition.strategy_id: definition for definition in formal_definitions()}
+    result = rows[rows["strategy_id"].isin(definitions)].copy()
+    if result.empty:
+        return result
+    result["capability"] = result["strategy_id"].map(lambda value: definitions[str(value)].capability)
+    result["capability_label"] = result["strategy_id"].map(lambda value: definitions[str(value)].label)
+    result["subtype"] = result["strategy_id"].map(lambda value: definitions[str(value)].subtype)
+    result["reference_price"] = pd.to_numeric(result.get("reference_price", result["entry_price"]), errors="coerce").fillna(result["entry_price"])
+    return result
+
+
+def _capability_run_status(conn, trade_date: str) -> pd.DataFrame:
+    """Return one explicit availability state per formal capability strategy."""
+    base = _load_strategy_run_status(conn, trade_date)
+    rows: list[dict[str, object]] = []
+    for definition in formal_definitions():
+        matched = base[base["strategy_id"].eq(definition.strategy_id)] if not base.empty else pd.DataFrame()
+        if matched.empty:
+            availability = "未运行"
+            latest_nonempty = conn.execute(
+                """
+                SELECT MAX(trade_date) FROM strategy_runs
+                WHERE strategy_id=? AND version='v2.0' AND status='ok' AND n_candidates>0
+                """,
+                (definition.strategy_id,),
+            ).fetchone()[0]
+            rows.append({"strategy_id": definition.strategy_id, "capability": definition.capability, "availability": availability, "last_nonempty": latest_nonempty})
+            continue
+        item = matched.iloc[0]
+        status = str(item["status"])
+        availability = "成功但 0 条" if status == "empty" else ("运行失败" if status not in {"ok", "empty"} else "成功")
+        latest_nonempty = None
+        if availability == "成功但 0 条":
+            latest_nonempty = conn.execute(
+                """
+                SELECT MAX(trade_date) FROM strategy_runs
+                WHERE strategy_id=? AND version='v2.0' AND status='ok' AND n_candidates>0
+                """,
+                (definition.strategy_id,),
+            ).fetchone()[0]
+        rows.append({
+            "strategy_id": definition.strategy_id,
+            "capability": definition.capability,
+            "availability": availability,
+            "n_candidates": int(item["n_candidates"] or 0),
+            "run_at": item["run_at"],
+            "last_nonempty": latest_nonempty,
+        })
+    return pd.DataFrame(rows)
+
+
+def _filter_pullback_strength_phase(rows: pd.DataFrame, strength_tier: str | None, state: str | None) -> pd.DataFrame:
+    result = rows.copy()
+    if strength_tier and strength_tier != "全部" and "strength_tier" in result.columns:
+        result = result[result["strength_tier"].eq(strength_tier)]
+    if state and state != "全部" and "state" in result.columns:
+        result = result[result["state"].eq(state)]
+    return result.reset_index(drop=True)
+
+
+def _selection_evidence(context, *, mode: str, snapshot_source: str | None, snapshot_coverage: float | None) -> dict[str, object]:
+    return {
+        "mode": mode,
+        "as_of": context.as_of,
+        "price_as_of": context.price_as_of,
+        "metadata_as_of": context.metadata_as_of,
+        "trend_profile": context.trend_profile,
+        "data_status": context.data_status,
+        "snapshot_source": snapshot_source,
+        "snapshot_coverage": snapshot_coverage,
+    }
+
+
+def _annotate_formal_rows(rows: pd.DataFrame, strategy_id: str, *, reference_column: str = "reference_price") -> pd.DataFrame:
+    """Turn one v2 evaluator's ordered rows into the common A–E display contract."""
+    if rows.empty:
+        return pd.DataFrame()
+    result = rows.copy().reset_index(drop=True)
+    if reference_column not in result.columns:
+        return pd.DataFrame()
+    result["reference_price"] = pd.to_numeric(result[reference_column], errors="coerce")
+    result = result[result["reference_price"].gt(0)].copy()
+    if result.empty:
+        return result
+    result["strategy_id"] = strategy_id
+    result["version"] = "v2.0"
+    result["trade_date"] = result.get("trade_date", pd.Series(pd.NA, index=result.index))
+    result["sec_type"] = "stock"
+    result["entry_price"] = result["reference_price"]
+    result["rank"] = range(1, len(result) + 1)
+    definition = next(item for item in formal_definitions() if item.strategy_id == strategy_id)
+    result["capability"] = definition.capability
+    result["capability_label"] = definition.label
+    result["subtype"] = definition.subtype
+    return result
+
+
+def _annotate_serialized_formal_rows(rows: pd.DataFrame) -> pd.DataFrame:
+    if rows.empty:
+        return rows
+    definitions = {definition.strategy_id: definition for definition in formal_definitions()}
+    result = rows[rows["strategy_id"].isin(definitions)].copy()
+    if result.empty:
+        return result
+    result["reference_price"] = pd.to_numeric(
+        result.get("reference_price", result["entry_price"]), errors="coerce"
+    ).fillna(result["entry_price"])
+    result["capability"] = result["strategy_id"].map(lambda value: definitions[str(value)].capability)
+    result["capability_label"] = result["strategy_id"].map(lambda value: definitions[str(value)].label)
+    result["subtype"] = result["strategy_id"].map(lambda value: definitions[str(value)].subtype)
+    return result
+
+
+def _live_formal_capability_rows(conn, context) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Re-evaluate A–E from one non-persistent runtime context for a snapshot/pending view."""
+    output_frames: list[pd.DataFrame] = []
+    status_rows: list[dict[str, object]] = []
+
+    def append_evaluation(strategy_id: str, rows: pd.DataFrame, diagnostics: dict[str, object], *, reference_column: str = "reference_price") -> None:
+        frame = _annotate_formal_rows(rows, strategy_id, reference_column=reference_column)
+        if not frame.empty:
+            output_frames.append(frame)
+        definition = next(item for item in formal_definitions() if item.strategy_id == strategy_id)
+        status_rows.append(
+            {
+                "strategy_id": strategy_id,
+                "capability": definition.capability,
+                "availability": "临时结果" if not frame.empty else "成功但 0 条",
+                "n_candidates": len(frame),
+                "run_at": context.as_of,
+                "last_nonempty": None,
+                "skipped_reason_counts": diagnostics.get("skipped_reason_counts", {}),
+            }
+        )
+
+    def append_failure(strategy_id: str, exc: Exception) -> None:
+        definition = next(item for item in formal_definitions() if item.strategy_id == strategy_id)
+        status_rows.append(
+            {
+                "strategy_id": strategy_id,
+                "capability": definition.capability,
+                "availability": "运行失败",
+                "n_candidates": 0,
+                "run_at": context.as_of,
+                "last_nonempty": None,
+                "skipped_reason_counts": {"runtime_error": type(exc).__name__},
+            }
+        )
+
+    try:
+        strong = evaluate_strong_trend(context)
+        append_evaluation("strong_trend", strong.rows, strong.diagnostics, reference_column="close")
+    except Exception as exc:
+        append_failure("strong_trend", exc)
+
+    try:
+        compression_rows, compression_diagnostics = evaluate_compression_launch(context)
+        append_evaluation("compression_launch", compression_rows, compression_diagnostics)
+    except Exception as exc:
+        append_failure("compression_launch", exc)
+
+    try:
+        momentum_rows, momentum_diagnostics = evaluate_momentum_anomaly(context)
+        append_evaluation("momentum_anomaly", momentum_rows, momentum_diagnostics)
+    except Exception as exc:
+        append_failure("momentum_anomaly", exc)
+
+    try:
+        pullback = build_pullback_support(conn, context.trade_date, context=context)
+        pullback_candidates = select_candidates_from_pullback_support(
+            pullback,
+            trade_date=context.trade_date,
+            strategy_id="second_launch",
+            version="v2.0",
+            top_n=20,
+        )
+        pullback_rows = _annotate_serialized_formal_rows(_serialize_candidates(pullback_candidates))
+        if not pullback_rows.empty:
+            output_frames.append(pullback_rows)
+        status_rows.append(
+            {
+                "strategy_id": "second_launch",
+                "capability": "C",
+                "availability": "临时结果" if not pullback_rows.empty else "成功但 0 条",
+                "n_candidates": len(pullback_rows),
+                "run_at": context.as_of,
+                "last_nonempty": None,
+                "skipped_reason_counts": pullback.diagnostics.get("skipped_reason_counts", {}),
+            }
+        )
+    except Exception as exc:
+        append_failure("second_launch", exc)
+
+    try:
+        base_rows, base_diagnostics = evaluate_base_breakout(context)
+        append_evaluation("base_breakout", base_rows, base_diagnostics)
+    except Exception as exc:
+        append_failure("base_breakout", exc)
+
+    try:
+        dates = [str(day) for day in context.diagnostics.get("clean_dates", [])]
+        if context.trade_date not in dates:
+            dates.append(context.trade_date)
+        primary = _load_benchmark_close(conn, dates, PRIMARY_BENCHMARK)
+        sensitivity = {code: _load_benchmark_close(conn, dates, code) for code in SENSITIVITY_BENCHMARKS}
+        rs_rows, rs_diagnostics = evaluate_counter_trend_rs(
+            context,
+            primary_benchmark=primary,
+            sensitivity_benchmarks=sensitivity,
+        )
+        append_evaluation("counter_trend_rs", rs_rows, rs_diagnostics)
+    except Exception as exc:
+        append_failure("counter_trend_rs", exc)
+    return (
+        pd.concat(output_frames, ignore_index=True, sort=False) if output_frames else pd.DataFrame(),
+        pd.DataFrame(status_rows),
+    )
+
+
+def _formal_capability_view(
+    conn,
+    trade_date: str,
+    *,
+    snapshot_loader: SnapshotLoader | None = None,
+    now: dt.datetime | None = None,
+    runtime: SelectionRuntime | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    """Use final persisted rows only after close finalization; otherwise run A–E from one snapshot."""
+    current = now or dt.datetime.now(CHINA_TZ)
+    resolved_runtime = runtime or SelectionRuntime()
+    snapshot = None
+    snapshot_source = None
+    if str(inspect_stock_session(conn, trade_date).get("status")) != STATUS_CLEAN and snapshot_loader is not None:
+        snapshot = _normalize_snapshot_quotes(snapshot_loader())
+        snapshot_source = "akshare_stock_spot"
+    result = resolved_runtime.run(
+        conn,
+        trade_date,
+        now=current,
+        snapshot_bars=snapshot,
+        snapshot_as_of=current if snapshot is not None and not snapshot.empty else None,
+        snapshot_source=snapshot_source,
+    )
+    context = result.context
+    if context is None:
+        return pd.DataFrame(), pd.DataFrame(), {}
+    evidence = _selection_evidence(
+        context,
+        mode=result.mode,
+        snapshot_source=result.snapshot_source,
+        snapshot_coverage=result.snapshot_coverage,
+    )
+    if result.mode == MODE_CLOSE_FINAL:
+        return _load_formal_capability_candidates(conn, trade_date), _capability_run_status(conn, trade_date), evidence
+    if result.mode == MODE_DATA_UNAVAILABLE:
+        status = pd.DataFrame(
+            [
+                {
+                    "strategy_id": definition.strategy_id,
+                    "capability": definition.capability,
+                    "availability": "数据过时或缺失",
+                    "n_candidates": 0,
+                    "run_at": None,
+                    "last_nonempty": None,
+                    "skipped_reason_counts": {result.reason: len(context.universe)},
+                }
+                for definition in formal_definitions()
+            ]
+        )
+        return pd.DataFrame(), status, evidence
+    rows, status = _live_formal_capability_rows(conn, context)
+    return rows, status, evidence
 
 
 def ensure_close_history_persisted(
@@ -1018,63 +1328,18 @@ def _render_watchlist_playbooks(
         label_parts = [part for part in (sec_code, sec_name, state) if part]
         with st.expander(" · ".join(label_parts) or "复盘笔记", expanded=False):
             _render_playbook_cards(_playbook_cards_for_row(row, lookup=lookup))
-def render_scanner_tab(
+
+
+def _render_legacy_observations(
     base_dir: str | Path,
-    fallback_trade_date: str | None = None,
-    latest_quote_trade_date: str | None = None,
-    use_intraday: bool = False,
-    prefer_latest_quotes: bool = False,
-    force_latest_quotes: bool = False,
+    today_df: pd.DataFrame,
+    today_date: str,
+    follow_df: pd.DataFrame,
+    previous_date: str | None,
+    current_date: str | None,
+    run_status_df: pd.DataFrame,
 ) -> None:
-    if fallback_trade_date:
-        sync_key = f"scanner_close_sync_{fallback_trade_date}"
-        sync_state = st.session_state.get(sync_key)
-        if sync_state != fallback_trade_date:
-            ensure_close_history_persisted(base_dir=base_dir, up_to_trade_date=fallback_trade_date)
-            st.session_state[sync_key] = fallback_trade_date
-
-    query_trade_date = latest_quote_trade_date or fallback_trade_date
-    shared_snapshot_loader = (
-        _build_cached_snapshot_loader()
-        if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes)
-        else None
-    )
-    today_df, today_date = load_latest_opportunities(
-        base_dir=base_dir,
-        trade_date=query_trade_date,
-        use_intraday=use_intraday,
-        prefer_latest_quotes=prefer_latest_quotes,
-        force_latest_quotes=force_latest_quotes,
-        fallback_trade_date=fallback_trade_date,
-        snapshot_loader=shared_snapshot_loader,
-    )
-    follow_df, previous_date, current_date = load_previous_day_followups(
-        base_dir=base_dir,
-        trade_date=query_trade_date,
-        use_intraday=use_intraday,
-        prefer_latest_quotes=prefer_latest_quotes,
-        force_latest_quotes=force_latest_quotes,
-        fallback_trade_date=fallback_trade_date,
-        snapshot_loader=shared_snapshot_loader,
-    )
-    if today_date is None:
-        st.info("还没有机会挖掘结果，先跑一次日任务。")
-        return
-
-    try:
-        status_conn = connect(base_dir=base_dir)
-        try:
-            market_summary = _load_market_regime_summary(status_conn, today_date)
-            run_status_df = _load_strategy_run_status(status_conn, today_date)
-        finally:
-            status_conn.close()
-    except Exception:
-        market_summary = {"available": False, "message": "市场灯不可用"}
-        run_status_df = pd.DataFrame(columns=["strategy_id", "status", "n_candidates", "universe_size", "run_at"])
-
-    st.markdown("**市场状态灯**")
-    st.caption(_format_market_regime(market_summary))
-
+    """Keep pre-v2 observations available as an explicit, collapsed comparison surface."""
     st.markdown("**今日扫描运行状态**")
     if run_status_df.empty:
         st.caption("今日扫描未运行。")
@@ -1093,16 +1358,13 @@ def render_scanner_tab(
             hide_index=True,
         )
 
-    launch_df = (
-        today_df[today_df["strategy_id"].eq("launch_burst")].copy()
+    legacy_today_df = (
+        today_df[today_df["strategy_id"].isin(LEGACY_STRATEGY_IDS)].copy()
         if "strategy_id" in today_df.columns
         else pd.DataFrame()
     )
-    general_today_df = (
-        today_df[~today_df["strategy_id"].eq("launch_burst")].copy()
-        if "strategy_id" in today_df.columns
-        else today_df
-    )
+    launch_df = legacy_today_df[legacy_today_df["strategy_id"].eq("launch_burst")].copy()
+    general_today_df = legacy_today_df[~legacy_today_df["strategy_id"].eq("launch_burst")].copy()
     st.markdown(f"**主升启动（初期异动，{today_date}）**")
     if launch_df.empty:
         st.info("当天没有主升启动信号。")
@@ -1172,3 +1434,145 @@ def render_scanner_tab(
             selected_states = st.multiselect("状态筛选", states, default=states)
             full_df = watchlist_df[watchlist_df["state"].isin(selected_states)] if selected_states else watchlist_df.iloc[0:0]
             st.dataframe(_prepare_watchlist_display(full_df), width="stretch", hide_index=True)
+def render_scanner_tab(
+    base_dir: str | Path,
+    fallback_trade_date: str | None = None,
+    latest_quote_trade_date: str | None = None,
+    use_intraday: bool = False,
+    prefer_latest_quotes: bool = False,
+    force_latest_quotes: bool = False,
+) -> None:
+    if fallback_trade_date:
+        sync_key = f"scanner_close_sync_{fallback_trade_date}"
+        sync_state = st.session_state.get(sync_key)
+        if sync_state != fallback_trade_date:
+            ensure_close_history_persisted(base_dir=base_dir, up_to_trade_date=fallback_trade_date)
+            st.session_state[sync_key] = fallback_trade_date
+
+    query_trade_date = latest_quote_trade_date or fallback_trade_date
+    shared_snapshot_loader = (
+        _build_cached_snapshot_loader()
+        if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes)
+        else None
+    )
+    today_df, today_date = load_latest_opportunities(
+        base_dir=base_dir,
+        trade_date=query_trade_date,
+        use_intraday=use_intraday,
+        prefer_latest_quotes=prefer_latest_quotes,
+        force_latest_quotes=force_latest_quotes,
+        fallback_trade_date=fallback_trade_date,
+        snapshot_loader=shared_snapshot_loader,
+    )
+    follow_df, previous_date, current_date = load_previous_day_followups(
+        base_dir=base_dir,
+        trade_date=query_trade_date,
+        use_intraday=use_intraday,
+        prefer_latest_quotes=prefer_latest_quotes,
+        force_latest_quotes=force_latest_quotes,
+        fallback_trade_date=fallback_trade_date,
+        snapshot_loader=shared_snapshot_loader,
+    )
+    if today_date is None:
+        st.info("还没有机会挖掘结果，先跑一次日任务。")
+        return
+
+    try:
+        status_conn = connect(base_dir=base_dir)
+        try:
+            market_summary = _load_market_regime_summary(status_conn, today_date)
+            run_status_df = _load_strategy_run_status(status_conn, today_date)
+            runtime_key = f"formal_selection_runtime_{today_date}"
+            if runtime_key not in st.session_state:
+                st.session_state[runtime_key] = SelectionRuntime()
+            formal_today_df, capability_status_df, selection_evidence = _formal_capability_view(
+                status_conn,
+                query_trade_date or today_date,
+                snapshot_loader=shared_snapshot_loader,
+                runtime=st.session_state[runtime_key],
+            )
+        finally:
+            status_conn.close()
+    except Exception:
+        market_summary = {"available": False, "message": "市场灯不可用"}
+        run_status_df = pd.DataFrame(columns=["strategy_id", "status", "n_candidates", "universe_size", "run_at"])
+        formal_today_df = pd.DataFrame()
+        capability_status_df = pd.DataFrame()
+        selection_evidence = {
+            "mode": "data_unavailable",
+            "as_of": None,
+            "price_as_of": None,
+            "metadata_as_of": None,
+            "trend_profile": None,
+            "data_status": "data_unavailable",
+            "snapshot_source": None,
+            "snapshot_coverage": None,
+        }
+
+    st.markdown("**当时市场背景**")
+    st.caption(_format_market_regime(market_summary))
+
+    st.markdown("**筛选证据**")
+    st.dataframe(pd.DataFrame([selection_evidence]), width="stretch", hide_index=True)
+    if selection_evidence["mode"] == "intraday_snapshot":
+        st.warning("盘中临时结果：不会写入正式收盘候选或状态历史。")
+    elif selection_evidence["mode"] == "close_pending":
+        st.warning("收盘待定：正在展示最后一批临时快照，收盘日线通过质量检查后才会定版。")
+
+    st.markdown("**正式筛选 A–E**")
+    if not capability_status_df.empty:
+        st.dataframe(capability_status_df, width="stretch", hide_index=True)
+    for capability in ("A", "B", "C", "D", "E"):
+        definitions = formal_definitions(capability)
+        label = definitions[0].label if definitions else capability
+        capability_status = (
+            capability_status_df[capability_status_df["capability"].eq(capability)].copy()
+            if not capability_status_df.empty and "capability" in capability_status_df.columns
+            else pd.DataFrame()
+        )
+        capability_rows = (
+            formal_today_df[formal_today_df["capability"].eq(capability)].copy()
+            if not formal_today_df.empty and "capability" in formal_today_df.columns
+            else pd.DataFrame()
+        )
+        st.markdown(f"**{capability} · {label}**")
+        if not capability_status.empty:
+            summaries = []
+            for item in capability_status.itertuples(index=False):
+                skipped = getattr(item, "skipped_reason_counts", None)
+                summary = f"{getattr(item, 'strategy_id')}：{getattr(item, 'availability')}"
+                if skipped:
+                    summary += f"；跳过={skipped}"
+                summaries.append(summary)
+            st.caption(" | ".join(summaries))
+        if capability_rows.empty:
+            st.info("该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。")
+            continue
+        if capability == "C":
+            tier_values = ["全部", *sorted(capability_rows.get("strength_tier", pd.Series(dtype=str)).dropna().astype(str).unique())]
+            state_values = ["全部", *sorted(capability_rows.get("state", pd.Series(dtype=str)).dropna().astype(str).unique())]
+            first, second = st.columns(2)
+            tier = first.selectbox("强度档", tier_values, key=f"c_tier_{today_date}")
+            state = second.selectbox("阶段", state_values, key=f"c_state_{today_date}")
+            capability_rows = _filter_pullback_strength_phase(capability_rows, tier, state)
+        display_columns = ["rank", "sec_code", "sec_name", "reference_price", "strategy_id"]
+        evidence_columns = [
+            field
+            for definition in definitions
+            for field in (*definition.sort_keys, *definition.fields)
+        ]
+        for column in dict.fromkeys(evidence_columns):
+            if column in capability_rows.columns and column not in display_columns:
+                display_columns.append(column)
+        st.dataframe(capability_rows[display_columns], width="stretch", hide_index=True)
+
+    with st.expander("Legacy / 其他观察（对照）", expanded=False):
+        _render_legacy_observations(
+            base_dir,
+            today_df,
+            today_date,
+            follow_df,
+            previous_date,
+            current_date,
+            run_status_df,
+        )

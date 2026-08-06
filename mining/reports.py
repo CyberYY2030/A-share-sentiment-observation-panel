@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from .capabilities import formal_definitions
+
 
 def _load_candidates(
     conn: sqlite3.Connection, trade_date: str, strategy_id: str
@@ -29,6 +31,54 @@ def _load_candidates(
     )
     features = pd.json_normalize(feature_rows)
     return pd.concat([df.drop(columns=["features_json"]), features], axis=1)
+
+
+def load_formal_capability_candidates(conn: sqlite3.Connection, trade_date: str) -> pd.DataFrame:
+    """Read only persisted close-final A–E candidates using the shared capability registry."""
+    definitions = formal_definitions()
+    if not definitions:
+        return pd.DataFrame()
+    marks = ",".join("?" for _ in definitions)
+    frame = pd.read_sql_query(
+        f"""
+        SELECT strategy_id, version, trade_date, sec_code, sec_name, entry_price, rank, features_json
+        FROM candidates
+        WHERE sec_type='stock' AND trade_date=? AND strategy_id IN ({marks})
+        ORDER BY strategy_id, rank, sec_code
+        """,
+        conn,
+        params=[str(trade_date), *(definition.strategy_id for definition in definitions)],
+    )
+    if frame.empty:
+        return frame
+    features = pd.json_normalize(frame["features_json"].map(lambda value: json.loads(value or "{}")))
+    result = pd.concat([frame.drop(columns="features_json"), features], axis=1)
+    by_strategy = {definition.strategy_id: definition for definition in definitions}
+    result["capability"] = result["strategy_id"].map(lambda value: by_strategy[str(value)].capability)
+    result["capability_label"] = result["strategy_id"].map(lambda value: by_strategy[str(value)].label)
+    result["subtype"] = result["strategy_id"].map(lambda value: by_strategy[str(value)].subtype)
+    result["reference_price"] = pd.to_numeric(result.get("reference_price", result["entry_price"]), errors="coerce").fillna(result["entry_price"])
+    return result
+
+
+def formal_capability_report_sections(conn: sqlite3.Connection, trade_date: str) -> list[str]:
+    """Registry-driven close-final report sections; no snapshot row is queried or exported."""
+    rows = load_formal_capability_candidates(conn, trade_date)
+    lines = ["## 正式筛选 A–E（收盘定版）"]
+    for capability in ("A", "B", "C", "D", "E"):
+        definitions = formal_definitions(capability)
+        label = definitions[0].label if definitions else capability
+        section = rows[rows["capability"].eq(capability)].copy() if not rows.empty else pd.DataFrame()
+        lines.extend(["", f"### {capability} · {label}"])
+        if section.empty:
+            lines.append("收盘定版后该能力无候选。")
+            continue
+        columns = ["rank", "sec_code", "sec_name", "reference_price", "strategy_id"]
+        for field in ("event_subtype", "strength_tier", "state", "score", "path_context"):
+            if field in section.columns:
+                columns.append(field)
+        lines.append(_markdown_table(section, columns))
+    return lines
 
 
 def _format_ratio(value: float | None) -> str:
@@ -58,7 +108,14 @@ def _format_number(value: float | None, digits: int = 2) -> str:
 def _markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
     if df.empty:
         return "无候选。"
-    return df[columns].to_markdown(index=False)
+    table = df[columns].copy()
+    try:
+        return table.to_markdown(index=False)
+    except ImportError:
+        header = "| " + " | ".join(map(str, table.columns)) + " |"
+        divider = "| " + " | ".join("---" for _ in table.columns) + " |"
+        body = ["| " + " | ".join(str(value) for value in row) + " |" for row in table.fillna("-").itertuples(index=False, name=None)]
+        return "\n".join([header, divider, *body])
 
 
 def get_review_summary(
@@ -333,6 +390,8 @@ def generate_markdown_report(
             f"{_format_ratio(market_regime['median_pct'])}，样本 {market_regime['n']}）"
         ),
         "",
+        *formal_capability_report_sections(conn, trade_date),
+        "",
         "## 今日异动候选",
         _markdown_table(
             momentum.assign(
@@ -461,7 +520,7 @@ def generate_markdown_report(
                 for strategy_id, values in summary.items()
             ]
         )
-        lines.append(summary_df.to_markdown(index=False))
+        lines.append(_markdown_table(summary_df, list(summary_df.columns)))
 
     path = out_path / f"report_{day_key}.md"
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -476,7 +535,16 @@ def generate_excel_report(
     day_key = trade_date.replace("-", "")
     file_path = out_path / f"candidates_{day_key}.xlsx"
 
+    formal_rows = load_formal_capability_candidates(conn, trade_date)
     sheets = {
+        **{
+            f"{definition.capability}{definition.label}{definition.subtype or definition.strategy_id}"[:31]: (
+                formal_rows[formal_rows["strategy_id"].eq(definition.strategy_id)].copy()
+                if not formal_rows.empty
+                else pd.DataFrame()
+            )
+            for definition in formal_definitions()
+        },
         "异动候选": _load_candidates(conn, trade_date, "momentum_breakout"),
         "个股强势": _load_candidates(conn, trade_date, "rps_stock_top20"),
         "板块强势": _load_candidates(conn, trade_date, "rps_concept_top20"),
