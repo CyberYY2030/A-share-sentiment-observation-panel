@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 
 from ..selection_context import build_selection_context
@@ -10,6 +11,18 @@ from ..watchlist import (
     persist_pullback_support_states,
 )
 from . import Candidate, Scanner, register
+
+
+def _ma_proximity(row: object) -> float | None:
+    values: list[float] = []
+    for field in ("dist_ma10", "dist_ma20"):
+        try:
+            value = float(getattr(row, field))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(abs(value))
+    return min(values) if values else None
 
 
 def select_candidates_from_pullback_support(
@@ -50,11 +63,14 @@ def select_candidates_from_pullback_support(
                     "ma10": float(row.ma10),
                     "ma20": float(row.ma20),
                     "ma_long": float(row.ma_long),
+                    "ma_proximity": _ma_proximity(row),
                     "shrink_ratio": float(row.shrink_ratio),
                     "pullback_negative_days": int(row.pullback_negative_days),
                     "made_new_low_recent": bool(row.made_new_low_recent),
                     "reclaim_ma10": bool(row.reclaim_ma10),
                     "activity_expand": bool(row.activity_expand),
+                    "stop_signal": bool(row.state == PULLBACK_STATE_RETRIGGER),
+                    "flag_strategies": "strong_trend",
                 },
                 rank=rank,
             )

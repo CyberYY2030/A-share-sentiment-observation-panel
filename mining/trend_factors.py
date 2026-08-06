@@ -13,6 +13,7 @@ class TrendProfile:
     middle_window: int
     long_window: int
     direction_shift: int
+    intermediate_window: int | None = None
 
     @property
     def required_stock_bars(self) -> int:
@@ -20,7 +21,7 @@ class TrendProfile:
 
 
 TREND_PROFILES = (
-    TrendProfile("P200", 220, 20, 60, 200, 20),
+    TrendProfile("P200", 220, 20, 60, 200, 20, intermediate_window=120),
     TrendProfile("P120", 140, 20, 60, 120, 20),
     TrendProfile("P90", 110, 20, 60, 90, 20),
     TrendProfile("P60", 75, 10, 30, 60, 15),
@@ -44,6 +45,7 @@ def evaluate_trend_structure(bars: pd.DataFrame, profile: TrendProfile | None) -
         "adj_close",
         "ma_short",
         "ma_middle",
+        "ma_intermediate",
         "ma_long",
         "ma_long_prior",
         "long_window_high",
@@ -66,6 +68,7 @@ def evaluate_trend_structure_history(bars: pd.DataFrame, profile: TrendProfile |
         "adj_close",
         "ma_short",
         "ma_middle",
+        "ma_intermediate",
         "ma_long",
         "ma_long_prior",
         "long_window_high",
@@ -84,6 +87,11 @@ def evaluate_trend_structure_history(bars: pd.DataFrame, profile: TrendProfile |
         close = frame.set_index("trade_date")["adj_close"].reindex(expected_dates)
         ma_short = close.rolling(profile.short_window, min_periods=profile.short_window).mean()
         ma_middle = close.rolling(profile.middle_window, min_periods=profile.middle_window).mean()
+        ma_intermediate = (
+            close.rolling(profile.intermediate_window, min_periods=profile.intermediate_window).mean()
+            if profile.intermediate_window is not None
+            else None
+        )
         ma_long = close.rolling(profile.long_window, min_periods=profile.long_window).mean()
         for position, trade_date in enumerate(expected_dates):
             tail_start = position - profile.required_stock_bars + 1
@@ -99,6 +107,7 @@ def evaluate_trend_structure_history(bars: pd.DataFrame, profile: TrendProfile |
                         "adj_close": latest_close if pd.notna(latest_close) else pd.NA,
                         "ma_short": pd.NA,
                         "ma_middle": pd.NA,
+                        "ma_intermediate": pd.NA,
                         "ma_long": pd.NA,
                         "ma_long_prior": pd.NA,
                         "long_window_high": pd.NA,
@@ -108,19 +117,25 @@ def evaluate_trend_structure_history(bars: pd.DataFrame, profile: TrendProfile |
                 continue
             latest_short = float(ma_short.iloc[position])
             latest_middle = float(ma_middle.iloc[position])
+            latest_intermediate = float(ma_intermediate.iloc[position]) if ma_intermediate is not None else pd.NA
             latest_long = float(ma_long.iloc[position])
             previous_long = float(ma_long.iloc[position - profile.direction_shift])
             long_high = float(close.iloc[position - profile.long_window + 1 : position + 1].max())
+            aligned = float(latest_close) > latest_short > latest_middle
+            if ma_intermediate is not None:
+                aligned = aligned and latest_middle > float(latest_intermediate) > latest_long
+            else:
+                aligned = aligned and latest_middle > latest_long
             rows.append(
                 {
                     "sec_code": sec_code,
                     "trade_date": trade_date,
                     "history_sufficient": True,
-                    "trend_structure_pass": float(latest_close) > latest_short > latest_middle > latest_long
-                    and latest_long > previous_long,
+                    "trend_structure_pass": aligned and latest_long > previous_long,
                     "adj_close": float(latest_close),
                     "ma_short": latest_short,
                     "ma_middle": latest_middle,
+                    "ma_intermediate": latest_intermediate,
                     "ma_long": latest_long,
                     "ma_long_prior": previous_long,
                     "long_window_high": long_high,

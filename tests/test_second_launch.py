@@ -31,6 +31,8 @@ class SecondLaunchTests(unittest.TestCase):
                         "ma10": 12.4,
                         "ma20": 12.0,
                         "ma_long": 10.0,
+                        "dist_ma10": 0.008,
+                        "dist_ma20": -0.015,
                         "shrink_ratio": 0.6,
                         "pullback_negative_days": 4,
                         "made_new_low_recent": False,
@@ -60,6 +62,9 @@ class SecondLaunchTests(unittest.TestCase):
         self.assertEqual([candidate.sec_code for candidate in candidates], ["600001"])
         self.assertEqual(candidates[0].features["state"], PULLBACK_STATE_RETRIGGER)
         self.assertEqual(candidates[0].features["reference_price"], 12.5)
+        self.assertAlmostEqual(candidates[0].features["ma_proximity"], 0.008)
+        self.assertTrue(candidates[0].features["stop_signal"])
+        self.assertEqual(candidates[0].features["flag_strategies"], "strong_trend")
 
     def test_scanner_consumes_one_evaluation_and_persists_that_same_final_state(self) -> None:
         context = SelectionContext(

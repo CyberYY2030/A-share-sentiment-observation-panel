@@ -13,7 +13,7 @@ import pandas as pd
 from .db import list_stock_trade_dates, now_str
 from .features import board_kind, moving_average, volume_shrink_ratio
 from .selection_context import SelectionContext, build_selection_context
-from .trend_factors import TrendProfile, evaluate_trend_structure_history, resolve_trend_profile
+from .trend_factors import TrendProfile, resolve_trend_profile
 
 # Phase L: scanners that certify a stock as "prior strength". A stock only enters
 # the funnel if it was flagged by one of these (true leader / relative-strength
@@ -569,6 +569,7 @@ PULLBACK_SUPPORT_STATES = frozenset(
     }
 )
 PULLBACK_STATE_HISTORY_TABLE = "pullback_state_history"
+FORMAL_A_DEFINITION_VERSION = "v2.5"
 
 
 @dataclass
@@ -633,29 +634,6 @@ def _normalize_a_qualified_dates(
         str(code).zfill(6): {str(trade_date) for trade_date in values}
         for code, values in a_qualified_dates.items()
     }
-
-
-def _five_day_structure_qualification(
-    structure_history: pd.DataFrame,
-    clean_dates: list[str],
-) -> dict[str, str]:
-    """Return the first five-session shared-structure streak inside the C window."""
-    if structure_history.empty or not clean_dates:
-        return {}
-    result: dict[str, str] = {}
-    for code, frame in structure_history.groupby("sec_code", sort=True):
-        passed = (
-            frame.assign(trade_date=frame["trade_date"].astype(str))
-            .set_index("trade_date")["trend_structure_pass"]
-            .reindex(clean_dates)
-            .fillna(False)
-            .astype(bool)
-        )
-        rolling = passed.astype(int).rolling(5, min_periods=5).sum()
-        qualified = rolling[rolling.eq(5)]
-        if not qualified.empty:
-            result[str(code).zfill(6)] = str(qualified.index[0])
-    return result
 
 
 def _series_value(series: pd.Series, position: int) -> float:
@@ -786,8 +764,6 @@ def evaluate_pullback_support(
         return PullbackSupportEvaluation(pd.DataFrame(), profile, diagnostics)
 
     window_dates = clean_dates[-60:]
-    structure_history = evaluate_trend_structure_history(context.bars, profile)
-    structure_streaks = _five_day_structure_qualification(structure_history, window_dates)
     a_pool = _normalize_a_qualified_dates(a_qualified_dates)
     prior_history = {str(code).zfill(6): tuple(states)[-5:] for code, states in (prior_state_history or {}).items()}
     tiers = {str(code).zfill(6): str(tier) for code, tier in (a_strength_tiers or {}).items()}
@@ -802,14 +778,15 @@ def evaluate_pullback_support(
     skipped = Counter()
     rows: list[dict[str, Any]] = []
     for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
-        first_structure_date = structure_streaks.get(code)
-        if first_structure_date is None:
-            skipped["five_session_structure_missing"] += 1
-            continue
         qualifying_a_dates = {date for date in a_pool.get(code, set()) if date in window_dates}
         if not qualifying_a_dates:
             skipped["never_in_a_qualified_pool"] += 1
             continue
+        # C is defined by a prior formal A result, not by the legacy shared-MA
+        # proxy.  The earliest qualifying A date is also the start of this C
+        # structure window, keeping the displayed start inside the frozen
+        # 60-session eligibility horizon.
+        first_structure_date = min(qualifying_a_dates)
         row = _evaluate_pullback_row(
             frame,
             code=code,
@@ -853,9 +830,9 @@ def _load_a_qualified_pool(
             f"""
             SELECT sec_code, trade_date, features_json
             FROM candidates
-            WHERE strategy_id='strong_trend' AND sec_type='stock' AND trade_date IN ({marks})
+            WHERE strategy_id='strong_trend' AND version=? AND sec_type='stock' AND trade_date IN ({marks})
             """,
-            list(clean_dates),
+            [FORMAL_A_DEFINITION_VERSION, *clean_dates],
         ).fetchall()
     except sqlite3.OperationalError:
         return {}, {}
@@ -863,13 +840,13 @@ def _load_a_qualified_pool(
     tiers: dict[str, str] = {}
     for sec_code, trade_date, features_json in rows:
         code = str(sec_code).zfill(6)
-        qualified.setdefault(code, set()).add(str(trade_date))
         try:
             features = json.loads(features_json or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
             features = {}
         tier = features.get("strength_tier")
-        if tier:
+        if tier in {"continuation", "fresh_breakout"}:
+            qualified.setdefault(code, set()).add(str(trade_date))
             tiers[code] = str(tier)
     return qualified, tiers
 
@@ -933,7 +910,7 @@ def build_pullback_support(
     """Build the formal C result; no raw price query is performed outside shared context."""
     resolved_context = context or build_selection_context(conn, trade_date, mode="close_final")
     clean_dates = [str(date) for date in resolved_context.diagnostics.get("clean_dates", [])]
-    window_dates = clean_dates[-60:]
+    window_dates = [date for date in clean_dates if str(date) < str(trade_date)][-60:]
     a_qualified_dates, strength_tiers = _load_a_qualified_pool(conn, window_dates)
     prior_states = load_prior_pullback_states(conn, trade_date, clean_dates=clean_dates)
     return evaluate_pullback_support(

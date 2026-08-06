@@ -1193,6 +1193,73 @@ class MiningPipelineTests(unittest.TestCase):
             conn = connect(base_dir=base)
             try:
                 _seed_second_launch_path(conn, dates["target_trade_date"])
+                # R1 fixture migration: C needs 75 usable sessions and an A
+                # close-final qualification strictly before the pullback date.
+                source_day = trading_days("2026-02-20", 40)[0]
+                for history_day in trading_days("2025-12-15", 48):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ash.kline_daily (
+                          sec_type, sec_code, trade_date, open, high, low, close, pre_close,
+                          change, change_pct, volume, amount, turnover_ratio, source, updated_at
+                        )
+                        SELECT sec_type, sec_code, ?, open, high, low, close, pre_close,
+                               change, change_pct, volume, amount, turnover_ratio, source, updated_at
+                        FROM ash.kline_daily
+                        WHERE sec_type='stock' AND trade_date=?
+                        """,
+                        (history_day, source_day),
+                    )
+                from mining.data_quality import clean_stock_trade_dates
+                clean_dates = clean_stock_trade_dates(conn, end_date=dates["target_trade_date"])
+                shape_days = clean_dates[-13:]
+                shape_closes = [8.0, 8.0, 8.0, 8.0, 12.0, 11.0, 10.5, 10.3, 10.1, 10.0, 9.9, 9.9, 11.0]
+                shape_volumes = [20_000_000] * 5 + [8_750_000] * 7 + [15_000_000]
+                prior_close = 8.0
+                for shape_day, close, volume in zip(shape_days, shape_closes, shape_volumes, strict=True):
+                    conn.execute(
+                        """
+                        UPDATE ash.kline_daily
+                        SET open=?, high=?, low=?, close=?, pre_close=?, change=?, change_pct=?, volume=?, amount=?
+                        WHERE sec_type='stock' AND sec_code='600001' AND trade_date=?
+                        """,
+                        (prior_close, max(prior_close, close) * 1.01, min(prior_close, close) * 0.99, close, prior_close, close - prior_close,
+                         (close / prior_close - 1.0) * 100.0, volume, volume * close, shape_day),
+                    )
+                    prior_close = close
+                a_day = shape_days[4]
+                run_id = conn.execute(
+                    """
+                    INSERT INTO strategy_runs (strategy_id, version, trade_date, run_at, universe_size, n_candidates, status, error_msg)
+                    VALUES ('strong_trend', 'v2.5', ?, '2026-04-10 00:00:00', 1, 1, 'ok', NULL)
+                    """,
+                    (a_day,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO candidates (run_id, strategy_id, version, trade_date, sec_type, sec_code, sec_name, entry_price, features_json, rank)
+                    VALUES (?, 'strong_trend', 'v2.5', ?, 'stock', '600001', 'Alpha', 10.0, '{"strength_tier":"continuation"}', 1)
+                    """,
+                    (run_id, a_day),
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pullback_state_history (
+                      trade_date TEXT NOT NULL, sec_code TEXT NOT NULL, state TEXT NOT NULL,
+                      trend_profile TEXT, as_of TEXT, created_at TEXT,
+                      PRIMARY KEY (trade_date, sec_code)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO pullback_state_history
+                    (trade_date, sec_code, state, trend_profile, as_of, created_at)
+                    VALUES (?, '600001', '回调中', 'P60', ?, '2026-04-10 00:00:00')
+                    """,
+                    (shape_days[-2], shape_days[-2]),
+                )
+                conn.commit()
                 candidates = SecondLaunchScanner().run(conn, dates["target_trade_date"])
             finally:
                 conn.close()
@@ -1200,10 +1267,10 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual([candidate.sec_code for candidate in candidates], ["600001"])
         features = candidates[0].features
         self.assertLessEqual(features["pullback_pct"], -0.08)
-        self.assertLessEqual(features["ma_proximity"], 0.03)
+        self.assertAlmostEqual(features["ma_proximity"], abs(11.0 / 10.27 - 1.0))
         self.assertAlmostEqual(features["shrink_ratio"], 0.5)
         self.assertTrue(features["stop_signal"])
-        self.assertEqual(features["flag_strategies"], "trend_embryo,true_leader")
+        self.assertEqual(features["flag_strategies"], "strong_trend")
 
     def test_second_launch_excludes_without_volume_shrink(self) -> None:
         from mining.db import connect
@@ -1231,6 +1298,73 @@ class MiningPipelineTests(unittest.TestCase):
             conn = connect(base_dir=base)
             try:
                 _seed_second_launch_path(conn, dates["target_trade_date"])
+                # Keep this fixture local to the authorized use case: current C
+                # may rely only on an earlier v2.5 A close-final record.
+                source_day = trading_days("2026-02-20", 40)[0]
+                for history_day in trading_days("2025-12-15", 48):
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO ash.kline_daily (
+                          sec_type, sec_code, trade_date, open, high, low, close, pre_close,
+                          change, change_pct, volume, amount, turnover_ratio, source, updated_at
+                        )
+                        SELECT sec_type, sec_code, ?, open, high, low, close, pre_close,
+                               change, change_pct, volume, amount, turnover_ratio, source, updated_at
+                        FROM ash.kline_daily
+                        WHERE sec_type='stock' AND trade_date=?
+                        """,
+                        (history_day, source_day),
+                    )
+                from mining.data_quality import clean_stock_trade_dates
+                clean_dates = clean_stock_trade_dates(conn, end_date=dates["target_trade_date"])
+                shape_days = clean_dates[-13:]
+                shape_closes = [8.0, 8.0, 8.0, 8.0, 12.0, 11.0, 10.5, 10.3, 10.1, 10.0, 9.9, 9.9, 11.0]
+                shape_volumes = [20_000_000] * 5 + [8_750_000] * 7 + [15_000_000]
+                prior_close = 8.0
+                for shape_day, close, volume in zip(shape_days, shape_closes, shape_volumes, strict=True):
+                    conn.execute(
+                        """
+                        UPDATE ash.kline_daily
+                        SET open=?, high=?, low=?, close=?, pre_close=?, change=?, change_pct=?, volume=?, amount=?
+                        WHERE sec_type='stock' AND sec_code='600001' AND trade_date=?
+                        """,
+                        (prior_close, max(prior_close, close) * 1.01, min(prior_close, close) * 0.99, close, prior_close, close - prior_close,
+                         (close / prior_close - 1.0) * 100.0, volume, volume * close, shape_day),
+                    )
+                    prior_close = close
+                a_day = shape_days[4]
+                run_id = conn.execute(
+                    """
+                    INSERT INTO strategy_runs (strategy_id, version, trade_date, run_at, universe_size, n_candidates, status, error_msg)
+                    VALUES ('strong_trend', 'v2.5', ?, '2026-04-10 00:00:00', 1, 1, 'ok', NULL)
+                    """,
+                    (a_day,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO candidates (run_id, strategy_id, version, trade_date, sec_type, sec_code, sec_name, entry_price, features_json, rank)
+                    VALUES (?, 'strong_trend', 'v2.5', ?, 'stock', '600001', 'Alpha', 10.0, '{"strength_tier":"continuation"}', 1)
+                    """,
+                    (run_id, a_day),
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS pullback_state_history (
+                      trade_date TEXT NOT NULL, sec_code TEXT NOT NULL, state TEXT NOT NULL,
+                      trend_profile TEXT, as_of TEXT, created_at TEXT,
+                      PRIMARY KEY (trade_date, sec_code)
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR REPLACE INTO pullback_state_history
+                    (trade_date, sec_code, state, trend_profile, as_of, created_at)
+                    VALUES (?, '600001', '回调中', 'P60', ?, '2026-04-10 00:00:00')
+                    """,
+                    (shape_days[-2], shape_days[-2]),
+                )
+                conn.commit()
             finally:
                 conn.close()
 
