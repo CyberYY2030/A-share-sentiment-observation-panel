@@ -54,9 +54,9 @@ def load_builtin_scanners() -> None:
     from . import rps_stock  # noqa: F401
     from . import trend_embryo  # noqa: F401
     from . import true_leader  # noqa: F401
+    from . import strong_trend  # noqa: F401
     from . import second_launch  # noqa: F401
     from . import launch_burst  # noqa: F401
-    from . import strong_trend  # noqa: F401
 
     _LOADED = True
 
