@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
+from mining.data_quality import STATUS_BAD, STATUS_UNAVAILABLE, inspect_stock_session, mark_known_bad_session
 from runtime_paths import build_runtime_paths
 
 
@@ -105,6 +106,7 @@ def stock_coverage_for_date(
         "index": False,
         "stock_rows": 0,
         "index_codes": [],
+        "session_quality": {},
     }
     if not Path(stock_db).exists():
         return result
@@ -137,12 +139,15 @@ def stock_coverage_for_date(
         index_codes = sorted({_canonical_code(row[0]) for row in rows if row and row[0] is not None})
         required = {_canonical_code(code) for code in required_index_codes}
 
+        session_quality = inspect_stock_session(con, day)
         result.update(
             {
-                "stock": stock_rows >= int(stock_min_rows),
+                "stock": stock_rows >= int(stock_min_rows)
+                and session_quality["status"] in {"clean", STATUS_UNAVAILABLE},
                 "index": required.issubset(set(index_codes)),
                 "stock_rows": stock_rows,
                 "index_codes": index_codes,
+                "session_quality": session_quality,
             }
         )
         return result
@@ -498,6 +503,46 @@ def _domain_days(plan: dict[str, Any], *domains: str) -> list[str]:
     return sorted(days)
 
 
+def _mark_unrecoverable_bad_stock_sessions(
+    stock_db: str | Path,
+    days: Iterable[str],
+    commands: Iterable[dict[str, Any]],
+) -> list[str]:
+    """Persist only observed bad sessions after the bounded repair source was tried."""
+    attempted = {
+        str(arg)
+        for command in commands
+        if command.get("domain") == "stock_index"
+        for arg in (command.get("cmd") or [])
+    }
+    marked: list[str] = []
+    if not attempted or not Path(stock_db).exists():
+        return marked
+    con = _connect(stock_db)
+    try:
+        for day in sorted({str(day) for day in days}):
+            if day not in attempted:
+                continue
+            quality = inspect_stock_session(con, day)
+            if quality["status"] != STATUS_BAD:
+                continue
+            errors = [
+                str(command.get("output") or "")[-1000:]
+                for command in commands
+                if command.get("domain") == "stock_index" and day in [str(arg) for arg in (command.get("cmd") or [])]
+            ]
+            mark_known_bad_session(
+                con,
+                day,
+                reason="bounded_repair_failed_for_observed_bad_session",
+                source_errors="\n".join(errors),
+            )
+            marked.append(day)
+    finally:
+        con.close()
+    return marked
+
+
 def _emit(logs: list[str], message: str) -> None:
     logs.append(message)
     print(message, flush=True)
@@ -832,7 +877,7 @@ def run_offline_update(
                     "1",
                 ]
                 _emit(logs, f"stock_index repair start asof={market_day}")
-                rc, out = _run(cmd, cwd=paths.base_dir, timeout_sec=max(3600, timeout_sec))
+                rc, out = _run(cmd, cwd=paths.base_dir, timeout_sec=max(30, timeout_sec))
                 commands.append(
                     {
                         "domain": "stock_index",
@@ -957,6 +1002,15 @@ def run_offline_update(
             _emit(logs, f"mining rc={rc} attempts={attempts} range={mining_days[0]}..{mining_days[-1]}")
 
     final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    unresolved_bad_days = [
+        day
+        for day in _domain_days(final_plan, "stock")
+        if (final_plan.get("coverage", {}).get(day, {}).get("session_quality", {}).get("status") == STATUS_BAD)
+    ]
+    marked_bad_days = _mark_unrecoverable_bad_stock_sessions(paths.stock_db, unresolved_bad_days, commands)
+    if marked_bad_days:
+        _emit(logs, f"known_bad_sessions={marked_bad_days}")
+        final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
     return {"ok": bool(final_plan.get("ok")), "plan": final_plan, "initial_plan": plan, "logs": logs, "commands": commands}
 
 

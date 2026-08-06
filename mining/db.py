@@ -186,6 +186,7 @@ def list_stock_trade_dates(
     end_date: str | None = None,
     limit: int | None = None,
     include_end: bool = True,
+    clean_only: bool = False,
 ) -> list[str]:
     where = "WHERE sec_type='stock'"
     params: list[Any] = []
@@ -193,16 +194,21 @@ def list_stock_trade_dates(
         op = "<=" if include_end else "<"
         where += f" AND trade_date {op} ?"
         params.append(end_date)
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT trade_date
-        FROM ash.kline_daily
-        {where}
-        ORDER BY trade_date
-        """,
-        params,
-    ).fetchall()
-    dates = [row[0] for row in rows]
+    if clean_only:
+        from .data_quality import clean_stock_trade_dates
+
+        dates = clean_stock_trade_dates(conn, end_date=end_date, include_end=include_end)
+    else:
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT trade_date
+            FROM ash.kline_daily
+            {where}
+            ORDER BY trade_date
+            """,
+            params,
+        ).fetchall()
+        dates = [row[0] for row in rows]
     if limit is not None:
         return dates[-limit:]
     return dates
