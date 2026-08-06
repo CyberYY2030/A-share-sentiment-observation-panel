@@ -39,6 +39,24 @@ def _positive(value: Any) -> bool:
     return _finite(value) and float(value) > 0.0
 
 
+def _zero_or_missing(value: Any) -> bool:
+    return value is None or (_finite(value) and float(value) == 0.0)
+
+
+def _provider_zero_no_activity_placeholder(
+    prices: Mapping[str, Any],
+    pre_close: Any,
+    volume: Any,
+    amount: Any,
+) -> bool:
+    return (
+        all(_finite(value) and float(value) == 0.0 for value in prices.values())
+        and _positive(pre_close)
+        and _zero_or_missing(volume)
+        and _zero_or_missing(amount)
+    )
+
+
 def _value(row: Mapping[str, Any] | sqlite3.Row, column: str) -> Any:
     try:
         return row[column]
@@ -129,6 +147,8 @@ def _row_status(row: Mapping[str, Any] | sqlite3.Row) -> tuple[str, str | None]:
     pre_close = _value(row, "pre_close")
     volume = _value(row, "volume")
     amount = _value(row, "amount")
+    if _provider_zero_no_activity_placeholder(prices, pre_close, volume, amount):
+        return ROW_PROVIDER_HALT, "provider_zero_no_activity_placeholder"
     if any(value is None for value in (*prices.values(), volume, amount)):
         return ROW_MISSING, "missing_required_field"
     if not all(_finite(value) for value in prices.values()):

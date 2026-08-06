@@ -55,6 +55,30 @@ class SelectionContextTests(unittest.TestCase):
         self.assertIn("600001", context.diagnostics["adjustment_invalid_codes"])
         self.assertEqual(context.diagnostics["skipped_reason_counts"]["adjustment_ratio_out_of_range"], 1)
 
+    def test_provider_zero_placeholder_is_not_a_current_tradable_candidate(self) -> None:
+        previous = self.conn.execute(
+            """
+            SELECT close FROM ash.kline_daily
+            WHERE sec_type='stock' AND sec_code='600001' AND trade_date < ?
+            ORDER BY trade_date DESC LIMIT 1
+            """,
+            (self.trade_date,),
+        ).fetchone()[0]
+        self.conn.execute(
+            """
+            UPDATE ash.kline_daily
+            SET open=0, high=0, low=0, close=0, pre_close=?, volume=0, amount=0
+            WHERE sec_type='stock' AND sec_code='600001' AND trade_date=?
+            """,
+            (previous, self.trade_date),
+        )
+        self.conn.commit()
+
+        context = build_selection_context(self.conn, self.trade_date)
+
+        self.assertNotIn("600001", set(context.universe["sec_code"]))
+        self.assertEqual(context.price_status, "ready")
+
     def test_same_context_inputs_are_deterministic_and_selector_is_pure(self) -> None:
         first = build_selection_context(self.conn, self.trade_date)
         second = build_selection_context(self.conn, self.trade_date)

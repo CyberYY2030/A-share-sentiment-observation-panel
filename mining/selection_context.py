@@ -155,13 +155,21 @@ def build_selection_context(
         raw_bars,
         allow_missing_activity=current_bars is not None and allow_missing_activity,
     )
-    target_valid_codes = set(
+    target_tradable = adjusted.bars["row_status"].eq("valid_trade")
+    if current_bars is not None and allow_missing_activity:
+        # Intraday snapshots can be price-valid before their activity fields are
+        # available. ``build_forward_adjusted_bars`` has already verified the
+        # price-only exception; provider halt placeholders never take this path.
+        target_tradable = target_tradable | adjusted.bars["row_status"].eq("missing")
+    target_tradable_codes = set(
         adjusted.bars.loc[
-            (adjusted.bars["trade_date"].astype(str) == str(trade_date)) & adjusted.bars["adjustment_valid"],
+            (adjusted.bars["trade_date"].astype(str) == str(trade_date))
+            & adjusted.bars["adjustment_valid"]
+            & target_tradable,
             "sec_code",
         ].astype(str)
     )
-    universe = universe_result.rows[universe_result.rows["sec_code"].isin(target_valid_codes)].reset_index(drop=True)
+    universe = universe_result.rows[universe_result.rows["sec_code"].isin(target_tradable_codes)].reset_index(drop=True)
     bars = adjusted.bars[
         adjusted.bars["adjustment_valid"] & adjusted.bars["sec_code"].isin(set(universe["sec_code"]))
     ].reset_index(drop=True)

@@ -110,6 +110,66 @@ class AdjustedPricesTests(unittest.TestCase):
         self.assertEqual(bars.loc[1, "adjustment_pre_close_source"], "halt_previous_valid_close")
         self.assertAlmostEqual(float(bars.loc[1, "adj_close"]), float(bars.loc[0, "adj_close"]))
 
+    def test_zero_provider_placeholders_keep_one_adjusted_segment_and_raw_audit_values(self) -> None:
+        source = pd.DataFrame(
+            [
+                {"sec_code": "600001", "trade_date": "2026-01-02", "open": 12.93, "high": 13.10, "low": 12.80, "close": 12.93, "pre_close": 12.93, "volume": 100.0, "amount": 1293.0},
+                {"sec_code": "600001", "trade_date": "2026-01-03", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 0.0, "amount": 0.0},
+                {"sec_code": "600001", "trade_date": "2026-01-04", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 0.0, "amount": float("nan")},
+                {"sec_code": "600001", "trade_date": "2026-01-05", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 0.0, "amount": 0.0},
+                {"sec_code": "600001", "trade_date": "2026-01-06", "open": 13.00, "high": 13.30, "low": 12.90, "close": 13.20, "pre_close": 12.93, "volume": 120.0, "amount": 1584.0},
+            ]
+        )
+
+        result = build_forward_adjusted_bars(source)
+        bars = result.bars.sort_values("trade_date").reset_index(drop=True)
+
+        self.assertTrue(bars["adjustment_valid"].all())
+        self.assertListEqual(bars.loc[1:3, "row_status"].tolist(), ["provider_halt_placeholder"] * 3)
+        self.assertListEqual(bars.loc[1:3, "row_reason"].tolist(), ["provider_zero_no_activity_placeholder"] * 3)
+        self.assertListEqual(bars.loc[1:3, "close"].tolist(), [0.0, 0.0, 0.0])
+        for column in ("adj_open", "adj_high", "adj_low", "adj_close"):
+            self.assertListEqual(bars.loc[1:3, column].tolist(), [float(bars.loc[0, "adj_close"])] * 3)
+        self.assertEqual(bars.loc[4, "adjustment_pre_close_source"], "reported")
+        self.assertEqual(bars["latest_valid_segment_start"].nunique(), 1)
+
+    def test_zero_provider_placeholder_without_a_prior_close_stays_isolated(self) -> None:
+        source = pd.DataFrame(
+            [{"sec_code": "600001", "trade_date": "2026-01-02", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 0.0, "amount": 0.0}]
+        )
+
+        result = build_forward_adjusted_bars(source)
+
+        self.assertEqual(result.bars.loc[0, "row_status"], "provider_halt_placeholder")
+        self.assertFalse(bool(result.bars.loc[0, "adjustment_valid"]))
+        self.assertEqual(result.bars.loc[0, "row_reason"], "provider_halt_without_prior_valid_close")
+
+    def test_zero_ohlc_with_activity_is_not_treated_as_a_provider_placeholder(self) -> None:
+        source = pd.DataFrame(
+            [{"sec_code": "600001", "trade_date": "2026-01-02", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 1.0, "amount": 1.0}]
+        )
+
+        result = build_forward_adjusted_bars(source)
+
+        self.assertEqual(result.bars.loc[0, "row_status"], "invalid_price")
+        self.assertFalse(bool(result.bars.loc[0, "adjustment_valid"]))
+
+    def test_conflicting_duplicate_cannot_be_reclassified_as_a_zero_provider_placeholder(self) -> None:
+        source = pd.DataFrame(
+            [
+                {"sec_code": "600001", "trade_date": "2026-01-02", "open": 12.93, "high": 13.10, "low": 12.80, "close": 12.93, "pre_close": 12.93, "volume": 100.0, "amount": 1293.0},
+                {"sec_code": "600001", "trade_date": "2026-01-03", "open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "pre_close": 12.93, "volume": 0.0, "amount": 0.0},
+                {"sec_code": "600001", "trade_date": "2026-01-03", "open": 13.00, "high": 13.30, "low": 12.90, "close": 13.20, "pre_close": 12.93, "volume": 120.0, "amount": 1584.0},
+            ]
+        )
+
+        result = build_forward_adjusted_bars(source)
+        conflicting = result.bars.loc[result.bars["trade_date"].eq("2026-01-03")].iloc[0]
+
+        self.assertEqual(conflicting["row_status"], "invalid_price")
+        self.assertEqual(conflicting["row_reason"], "conflicting_duplicate")
+        self.assertFalse(bool(conflicting["adjustment_valid"]))
+
 
 if __name__ == "__main__":
     unittest.main()

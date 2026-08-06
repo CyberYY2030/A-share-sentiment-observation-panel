@@ -127,6 +127,63 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(invalid_activity["status"], STATUS_BAD)
         self.assertIn("no_valid_trade", invalid_activity["reasons"])
 
+    def test_isolated_zero_provider_placeholder_keeps_the_market_session_usable(self) -> None:
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day)
+            _insert_clean_day(conn, "2026-07-06")
+            _insert_row(
+                conn,
+                "2026-07-06",
+                "600999",
+                open_price=0.0,
+                high=0.0,
+                low=0.0,
+                close=0.0,
+                pre_close=12.93,
+                volume=0.0,
+                amount=0.0,
+            )
+            conn.commit()
+            quality = inspect_stock_session(conn, "2026-07-06")
+            calendar = clean_stock_trade_dates(conn)
+        finally:
+            conn.close()
+
+        self.assertEqual(quality["status"], STATUS_CLEAN)
+        self.assertEqual(quality["provider_halt_rows"], 1)
+        placeholder = next(row for row in quality["row_status_counts"].items() if row[0] == "provider_halt_placeholder")
+        self.assertEqual(placeholder[1], 1)
+        self.assertIn("2026-07-06", calendar)
+
+    def test_marketwide_zero_provider_shape_remains_known_bad(self) -> None:
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day)
+            for index in range(5):
+                _insert_row(
+                    conn,
+                    "2026-07-06",
+                    f"600{index:03d}",
+                    open_price=0.0,
+                    high=0.0,
+                    low=0.0,
+                    close=0.0,
+                    pre_close=12.93,
+                    volume=0.0,
+                    amount=0.0,
+                )
+            conn.commit()
+            quality = inspect_stock_session(conn, "2026-07-06")
+        finally:
+            conn.close()
+
+        self.assertEqual(quality["status"], STATUS_KNOWN_BAD)
+        self.assertEqual(quality["provider_halt_rows"], 5)
+        self.assertIn("no_valid_trade", quality["reasons"])
+
     def test_v25_two_axis_boundaries_and_duplicate_conflict_are_deterministic(self) -> None:
         conn = _connect()
         try:

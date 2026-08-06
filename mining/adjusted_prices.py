@@ -29,6 +29,18 @@ def _finite_positive(value: Any) -> bool:
         return False
 
 
+def _provider_zero_no_activity_placeholder(numeric: dict[str, pd.Series]) -> pd.Series:
+    return (
+        numeric["open"].eq(0)
+        & numeric["high"].eq(0)
+        & numeric["low"].eq(0)
+        & numeric["close"].eq(0)
+        & numeric["pre_close"].gt(0)
+        & (numeric["volume"].eq(0) | numeric["volume"].isna())
+        & (numeric["amount"].eq(0) | numeric["amount"].isna())
+    )
+
+
 def _derived_row_statuses(frame: pd.DataFrame) -> pd.Series:
     numeric = {column: pd.to_numeric(frame[column], errors="coerce") for column in (*PRICE_COLUMNS, "pre_close", "volume", "amount")}
     finite_positive = {column: numeric[column].gt(0) & np.isfinite(numeric[column]) for column in numeric}
@@ -49,10 +61,12 @@ def _derived_row_statuses(frame: pd.DataFrame) -> pd.Series:
         & flat_prices
         & numeric["pre_close"].eq(numeric["close"])
     )
+    provider_zero = _provider_zero_no_activity_placeholder(numeric)
     statuses = pd.Series("invalid_price", index=frame.index, dtype="object")
     statuses.loc[ohlc_valid & activity_present] = "invalid_activity"
     statuses.loc[ohlc_valid & ~activity_present] = "missing"
     statuses.loc[provider_halt] = "provider_halt_placeholder"
+    statuses.loc[provider_zero] = "provider_halt_placeholder"
     statuses.loc[valid_trade] = "valid_trade"
     return statuses
 
@@ -100,7 +114,15 @@ def _flush_segment(segment: list[dict[str, Any]], output: pd.DataFrame) -> None:
     output.loc[indexes, "adjustment_pre_close_source"] = [item["pre_close_source"] for item in segment]
     factor_series = pd.Series(factors, index=indexes, dtype="float64")
     for column in PRICE_COLUMNS:
-        output.loc[indexes, f"adj_{column}"] = pd.to_numeric(output.loc[indexes, column], errors="coerce") * factor_series
+        prices = pd.Series(
+            [
+                item.get("calculation_prices", {}).get(column, output.at[int(item["index"]), column])
+                for item in segment
+            ],
+            index=indexes,
+            dtype="float64",
+        )
+        output.loc[indexes, f"adj_{column}"] = prices * factor_series
     output.loc[indexes, "adj_pre_close"] = pd.Series(
         [float(item["effective_pre_close"]) for item in segment], index=indexes, dtype="float64"
     ) * factor_series
@@ -144,6 +166,13 @@ def build_forward_adjusted_bars(
     if "row_reason" not in normalized.columns:
         normalized["row_reason"] = pd.NA
     output, duplicate_counts = _collapse_duplicate_rows(normalized)
+    output_zero_placeholder = _provider_zero_no_activity_placeholder(
+        {column: pd.to_numeric(output[column], errors="coerce") for column in (*PRICE_COLUMNS, "pre_close", "volume", "amount")}
+    )
+    output.loc[
+        output_zero_placeholder & output["row_status"].eq("provider_halt_placeholder"),
+        "row_reason",
+    ] = "provider_zero_no_activity_placeholder"
     output["adjustment_factor"] = math.nan
     output["adjustment_valid"] = False
     output["valid_adjusted_bar"] = False
@@ -179,8 +208,13 @@ def build_forward_adjusted_bars(
                 segment = []
                 continue
 
-            close = float(closes[position])
             if not segment:
+                if status == "provider_halt_placeholder":
+                    output.loc[index, "row_reason"] = "provider_halt_without_prior_valid_close"
+                    reasons["provider_halt_without_prior_valid_close"] += 1
+                    invalid_code_reasons.setdefault(str(code), []).append("provider_halt_without_prior_valid_close")
+                    continue
+                close = float(closes[position])
                 segment.append(
                     {
                         "index": int(index),
@@ -192,10 +226,13 @@ def build_forward_adjusted_bars(
                 )
                 continue
 
+            close = float(closes[position])
             previous_close = float(segment[-1]["close"])
             pre_close = pre_closes[position]
             if status in {"confirmed_halt", "provider_halt_placeholder"}:
                 effective_pre_close, source = previous_close, "halt_previous_valid_close"
+                if status == "provider_halt_placeholder":
+                    close = previous_close
             elif pd.isna(pre_close):
                 effective_pre_close, source = previous_close, "previous_valid_close"
                 fallback_counts["missing_pre_close_used_previous_valid_close"] += 1
@@ -219,15 +256,16 @@ def build_forward_adjusted_bars(
                 _flush_segment(segment, output)
                 segment = []
                 continue
-            segment.append(
-                {
-                    "index": int(index),
-                    "close": close,
-                    "step_ratio": step_ratio,
-                    "effective_pre_close": effective_pre_close,
-                    "pre_close_source": source,
-                }
-            )
+            item = {
+                "index": int(index),
+                "close": close,
+                "step_ratio": step_ratio,
+                "effective_pre_close": effective_pre_close,
+                "pre_close_source": source,
+            }
+            if status == "provider_halt_placeholder":
+                item["calculation_prices"] = {column: previous_close for column in PRICE_COLUMNS}
+            segment.append(item)
         _flush_segment(segment, output)
 
     for code, code_reasons in invalid_code_reasons.items():
