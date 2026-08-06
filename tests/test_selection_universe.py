@@ -97,15 +97,22 @@ class SelectionUniverseTests(unittest.TestCase):
         self.assertIn("clean_bar_count", result.rows.columns)
         self.assertIn("liquidity_pct", result.rows.columns)
         alpha = result.rows.set_index("sec_code").loc["600001"]
-        self.assertEqual(int(alpha["clean_bar_count"]), 35)
+        self.assertEqual(int(alpha["clean_bar_count"]), 30)
         self.assertGreater(float(alpha["amount_mean_20d"]), 0.0)
         self.assertEqual(len(result.diagnostics["liquidity_history_dates"]), 20)
 
-    def test_stale_metadata_blocks_official_pool_without_snapshot_names(self) -> None:
+    def test_stale_metadata_is_provisional_without_blocking_price_pool(self) -> None:
         result = build_selection_universe(self.conn, self.trade_date)
 
         self.assertEqual(result.metadata_as_of, "2026-01-01")
-        self.assertEqual(result.data_status, "metadata_stale")
+        self.assertEqual(result.data_status, "ready")
+        self.assertEqual(result.price_status, "ready")
+        self.assertFalse(result.metadata_fresh)
+        self.assertTrue(result.metadata_provisional)
+        self.assertEqual(
+            result.diagnostics["metadata_note"],
+            "metadata_provisional_last_known_name_filter",
+        )
         self.assertEqual(result.diagnostics["latest_clean_trade_date"], self.trade_date)
 
     def test_snapshot_name_overrides_stale_metadata_for_current_st_status(self) -> None:

@@ -65,6 +65,22 @@ class SelectionContextTests(unittest.TestCase):
         selection = select_from_context(first, lambda context: context.universe["sec_code"].tolist())
         self.assertListEqual(selection, first.universe["sec_code"].tolist())
 
+    def test_stale_metadata_is_provisional_without_disabling_price_selection(self) -> None:
+        self.conn.execute("UPDATE ash.stock_info SET updated_at='2025-01-01'")
+        self.conn.commit()
+
+        context = build_selection_context(self.conn, self.trade_date)
+
+        self.assertFalse(context.universe.empty)
+        self.assertEqual(context.price_status, "ready")
+        self.assertEqual(context.data_status, "ready")
+        self.assertFalse(context.metadata_fresh)
+        self.assertTrue(context.metadata_provisional)
+        self.assertEqual(
+            context.diagnostics["universe"]["metadata_note"],
+            "metadata_provisional_last_known_name_filter",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

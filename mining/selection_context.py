@@ -9,7 +9,7 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .adjusted_prices import AdjustedPriceResult, build_forward_adjusted_bars
-from .data_quality import clean_stock_trade_dates
+from .data_quality import usable_stock_trade_dates
 from .universe import SelectionUniverseResult, build_selection_universe
 
 
@@ -29,6 +29,10 @@ class SelectionContext:
     metadata_as_of: str | None
     trend_profile: str | None
     data_status: str
+    price_status: str = "ready"
+    metadata_fresh: bool = True
+    metadata_coverage: float | None = None
+    metadata_provisional: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -71,6 +75,7 @@ def _empty_context(
 ) -> SelectionContext:
     diagnostics = {
         "clean_dates": clean_dates,
+        "usable_dates": clean_dates,
         "universe": universe_result.diagnostics,
         "universe_count": universe_result.universe_count,
         "excluded_reason_counts": universe_result.excluded_reason_counts,
@@ -86,6 +91,10 @@ def _empty_context(
         metadata_as_of=universe_result.metadata_as_of,
         trend_profile=None,
         data_status=universe_result.data_status,
+        price_status=universe_result.price_status,
+        metadata_fresh=universe_result.metadata_fresh,
+        metadata_coverage=universe_result.metadata_coverage,
+        metadata_provisional=universe_result.metadata_provisional,
         diagnostics=diagnostics,
     )
 
@@ -103,11 +112,15 @@ def build_selection_context(
     allow_missing_activity: bool = False,
 ) -> SelectionContext:
     """Build deterministic close-data input for v2 selectors without touching raw SQLite prices."""
-    resolved_clean_dates = (
-        clean_stock_trade_dates(conn, end_date=str(trade_date), include_end=current_bars is None)
-        if clean_dates is None
-        else sorted({str(day) for day in clean_dates if str(day) <= str(trade_date)})
-    )
+    if clean_dates is None:
+        resolved_clean_dates, quarantined_rows = usable_stock_trade_dates(
+            conn,
+            end_date=str(trade_date),
+            include_end=current_bars is None,
+        )
+    else:
+        resolved_clean_dates = sorted({str(day) for day in clean_dates if str(day) <= str(trade_date)})
+        quarantined_rows = []
     resolved_as_of = str(as_of or trade_date)
     resolved_price_as_of = str(price_as_of or trade_date)
     universe_result = build_selection_universe(
@@ -138,14 +151,26 @@ def build_selection_context(
             if column not in current.columns:
                 current[column] = pd.NA
         raw_bars = pd.concat([raw_bars, current[raw_bars.columns]], ignore_index=True)
-    adjusted: AdjustedPriceResult = build_forward_adjusted_bars(raw_bars)
-    valid_codes = adjusted.bars.loc[adjusted.bars["adjustment_valid"], "sec_code"].drop_duplicates()
-    universe = universe_result.rows[universe_result.rows["sec_code"].isin(valid_codes)].reset_index(drop=True)
-    bars = adjusted.bars[adjusted.bars["sec_code"].isin(set(universe["sec_code"]))].reset_index(drop=True)
+    adjusted: AdjustedPriceResult = build_forward_adjusted_bars(
+        raw_bars,
+        allow_missing_activity=current_bars is not None and allow_missing_activity,
+    )
+    target_valid_codes = set(
+        adjusted.bars.loc[
+            (adjusted.bars["trade_date"].astype(str) == str(trade_date)) & adjusted.bars["adjustment_valid"],
+            "sec_code",
+        ].astype(str)
+    )
+    universe = universe_result.rows[universe_result.rows["sec_code"].isin(target_valid_codes)].reset_index(drop=True)
+    bars = adjusted.bars[
+        adjusted.bars["adjustment_valid"] & adjusted.bars["sec_code"].isin(set(universe["sec_code"]))
+    ].reset_index(drop=True)
     skipped = Counter(adjusted.skipped_reason_counts)
-    skipped["invalid_adjusted_series"] += len(adjusted.invalid_code_reasons)
+    skipped["invalid_adjusted_edges"] += sum(adjusted.skipped_reason_counts.values())
     diagnostics = {
         "clean_dates": resolved_clean_dates,
+        "usable_dates": resolved_clean_dates,
+        "row_quarantine": quarantined_rows,
         "universe": universe_result.diagnostics,
         "universe_count": universe_result.universe_count,
         "eligible_count": len(universe),
@@ -164,5 +189,9 @@ def build_selection_context(
         metadata_as_of=universe_result.metadata_as_of,
         trend_profile=None,
         data_status=universe_result.data_status,
+        price_status=universe_result.price_status,
+        metadata_fresh=universe_result.metadata_fresh,
+        metadata_coverage=universe_result.metadata_coverage,
+        metadata_provisional=universe_result.metadata_provisional,
         diagnostics=diagnostics,
     )

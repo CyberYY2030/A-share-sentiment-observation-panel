@@ -239,7 +239,7 @@ def evaluate_momentum_anomaly(
         **(params or {}),
     }
     diagnostics: dict[str, Any] = {"event_subtype": "momentum_anomaly", "skipped_reason_counts": {}}
-    if context.data_status != "ready" or context.bars.empty:
+    if getattr(context, "price_status", context.data_status) == "unavailable" or context.bars.empty:
         diagnostics["skipped_reason_counts"] = {"data_unavailable": len(context.universe)}
         return pd.DataFrame(), diagnostics
     dates = [str(date) for date in context.diagnostics.get("clean_dates", [])]
@@ -264,14 +264,14 @@ def evaluate_momentum_anomaly(
         close = pd.to_numeric(indexed.get("adj_close"), errors="coerce")
         raw_open = pd.to_numeric(indexed.get("open"), errors="coerce")
         raw_high = pd.to_numeric(indexed.get("high"), errors="coerce")
-        raw_change = pd.to_numeric(indexed.get("change_pct"), errors="coerce")
-        if not all(series.notna().iloc[-6:].all() for series in (close, raw_open, raw_high, raw_change)):
+        derived_change = (close / close.shift(1) - 1.0) * 100.0
+        if not all(series.notna().iloc[-6:].all() for series in (close, raw_open, raw_high, derived_change)):
             skipped["price_window_missing"] += 1
             continue
-        current_change = float(raw_change.iloc[-1])
+        current_change = float(derived_change.iloc[-1])
         ret_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
         recent_window_gain = (float(close.iloc[-1]) / float(close.iloc[-4]) - 1.0) * 100.0
-        recent_spike = float(raw_change.iloc[-4:-1].max())
+        recent_spike = float(derived_change.iloc[-4:-1].max())
         high_over_open = (float(raw_high.iloc[-1]) / float(raw_open.iloc[-1]) - 1.0) * 100.0
         high_over_close = (float(raw_high.iloc[-1]) / float(close.iloc[-1]) - 1.0) * 100.0
         board = str(board_by_code.get(code) or "")

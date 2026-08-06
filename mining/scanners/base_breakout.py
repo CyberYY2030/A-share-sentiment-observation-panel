@@ -25,7 +25,7 @@ def evaluate_base_breakout(context: SelectionContext) -> tuple[pd.DataFrame, dic
         "result_count": 0,
         "skipped_reason_counts": {},
     }
-    if context.data_status != "ready" or profile is None or context.bars.empty:
+    if getattr(context, "price_status", context.data_status) == "unavailable" or profile is None or context.bars.empty:
         diagnostics["skipped_reason_counts"] = {
             "insufficient_history" if profile is None else "data_unavailable": len(context.universe)
         }
@@ -59,8 +59,8 @@ def evaluate_base_breakout(context: SelectionContext) -> tuple[pd.DataFrame, dic
         close = pd.to_numeric(indexed.get("adj_close"), errors="coerce")
         high = pd.to_numeric(indexed.get("adj_high", indexed.get("high")), errors="coerce")
         low = pd.to_numeric(indexed.get("adj_low", indexed.get("low")), errors="coerce")
-        raw_change = pd.to_numeric(indexed.get("change_pct"), errors="coerce")
-        if not all(series.notna().iloc[-required:].all() for series in (close, high, low, raw_change)):
+        derived_change = (close / close.shift(1) - 1.0) * 100.0
+        if not all(series.notna().iloc[-required:].all() for series in (close, high, low, derived_change)):
             skipped["price_window_missing"] += 1
             continue
         base_high = float(high.iloc[-61:-1].max())
@@ -82,7 +82,7 @@ def evaluate_base_breakout(context: SelectionContext) -> tuple[pd.DataFrame, dic
         current_close = float(close.iloc[-1])
         current_high = float(high.iloc[-1])
         current_low = float(low.iloc[-1])
-        current_change = float(raw_change.iloc[-1])
+        current_change = float(derived_change.iloc[-1])
         range_width = current_high - current_low
         if range_width <= 0:
             skipped["confirmation_path_unknown"] += 1

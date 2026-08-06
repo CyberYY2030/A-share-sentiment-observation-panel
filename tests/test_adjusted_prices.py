@@ -56,16 +56,27 @@ class AdjustedPricesTests(unittest.TestCase):
         for column in ("volume", "amount", "turnover_ratio"):
             self.assertListEqual(result.bars[column].tolist(), source[column].tolist())
 
-    def test_invalid_adjustment_edge_fails_closed_with_diagnostics(self) -> None:
+    def test_invalid_adjustment_edge_isolates_one_row_and_starts_a_new_segment(self) -> None:
         source = self._split_bars()
         source.loc[1, "pre_close"] = 0.01
+        source.loc[2] = {
+            **source.loc[1].to_dict(),
+            "trade_date": "2026-01-04",
+            "open": 5.2,
+            "high": 5.4,
+            "low": 5.1,
+            "close": 5.3,
+            "pre_close": 5.1,
+        }
 
         result = build_forward_adjusted_bars(source)
 
         self.assertEqual(result.invalid_code_reasons["600001"], ["adjustment_ratio_out_of_range"])
         self.assertEqual(result.skipped_reason_counts["adjustment_ratio_out_of_range"], 1)
-        self.assertFalse(result.bars["adjustment_valid"].any())
-        self.assertTrue(result.bars["adj_close"].isna().all())
+        bars = result.bars.sort_values("trade_date").reset_index(drop=True)
+        self.assertListEqual(bars["adjustment_valid"].tolist(), [True, False, True])
+        self.assertTrue(pd.isna(bars.loc[1, "adj_close"]))
+        self.assertEqual(bars.loc[2, "latest_valid_segment_start"], "2026-01-04")
 
     def test_tick_sized_pre_close_difference_does_not_create_a_fake_adjustment(self) -> None:
         source = self._split_bars()
@@ -86,6 +97,18 @@ class AdjustedPricesTests(unittest.TestCase):
         self.assertEqual(result.fallback_counts["missing_pre_close_used_previous_valid_close"], 1)
         self.assertEqual(latest["adjustment_pre_close_source"], "previous_valid_close")
         self.assertAlmostEqual(float(latest["adj_pre_close"]), 10.0)
+
+    def test_provider_halt_keeps_the_previous_adjusted_close_without_a_new_edge(self) -> None:
+        source = self._split_bars()
+        source.loc[1, ["open", "high", "low", "close", "pre_close", "volume", "amount"]] = [10, 10, 10, 10, 10, 0, 0]
+
+        result = build_forward_adjusted_bars(source)
+        bars = result.bars.sort_values("trade_date").reset_index(drop=True)
+
+        self.assertTrue(bars["adjustment_valid"].all())
+        self.assertEqual(bars.loc[1, "row_status"], "provider_halt_placeholder")
+        self.assertEqual(bars.loc[1, "adjustment_pre_close_source"], "halt_previous_valid_close")
+        self.assertAlmostEqual(float(bars.loc[1, "adj_close"]), float(bars.loc[0, "adj_close"]))
 
 
 if __name__ == "__main__":

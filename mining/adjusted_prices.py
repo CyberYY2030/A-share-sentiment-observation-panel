@@ -3,11 +3,15 @@ from __future__ import annotations
 import math
 from collections import Counter
 from dataclasses import dataclass
+from typing import Any
+
+import numpy as np
 import pandas as pd
 
 
 PRICE_COLUMNS = ("open", "high", "low", "close")
 ADJUSTED_PRICE_COLUMNS = tuple(f"adj_{column}" for column in (*PRICE_COLUMNS, "pre_close"))
+_PRICE_USABLE_STATUSES = {"valid_trade", "confirmed_halt", "provider_halt_placeholder"}
 
 
 @dataclass
@@ -18,19 +22,103 @@ class AdjustedPriceResult:
     fallback_counts: dict[str, int]
 
 
+def _finite_positive(value: Any) -> bool:
+    try:
+        return math.isfinite(float(value)) and float(value) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _derived_row_statuses(frame: pd.DataFrame) -> pd.Series:
+    numeric = {column: pd.to_numeric(frame[column], errors="coerce") for column in (*PRICE_COLUMNS, "pre_close", "volume", "amount")}
+    finite_positive = {column: numeric[column].gt(0) & np.isfinite(numeric[column]) for column in numeric}
+    price_valid = finite_positive["open"] & finite_positive["high"] & finite_positive["low"] & finite_positive["close"]
+    ohlc_valid = (
+        price_valid
+        & numeric["low"].le(pd.concat([numeric["open"], numeric["close"]], axis=1).min(axis=1))
+        & pd.concat([numeric["open"], numeric["close"]], axis=1).max(axis=1).le(numeric["high"])
+    )
+    activity_present = numeric["volume"].notna() & numeric["amount"].notna()
+    valid_trade = ohlc_valid & finite_positive["volume"] & finite_positive["amount"]
+    flat_prices = numeric["open"].eq(numeric["high"]) & numeric["high"].eq(numeric["low"]) & numeric["low"].eq(numeric["close"])
+    provider_halt = (
+        ohlc_valid
+        & numeric["volume"].eq(0)
+        & numeric["amount"].eq(0)
+        & finite_positive["pre_close"]
+        & flat_prices
+        & numeric["pre_close"].eq(numeric["close"])
+    )
+    statuses = pd.Series("invalid_price", index=frame.index, dtype="object")
+    statuses.loc[ohlc_valid & activity_present] = "invalid_activity"
+    statuses.loc[ohlc_valid & ~activity_present] = "missing"
+    statuses.loc[provider_halt] = "provider_halt_placeholder"
+    statuses.loc[valid_trade] = "valid_trade"
+    return statuses
+
+
+def _collapse_duplicate_rows(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter[str]]:
+    reasons: Counter[str] = Counter()
+    keys = ["sec_code", "trade_date"]
+    duplicate_mask = frame.duplicated(keys, keep=False)
+    if not bool(duplicate_mask.any()):
+        return frame.reset_index(drop=True), reasons
+
+    output = frame.drop_duplicates(keys, keep="first").copy()
+    value_columns = ["open", "high", "low", "close", "pre_close", "volume", "amount"]
+    duplicate_rows = frame.loc[duplicate_mask]
+    for key, group in duplicate_rows.groupby(keys, sort=False, dropna=False):
+        signatures = {
+            tuple("nan" if pd.isna(value) else f"{float(value):.12g}" if isinstance(value, (int, float)) else str(value) for value in row[value_columns])
+            for _, row in group.iterrows()
+        }
+        selector = output["sec_code"].eq(key[0]) & output["trade_date"].eq(key[1])
+        if len(signatures) > 1:
+            output.loc[selector, "row_status"] = "invalid_price"
+            output.loc[selector, "row_reason"] = "conflicting_duplicate"
+            reasons["conflicting_duplicate"] += 1
+        else:
+            reasons["identical_duplicate_collapsed"] += len(group) - 1
+    return output.reset_index(drop=True), reasons
+
+
+def _flush_segment(segment: list[dict[str, Any]], output: pd.DataFrame) -> None:
+    if not segment:
+        return
+    steps = [float(item["step_ratio"]) for item in segment]
+    future_product = 1.0
+    factors = [1.0] * len(segment)
+    for index in range(len(segment) - 1, -1, -1):
+        future_product *= steps[index]
+        factors[index] = future_product / steps[index]
+    indexes = [int(item["index"]) for item in segment]
+    segment_start = str(output.loc[indexes[0], "trade_date"])
+    output.loc[indexes, "adjustment_factor"] = factors
+    output.loc[indexes, "adjustment_valid"] = True
+    output.loc[indexes, "valid_adjusted_bar"] = True
+    output.loc[indexes, "latest_valid_segment_start"] = segment_start
+    output.loc[indexes, "adjustment_pre_close_source"] = [item["pre_close_source"] for item in segment]
+    factor_series = pd.Series(factors, index=indexes, dtype="float64")
+    for column in PRICE_COLUMNS:
+        output.loc[indexes, f"adj_{column}"] = pd.to_numeric(output.loc[indexes, column], errors="coerce") * factor_series
+    output.loc[indexes, "adj_pre_close"] = pd.Series(
+        [float(item["effective_pre_close"]) for item in segment], index=indexes, dtype="float64"
+    ) * factor_series
+
+
 def build_forward_adjusted_bars(
     bars: pd.DataFrame,
     *,
     price_tick: float = 0.01,
     min_step_ratio: float = 0.1,
     max_step_ratio: float = 10.0,
+    allow_missing_activity: bool = False,
 ) -> AdjustedPriceResult:
-    """Return research-only forward-adjusted OHLC without changing raw activity facts.
+    """Build forward-adjusted bars without allowing one bad row to erase a stock.
 
-    The final valid bar for each stock is anchored at factor ``1``.  An invalid
-    corporate-action edge invalidates that stock's adjusted series.  A genuinely
-    missing ``pre_close`` uses the previous valid close as a neutral edge and is
-    retained in diagnostics rather than being silently fabricated.
+    Every invalid row or invalid corporate-action edge ends only its current
+    contiguous segment. Consumers receive all valid segments but must use the
+    latest one, so MA/RPS cannot cross the missing edge.
     """
     required = {"sec_code", "trade_date", "pre_close", *PRICE_COLUMNS}
     missing = required.difference(bars.columns)
@@ -40,82 +128,114 @@ def build_forward_adjusted_bars(
         raise ValueError("invalid adjusted-price thresholds")
     if bars.empty:
         output = bars.copy()
-        for column in ("adjustment_factor", "adjustment_valid", *ADJUSTED_PRICE_COLUMNS):
-            output[column] = pd.Series(dtype="float64")
+        for column in (
+            "row_status", "row_reason", "adjustment_factor", "adjustment_valid", "valid_adjusted_bar",
+            "latest_valid_segment_start", "adjustment_pre_close_source", *ADJUSTED_PRICE_COLUMNS,
+        ):
+            output[column] = pd.Series(dtype="object")
         return AdjustedPriceResult(output, {}, {}, {})
 
     normalized = bars.copy()
     normalized["sec_code"] = normalized["sec_code"].astype(str).str.zfill(6)
-    ordered = normalized.sort_values(["sec_code", "trade_date"], kind="stable").reset_index(drop=True)
-    prices = {column: pd.to_numeric(ordered[column], errors="coerce") for column in PRICE_COLUMNS}
-    positive_prices = {column: values.gt(0) & values.map(math.isfinite) for column, values in prices.items()}
-    ohlc_valid = (
-        positive_prices["open"]
-        & positive_prices["high"]
-        & positive_prices["low"]
-        & positive_prices["close"]
-        & prices["low"].le(pd.concat([prices["open"], prices["close"]], axis=1).min(axis=1))
-        & pd.concat([prices["open"], prices["close"]], axis=1).max(axis=1).le(prices["high"])
-    )
-    close_valid = positive_prices["close"]
-    codes = ordered["sec_code"]
-    previous_valid_close = prices["close"].where(close_valid).groupby(codes, sort=False).ffill().groupby(codes, sort=False).shift()
-    has_previous = previous_valid_close.notna()
-    pre_close = pd.to_numeric(ordered["pre_close"], errors="coerce")
-    pre_close_missing = pre_close.isna()
-    pre_close_valid = pre_close.gt(0) & pre_close.map(math.isfinite)
-    invalid_pre_close = has_previous & ~pre_close_missing & ~pre_close_valid
-    effective_pre_close = pre_close.where(~(has_previous & pre_close_missing), previous_valid_close)
-    raw_ratio = effective_pre_close / previous_valid_close
-    tick_sized = (effective_pre_close - previous_valid_close).abs().le(
-        pd.concat(
-            [pd.Series(float(price_tick), index=ordered.index), previous_valid_close * 1e-9],
-            axis=1,
-        ).max(axis=1)
-    )
-    step_ratios = raw_ratio.where(~tick_sized, 1.0).where(has_previous, 1.0)
-    ratio_valid = step_ratios.map(math.isfinite) & step_ratios.between(float(min_step_ratio), float(max_step_ratio))
-    invalid_ratio = has_previous & ~pre_close_missing & pre_close_valid & ~ratio_valid
+    normalized = normalized.sort_values(["sec_code", "trade_date"], kind="stable").reset_index(drop=True)
+    if "row_status" not in normalized.columns:
+        normalized["row_status"] = _derived_row_statuses(normalized)
+    normalized["row_status"] = normalized["row_status"].fillna("invalid_price").astype(str)
+    if "row_reason" not in normalized.columns:
+        normalized["row_reason"] = pd.NA
+    output, duplicate_counts = _collapse_duplicate_rows(normalized)
+    output["adjustment_factor"] = math.nan
+    output["adjustment_valid"] = False
+    output["valid_adjusted_bar"] = False
+    output["latest_valid_segment_start"] = pd.NA
+    output["adjustment_pre_close_source"] = pd.NA
+    for column in ADJUSTED_PRICE_COLUMNS:
+        output[column] = math.nan
 
-    reason_masks = {
-        "invalid_ohlc": ~ohlc_valid,
-        "invalid_close": ~close_valid,
-        "invalid_pre_close": invalid_pre_close,
-        "adjustment_ratio_out_of_range": invalid_ratio,
-    }
-    code_reasons: dict[str, list[str]] = {}
-    reason_counts: Counter[str] = Counter()
-    for reason, mask in reason_masks.items():
-        invalid_codes = sorted({str(code) for code in codes[mask]})
-        if invalid_codes:
-            reason_counts[reason] = len(invalid_codes)
-            for code in invalid_codes:
-                code_reasons.setdefault(code, []).append(reason)
-
-    reverse = pd.DataFrame({"sec_code": codes, "step_ratio": step_ratios}).iloc[::-1]
-    reverse_product = reverse.groupby("sec_code", sort=False)["step_ratio"].cumprod()
-    future_product = reverse_product.reindex(ordered.index)
-    ordered["adjustment_factor"] = future_product / step_ratios
-    for column in PRICE_COLUMNS:
-        ordered[f"adj_{column}"] = prices[column] * ordered["adjustment_factor"]
-    ordered["adjustment_pre_close_source"] = "reported"
-    ordered.loc[has_previous & pre_close_missing, "adjustment_pre_close_source"] = "previous_valid_close"
-    ordered["adj_pre_close"] = effective_pre_close * ordered["adjustment_factor"]
-    ordered["adjustment_valid"] = ~codes.isin(code_reasons)
-    if code_reasons:
-        invalid_rows = ~ordered["adjustment_valid"]
-        ordered.loc[invalid_rows, "adjustment_factor"] = math.nan
-        for column in ADJUSTED_PRICE_COLUMNS:
-            ordered.loc[invalid_rows, column] = math.nan
-
+    reasons: Counter[str] = Counter(duplicate_counts)
     fallback_counts: Counter[str] = Counter()
-    missing_pre_close_count = int((has_previous & pre_close_missing).sum())
-    if missing_pre_close_count:
-        fallback_counts["missing_pre_close_used_previous_valid_close"] = missing_pre_close_count
-    result = ordered.sort_values(["trade_date", "sec_code"], kind="stable")
+    invalid_code_reasons: dict[str, list[str]] = {}
+    for code, group in output.groupby("sec_code", sort=False):
+        segment: list[dict[str, Any]] = []
+        indexes = group.index.to_list()
+        statuses = group["row_status"].astype(str).tolist()
+        closes = pd.to_numeric(group["close"], errors="coerce").tolist()
+        pre_closes = pd.to_numeric(group["pre_close"], errors="coerce").tolist()
+        reasons_by_index = group["row_reason"].tolist()
+        price_rows = group.loc[:, PRICE_COLUMNS].to_dict("records")
+        for position, index in enumerate(indexes):
+            status = statuses[position]
+            price_only_snapshot = (
+                allow_missing_activity
+                and status == "missing"
+                and all(_finite_positive(price_rows[position][column]) for column in PRICE_COLUMNS)
+            )
+            if status not in _PRICE_USABLE_STATUSES and not price_only_snapshot:
+                raw_reason = reasons_by_index[position]
+                reason = status if pd.isna(raw_reason) else str(raw_reason)
+                reasons[reason] += 1
+                invalid_code_reasons.setdefault(str(code), []).append(reason)
+                _flush_segment(segment, output)
+                segment = []
+                continue
+
+            close = float(closes[position])
+            if not segment:
+                segment.append(
+                    {
+                        "index": int(index),
+                        "close": close,
+                        "step_ratio": 1.0,
+                        "effective_pre_close": close,
+                        "pre_close_source": "segment_anchor",
+                    }
+                )
+                continue
+
+            previous_close = float(segment[-1]["close"])
+            pre_close = pre_closes[position]
+            if status in {"confirmed_halt", "provider_halt_placeholder"}:
+                effective_pre_close, source = previous_close, "halt_previous_valid_close"
+            elif pd.isna(pre_close):
+                effective_pre_close, source = previous_close, "previous_valid_close"
+                fallback_counts["missing_pre_close_used_previous_valid_close"] += 1
+            elif not _finite_positive(pre_close):
+                output.loc[index, "row_reason"] = "invalid_pre_close"
+                reasons["invalid_pre_close"] += 1
+                invalid_code_reasons.setdefault(str(code), []).append("invalid_pre_close")
+                _flush_segment(segment, output)
+                segment = []
+                continue
+            else:
+                effective_pre_close, source = float(pre_close), "reported"
+
+            raw_ratio = effective_pre_close / previous_close
+            tick_sized = abs(effective_pre_close - previous_close) <= max(float(price_tick), previous_close * 1e-9)
+            step_ratio = 1.0 if tick_sized else raw_ratio
+            if not math.isfinite(step_ratio) or not (float(min_step_ratio) <= step_ratio <= float(max_step_ratio)):
+                output.loc[index, "row_reason"] = "adjustment_ratio_out_of_range"
+                reasons["adjustment_ratio_out_of_range"] += 1
+                invalid_code_reasons.setdefault(str(code), []).append("adjustment_ratio_out_of_range")
+                _flush_segment(segment, output)
+                segment = []
+                continue
+            segment.append(
+                {
+                    "index": int(index),
+                    "close": close,
+                    "step_ratio": step_ratio,
+                    "effective_pre_close": effective_pre_close,
+                    "pre_close_source": source,
+                }
+            )
+        _flush_segment(segment, output)
+
+    for code, code_reasons in invalid_code_reasons.items():
+        invalid_code_reasons[code] = sorted(set(code_reasons))
+    result = output.sort_values(["trade_date", "sec_code"], kind="stable").reset_index(drop=True)
     return AdjustedPriceResult(
-        bars=result.reset_index(drop=True),
-        invalid_code_reasons=code_reasons,
-        skipped_reason_counts=dict(sorted(reason_counts.items())),
+        bars=result,
+        invalid_code_reasons=dict(sorted(invalid_code_reasons.items())),
+        skipped_reason_counts=dict(sorted(reasons.items())),
         fallback_counts=dict(sorted(fallback_counts.items())),
     )

@@ -95,3 +95,10 @@ class BaseBreakoutTests(unittest.TestCase):
         self.assertEqual(rows["sec_code"].tolist(), ["600003", "600001"])
         candidates = select_base_breakout_from_context(context)
         self.assertEqual([candidate.rank for candidate in candidates], [1, 2])
+
+    def test_change_pct_null_does_not_block_adjusted_price_breakout(self) -> None:
+        context = _base_context()
+        context.bars["change_pct"] = pd.NA
+        rows, diagnostics = evaluate_base_breakout(context)
+        self.assertEqual(rows["sec_code"].tolist(), ["600001"])
+        self.assertEqual(diagnostics["result_count"], 1)

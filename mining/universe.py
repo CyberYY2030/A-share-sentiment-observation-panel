@@ -8,7 +8,14 @@ from typing import Any
 
 import pandas as pd
 
-from .data_quality import STATUS_CLEAN, STATUS_UNAVAILABLE, clean_stock_trade_dates, inspect_stock_session
+from .data_quality import (
+    STATUS_CLEAN,
+    STATUS_PARTIAL,
+    STATUS_UNAVAILABLE,
+    STATUS_USABLE_WITH_QUARANTINE,
+    inspect_stock_session,
+    usable_stock_trade_dates,
+)
 from .features import board_kind, change_pct
 
 
@@ -40,6 +47,10 @@ class SelectionUniverseResult:
     excluded_reason_counts: dict[str, int]
     metadata_as_of: str | None
     data_status: str
+    price_status: str = "ready"
+    metadata_fresh: bool = True
+    metadata_coverage: float | None = None
+    metadata_provisional: bool = False
     diagnostics: dict[str, Any] = field(default_factory=dict)
 
 
@@ -108,14 +119,18 @@ def _snapshot_name_map(snapshot_names: pd.DataFrame | Mapping[str, str] | None) 
         items = snapshot_names.items()
     else:
         frame = pd.DataFrame(snapshot_names)
-        if not {"sec_code", "sec_name"}.issubset(frame.columns):
+        name_column = next(
+            (column for column in ("sec_name", "名称", "股票简称", "证券简称") if column in frame.columns),
+            None,
+        )
+        if "sec_code" not in frame.columns or name_column is None:
             return {}
-        items = zip(frame["sec_code"], frame["sec_name"], strict=False)
+        items = zip(frame["sec_code"], frame[name_column], strict=False)
     names: dict[str, str] = {}
     for code, name in items:
         normalized_code = str(code).zfill(6)
-        normalized_name = str(name).strip() if name is not None else ""
-        if normalized_name:
+        normalized_name = str(name).strip() if name is not None and not pd.isna(name) else ""
+        if normalized_name and normalized_name.lower() not in {"nan", "<na>", "none"}:
             names[normalized_code] = normalized_name
     return names
 
@@ -134,6 +149,7 @@ def _empty_selection_result(
         excluded_reason_counts={},
         metadata_as_of=metadata_as_of,
         data_status=data_status,
+        price_status="unavailable" if data_status not in {"ready", "partial"} else data_status,
         diagnostics=diagnostics,
     )
 
@@ -159,12 +175,17 @@ def build_selection_universe(
         if current_bars is None
         else {"trade_date": str(trade_date), "status": STATUS_UNAVAILABLE, "reasons": ["intraday_snapshot"]}
     )
-    diagnostics: dict[str, Any] = {"session_quality": quality}
-    if quality["status"] not in {STATUS_CLEAN, STATUS_UNAVAILABLE}:
+    price_status = {
+        STATUS_CLEAN: "ready",
+        STATUS_USABLE_WITH_QUARANTINE: "ready",
+        STATUS_PARTIAL: "partial",
+    }.get(str(quality["status"]), "unavailable")
+    diagnostics: dict[str, Any] = {"session_quality": quality, "price_status": price_status}
+    if price_status != "ready" and current_bars is None:
         return _empty_selection_result(
             trade_date,
             metadata_as_of=metadata_as_of,
-            data_status=quality["status"],
+            data_status=price_status,
             diagnostics=diagnostics,
         )
 
@@ -226,12 +247,15 @@ def build_selection_universe(
     if "snapshot_name" not in df.columns:
         df["snapshot_name"] = pd.NA
     df["snapshot_name"] = df["sec_code"].map(snapshot_by_code).fillna(df["snapshot_name"])
-    df["sec_name"] = df["snapshot_name"].fillna(df["metadata_name"]).fillna(df["sec_code"])
+    metadata_name = df["metadata_name"].where(df["metadata_name"].notna(), pd.NA)
+    snapshot_name = df["snapshot_name"].where(df["snapshot_name"].notna(), pd.NA)
+    df["st_status_known"] = snapshot_name.notna() | metadata_name.notna()
+    df["sec_name"] = snapshot_name.fillna(metadata_name).fillna(df["sec_code"])
     df["change_pct"] = df["change_pct"].fillna(df.apply(change_pct, axis=1))
     df["board"] = df["sec_code"].map(board_kind)
 
     resolved_clean_dates = (
-        clean_stock_trade_dates(conn, end_date=str(trade_date))
+        usable_stock_trade_dates(conn, end_date=str(trade_date))[0]
         if clean_dates is None
         else sorted({str(day) for day in clean_dates if str(day) <= str(trade_date)})
     )
@@ -239,17 +263,21 @@ def build_selection_universe(
     prior_dates = [day for day in resolved_clean_dates if day < str(trade_date)][-20:]
     metrics = _history_metrics(conn, resolved_clean_dates, prior_dates)
     df = df.merge(metrics, on="sec_code", how="left")
-    has_snapshot_names = bool(snapshot_by_code) or bool(df["snapshot_name"].notna().any())
-    metadata_stale = (
-        not has_snapshot_names
-        and (metadata_as_of is None or (latest_clean_date is not None and metadata_as_of < latest_clean_date))
+    snapshot_name_count = int(df["snapshot_name"].notna().sum())
+    metadata_coverage = float(df["st_status_known"].mean()) if len(df) else 0.0
+    has_complete_snapshot_names = bool(len(df)) and snapshot_name_count == len(df)
+    metadata_fresh = has_complete_snapshot_names or (
+        metadata_as_of is not None and (latest_clean_date is None or metadata_as_of >= latest_clean_date)
     )
+    metadata_provisional = not metadata_fresh
     diagnostics.update(
         {
             "latest_clean_trade_date": latest_clean_date,
             "liquidity_history_dates": prior_dates,
-            "snapshot_name_count": len(snapshot_by_code),
-            "metadata_stale": metadata_stale,
+            "snapshot_name_count": snapshot_name_count,
+            "metadata_fresh": metadata_fresh,
+            "metadata_coverage": metadata_coverage,
+            "metadata_provisional": metadata_provisional,
         }
     )
 
@@ -283,13 +311,19 @@ def build_selection_universe(
         result["turnover_mean_20d_pct"].notna(), result["amount_mean_20d_pct"]
     )
     diagnostics["activity_unavailable_count"] = int((~activity_available.loc[eligible]).sum())
+    if metadata_provisional:
+        diagnostics["metadata_note"] = "metadata_provisional_last_known_name_filter"
     return SelectionUniverseResult(
         rows=result,
         trade_date=str(trade_date),
         universe_count=len(result),
         excluded_reason_counts=dict(sorted(excluded.items())),
         metadata_as_of=metadata_as_of,
-        data_status="metadata_stale" if metadata_stale else "ready",
+        data_status=price_status,
+        price_status=price_status,
+        metadata_fresh=metadata_fresh,
+        metadata_coverage=metadata_coverage,
+        metadata_provisional=metadata_provisional,
         diagnostics=diagnostics,
     )
 

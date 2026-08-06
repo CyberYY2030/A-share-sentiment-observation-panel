@@ -10,6 +10,7 @@ from mining.data_quality import (
     STATUS_CLEAN,
     STATUS_KNOWN_BAD,
     STATUS_PARTIAL,
+    STATUS_USABLE_WITH_QUARANTINE,
     clean_stock_trade_dates,
     inspect_stock_session,
     mark_known_bad_session,
@@ -69,6 +70,8 @@ class DataQualityTests(unittest.TestCase):
     def test_clean_calendar_excludes_full_zero_session_and_keeps_normal_halt(self) -> None:
         conn = _connect()
         try:
+            for day in ("2026-07-05", "2026-07-06", "2026-07-07", "2026-07-08", "2026-07-09"):
+                _insert_clean_day(conn, day)
             _insert_clean_day(conn, "2026-07-10")
             _insert_clean_day(conn, "2026-07-11")
             for index in range(5):
@@ -95,7 +98,7 @@ class DataQualityTests(unittest.TestCase):
             conn.close()
 
         self.assertEqual(bad["status"], STATUS_BAD)
-        self.assertIn("invalid_close", bad["reasons"])
+        self.assertIn("no_valid_trade", bad["reasons"])
         self.assertEqual(halt["status"], STATUS_CLEAN)
         self.assertEqual(halt["normal_halt_rows"], 1)
         self.assertNotIn("2026-07-13", calendar)
@@ -104,9 +107,9 @@ class DataQualityTests(unittest.TestCase):
     def test_partial_missing_ohlc_and_activity_fail_closed(self) -> None:
         conn = _connect()
         try:
-            _insert_clean_day(conn, "2026-07-10")
-            _insert_clean_day(conn, "2026-07-11")
-            _insert_clean_day(conn, "2026-07-12", count=3)
+            for day in ("2026-07-03", "2026-07-04", "2026-07-05", "2026-07-06", "2026-07-07"):
+                _insert_clean_day(conn, day, count=100)
+            _insert_clean_day(conn, "2026-07-12", count=90)
             _insert_row(conn, "2026-07-13", "600100", high=9.0)
             _insert_row(conn, "2026-07-14", "600101", open_price=10.0, high=11.0, low=10.0, close=11.0, volume=0.0, amount=0.0)
             conn.commit()
@@ -118,11 +121,38 @@ class DataQualityTests(unittest.TestCase):
             conn.close()
 
         self.assertEqual(partial["status"], STATUS_PARTIAL)
-        self.assertIn("coverage_below_clean_median", partial["reasons"])
+        self.assertIn("coverage_ratio_below_0_95", partial["reasons"])
         self.assertEqual(invalid_ohlc["status"], STATUS_BAD)
-        self.assertIn("invalid_ohlc", invalid_ohlc["reasons"])
+        self.assertIn("no_valid_trade", invalid_ohlc["reasons"])
         self.assertEqual(invalid_activity["status"], STATUS_BAD)
-        self.assertIn("activity_without_volume_or_amount", invalid_activity["reasons"])
+        self.assertIn("no_valid_trade", invalid_activity["reasons"])
+
+    def test_v25_two_axis_boundaries_and_duplicate_conflict_are_deterministic(self) -> None:
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day, count=100)
+            _insert_clean_day(conn, "2026-07-06", count=99)
+            _insert_row(conn, "2026-07-06", "601999", high=9.0)
+            usable = inspect_stock_session(conn, "2026-07-06")
+            calendar = clean_stock_trade_dates(conn)
+            _insert_clean_day(conn, "2026-07-07", count=36)
+            known_bad = inspect_stock_session(conn, "2026-07-07")
+            _insert_row(conn, "2026-07-08", "600001")
+            _insert_row(conn, "2026-07-08", "600001", close=11.0, high=11.0)
+            duplicate = inspect_stock_session(conn, "2026-07-08")
+            conn.commit()
+        finally:
+            conn.close()
+
+        self.assertEqual(usable["status"], STATUS_USABLE_WITH_QUARANTINE)
+        self.assertEqual(usable["coverage_ratio"], 1.0)
+        self.assertGreaterEqual(usable["usable_ratio"], 0.98)
+        self.assertIn("2026-07-06", calendar)
+        self.assertEqual(known_bad["status"], STATUS_KNOWN_BAD)
+        self.assertLess(known_bad["coverage_ratio"], 0.80)
+        self.assertEqual(duplicate["status"], STATUS_KNOWN_BAD)
+        self.assertEqual(duplicate["quarantined_rows"][0]["reason"], "conflicting_duplicate")
 
     def test_known_bad_session_remains_explicit_and_is_not_calendar_data(self) -> None:
         conn = _connect()
