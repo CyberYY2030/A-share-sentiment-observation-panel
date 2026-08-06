@@ -4,7 +4,7 @@ import unittest
 
 from mining.scanners.momentum_breakout import evaluate_momentum_anomaly, select_momentum_anomaly_from_context
 
-from .test_launch_burst import _event_context
+from tests.test_event_activity_v2 import _event_context
 
 
 class MomentumBreakoutV2Tests(unittest.TestCase):

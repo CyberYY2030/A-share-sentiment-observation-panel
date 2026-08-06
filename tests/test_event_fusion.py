@@ -5,7 +5,7 @@ import unittest
 from mining.scanners.launch_burst import evaluate_compression_launch
 from mining.scanners.momentum_breakout import evaluate_momentum_anomaly
 
-from .test_launch_burst import _event_context
+from tests.test_event_activity_v2 import _event_context
 
 
 class EventFusionTests(unittest.TestCase):

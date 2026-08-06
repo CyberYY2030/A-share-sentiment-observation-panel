@@ -38,6 +38,11 @@ def _load_stock_history(
     return pd.read_sql_query(sql, conn, params=[*dates, *sec_codes])
 
 
+def _load_rps_exclusion_codes(*_args: object, **_kwargs: object) -> set[str]:
+    """Compatibility symbol only: v2 removes the momentum-to-RPS exclusion coupling."""
+    raise RuntimeError("RPS exclusion coupling was removed from momentum breakout.")
+
+
 def select_candidates_from_universe(
     conn: sqlite3.Connection,
     trade_date: str,
