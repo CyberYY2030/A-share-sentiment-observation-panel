@@ -19,6 +19,8 @@ def build_event_activity(context: SelectionContext, *, baseline_days: int = 20) 
     """Build the one activity input shared by B/D, excluding T from close baselines."""
     columns = ["sec_code", "activity_source", "activity_value", "activity_ratio", "activity_pct"]
     dates = [str(value) for value in context.diagnostics.get("clean_dates", [])]
+    if str(context.trade_date) not in dates:
+        dates.append(str(context.trade_date))
     if context.bars.empty or not dates:
         return EventActivityResult(pd.DataFrame(columns=columns), {"activity_missing": len(context.universe)})
 

@@ -81,3 +81,15 @@ class LaunchBurstV2Tests(unittest.TestCase):
         self.assertTrue(values["activity_ratio"].isna().all())
         self.assertAlmostEqual(float(values.at["600001", "activity_pct"]), 0.5)
         self.assertAlmostEqual(float(values.at["300001", "activity_pct"]), 1.0)
+
+    def test_snapshot_t_bar_is_included_but_not_in_close_baseline(self) -> None:
+        context = _event_context(mode="intraday_snapshot")
+        snapshot_date = "2026-03-16"
+        current = context.bars[context.bars["trade_date"].eq(context.trade_date)].copy()
+        current["trade_date"] = snapshot_date
+        current["turnover_ratio"] = [120.0, 180.0]
+        context.bars = pd.concat([context.bars, current], ignore_index=True)
+        context.trade_date = snapshot_date
+        activity = build_event_activity(context).rows.set_index("sec_code")
+        self.assertEqual(set(activity.index), {"600001", "300001"})
+        self.assertTrue(activity["activity_ratio"].isna().all())

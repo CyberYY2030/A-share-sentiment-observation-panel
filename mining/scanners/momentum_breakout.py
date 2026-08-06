@@ -238,6 +238,8 @@ def evaluate_momentum_anomaly(
         diagnostics["skipped_reason_counts"] = {"data_unavailable": len(context.universe)}
         return pd.DataFrame(), diagnostics
     dates = [str(date) for date in context.diagnostics.get("clean_dates", [])]
+    if str(context.trade_date) not in dates:
+        dates.append(str(context.trade_date))
     if len(dates) < 6:
         diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
         return pd.DataFrame(), diagnostics
