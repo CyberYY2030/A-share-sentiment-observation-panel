@@ -1,14 +1,263 @@
 from __future__ import annotations
 
 import sqlite3
+from collections import Counter
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from typing import Any
 
 import pandas as pd
 
+from .data_quality import STATUS_CLEAN, STATUS_UNAVAILABLE, clean_stock_trade_dates, inspect_stock_session
 from .features import board_kind, change_pct
 
 
 MAX_MARKET_CAP = 5_000 * 100_000_000
 MIN_LISTING_DAYS = 87
+SELECTION_CODE_PREFIXES = (
+    "000",
+    "001",
+    "002",
+    "003",
+    "300",
+    "301",
+    "600",
+    "601",
+    "603",
+    "605",
+    "688",
+    "689",
+)
+
+
+@dataclass
+class SelectionUniverseResult:
+    """The v2 stock pool and the evidence needed to decide whether it is publishable."""
+
+    rows: pd.DataFrame
+    trade_date: str
+    universe_count: int
+    excluded_reason_counts: dict[str, int]
+    metadata_as_of: str | None
+    data_status: str
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+def _schema_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {
+        str(row[1])
+        for row in conn.execute(f"PRAGMA ash.table_info({table})").fetchall()
+    }
+
+
+def _metadata_as_of(conn: sqlite3.Connection) -> str | None:
+    if "updated_at" not in _schema_columns(conn, "stock_info"):
+        return None
+    row = conn.execute("SELECT MAX(updated_at) FROM ash.stock_info WHERE updated_at IS NOT NULL").fetchone()
+    if row is None or row[0] is None:
+        return None
+    parsed = pd.to_datetime(row[0], errors="coerce")
+    return None if pd.isna(parsed) else parsed.date().isoformat()
+
+
+def _history_metrics(
+    conn: sqlite3.Connection,
+    clean_dates: list[str],
+    prior_dates: list[str],
+) -> pd.DataFrame:
+    if not clean_dates:
+        return pd.DataFrame(columns=["sec_code", "clean_bar_count", "amount_mean_20d", "turnover_mean_20d"])
+
+    clean_marks = ",".join("?" for _ in clean_dates)
+    counts = pd.read_sql_query(
+        f"""
+        SELECT sec_code, COUNT(*) AS clean_bar_count
+        FROM ash.kline_daily
+        WHERE sec_type='stock' AND trade_date IN ({clean_marks})
+        GROUP BY sec_code
+        """,
+        conn,
+        params=clean_dates,
+    )
+    if not prior_dates:
+        counts["amount_mean_20d"] = pd.NA
+        counts["turnover_mean_20d"] = pd.NA
+        return counts
+
+    prior_marks = ",".join("?" for _ in prior_dates)
+    liquidity = pd.read_sql_query(
+        f"""
+        SELECT
+          sec_code,
+          AVG(amount) AS amount_mean_20d,
+          AVG(turnover_ratio) AS turnover_mean_20d
+        FROM ash.kline_daily
+        WHERE sec_type='stock' AND trade_date IN ({prior_marks})
+        GROUP BY sec_code
+        """,
+        conn,
+        params=prior_dates,
+    )
+    return counts.merge(liquidity, on="sec_code", how="left")
+
+
+def _snapshot_name_map(snapshot_names: pd.DataFrame | Mapping[str, str] | None) -> dict[str, str]:
+    if snapshot_names is None:
+        return {}
+    if isinstance(snapshot_names, Mapping):
+        items = snapshot_names.items()
+    else:
+        frame = pd.DataFrame(snapshot_names)
+        if not {"sec_code", "sec_name"}.issubset(frame.columns):
+            return {}
+        items = zip(frame["sec_code"], frame["sec_name"], strict=False)
+    names: dict[str, str] = {}
+    for code, name in items:
+        normalized_code = str(code).zfill(6)
+        normalized_name = str(name).strip() if name is not None else ""
+        if normalized_name:
+            names[normalized_code] = normalized_name
+    return names
+
+
+def _empty_selection_result(
+    trade_date: str,
+    *,
+    metadata_as_of: str | None,
+    data_status: str,
+    diagnostics: dict[str, Any],
+) -> SelectionUniverseResult:
+    return SelectionUniverseResult(
+        rows=pd.DataFrame(),
+        trade_date=str(trade_date),
+        universe_count=0,
+        excluded_reason_counts={},
+        metadata_as_of=metadata_as_of,
+        data_status=data_status,
+        diagnostics=diagnostics,
+    )
+
+
+def build_selection_universe(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    snapshot_names: pd.DataFrame | Mapping[str, str] | None = None,
+    clean_dates: list[str] | None = None,
+) -> SelectionUniverseResult:
+    """Build the sole v2 A-share stock pool without historical metadata look-ahead.
+
+    The incoming snapshot name is authoritative for intraday ST filtering.  Without
+    it, a stale or missing successful ``stock_info`` refresh makes the result
+    explicitly non-publishable instead of silently presenting an official list.
+    """
+    metadata_as_of = _metadata_as_of(conn)
+    quality = inspect_stock_session(conn, trade_date)
+    diagnostics: dict[str, Any] = {"session_quality": quality}
+    if quality["status"] not in {STATUS_CLEAN, STATUS_UNAVAILABLE}:
+        return _empty_selection_result(
+            trade_date,
+            metadata_as_of=metadata_as_of,
+            data_status=quality["status"],
+            diagnostics=diagnostics,
+        )
+
+    df = pd.read_sql_query(
+        """
+        SELECT
+          k.sec_code,
+          s.name AS metadata_name,
+          k.open,
+          k.high,
+          k.low,
+          k.close,
+          k.pre_close,
+          k.change,
+          k.change_pct,
+          k.volume,
+          k.amount,
+          k.turnover_ratio
+        FROM ash.kline_daily k
+        LEFT JOIN ash.stock_info s ON s.sec_code = k.sec_code
+        WHERE k.sec_type='stock' AND k.trade_date=?
+        """,
+        conn,
+        params=[str(trade_date)],
+    )
+    if df.empty:
+        return _empty_selection_result(
+            trade_date,
+            metadata_as_of=metadata_as_of,
+            data_status="data_unavailable",
+            diagnostics=diagnostics,
+        )
+
+    df["sec_code"] = df["sec_code"].astype(str).str.zfill(6)
+    snapshot_by_code = _snapshot_name_map(snapshot_names)
+    df["snapshot_name"] = df["sec_code"].map(snapshot_by_code)
+    df["sec_name"] = df["snapshot_name"].fillna(df["metadata_name"]).fillna(df["sec_code"])
+    df["change_pct"] = df["change_pct"].fillna(df.apply(change_pct, axis=1))
+    df["board"] = df["sec_code"].map(board_kind)
+
+    resolved_clean_dates = (
+        clean_stock_trade_dates(conn, end_date=str(trade_date))
+        if clean_dates is None
+        else sorted({str(day) for day in clean_dates if str(day) <= str(trade_date)})
+    )
+    latest_clean_date = resolved_clean_dates[-1] if resolved_clean_dates else None
+    prior_dates = [day for day in resolved_clean_dates if day < str(trade_date)][-20:]
+    metrics = _history_metrics(conn, resolved_clean_dates, prior_dates)
+    df = df.merge(metrics, on="sec_code", how="left")
+    has_snapshot_names = bool(snapshot_by_code)
+    metadata_stale = (
+        not has_snapshot_names
+        and (metadata_as_of is None or (latest_clean_date is not None and metadata_as_of < latest_clean_date))
+    )
+    diagnostics.update(
+        {
+            "latest_clean_trade_date": latest_clean_date,
+            "liquidity_history_dates": prior_dates,
+            "snapshot_name_count": len(snapshot_by_code),
+            "metadata_stale": metadata_stale,
+        }
+    )
+
+    excluded = Counter()
+    eligible = pd.Series(True, index=df.index)
+
+    def exclude(mask: pd.Series, reason: str) -> None:
+        nonlocal eligible
+        rejected = eligible & mask.fillna(False)
+        rejected_count = int(rejected.sum())
+        if rejected_count:
+            excluded[reason] += rejected_count
+        eligible &= ~rejected
+
+    exclude(~df["sec_code"].str.startswith(SELECTION_CODE_PREFIXES), "non_a_share_prefix")
+    exclude(
+        df["sec_name"].astype(str).str.contains(r"^\s*(?:\*?ST|S\*?ST)(?![A-Za-z])", case=False, regex=True),
+        "st_name",
+    )
+    active = (pd.to_numeric(df["volume"], errors="coerce") > 0) & (
+        pd.to_numeric(df["amount"], errors="coerce") > 0
+    )
+    exclude(~active, "no_valid_activity")
+
+    result = df.loc[eligible].drop(columns=["metadata_name", "snapshot_name"]).reset_index(drop=True)
+    for metric in ("amount_mean_20d", "turnover_mean_20d"):
+        result[f"{metric}_pct"] = result[metric].rank(pct=True, method="average")
+    result["liquidity_pct"] = result["turnover_mean_20d_pct"].where(
+        result["turnover_mean_20d_pct"].notna(), result["amount_mean_20d_pct"]
+    )
+    return SelectionUniverseResult(
+        rows=result,
+        trade_date=str(trade_date),
+        universe_count=len(result),
+        excluded_reason_counts=dict(sorted(excluded.items())),
+        metadata_as_of=metadata_as_of,
+        data_status="metadata_stale" if metadata_stale else "ready",
+        diagnostics=diagnostics,
+    )
 
 
 def build_universe(conn: sqlite3.Connection, trade_date: str) -> pd.DataFrame:
@@ -67,4 +316,3 @@ def build_universe(conn: sqlite3.Connection, trade_date: str) -> pd.DataFrame:
     df = df[df["listing_missing"] | (age_days >= MIN_LISTING_DAYS)].copy()
 
     return df.reset_index(drop=True)
-
