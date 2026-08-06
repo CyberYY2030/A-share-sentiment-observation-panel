@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import pandas as pd
+
+
+@dataclass(frozen=True)
+class TrendProfile:
+    profile_id: str
+    min_clean_sessions: int
+    short_window: int
+    middle_window: int
+    long_window: int
+    direction_shift: int
+
+    @property
+    def required_stock_bars(self) -> int:
+        return self.long_window + self.direction_shift
+
+
+TREND_PROFILES = (
+    TrendProfile("P200", 220, 20, 60, 200, 20),
+    TrendProfile("P120", 140, 20, 60, 120, 20),
+    TrendProfile("P90", 110, 20, 60, 90, 20),
+    TrendProfile("P60", 75, 10, 30, 60, 15),
+)
+
+
+def resolve_trend_profile(clean_session_count: int) -> TrendProfile | None:
+    """Select one market-wide profile; callers may not downgrade it per stock."""
+    for profile in TREND_PROFILES:
+        if int(clean_session_count) >= profile.min_clean_sessions:
+            return profile
+    return None
+
+
+def evaluate_trend_structure(bars: pd.DataFrame, profile: TrendProfile | None) -> pd.DataFrame:
+    """Evaluate the profile's moving-average gate for each stock independently."""
+    columns = [
+        "sec_code",
+        "history_sufficient",
+        "trend_structure_pass",
+        "adj_close",
+        "ma_short",
+        "ma_middle",
+        "ma_long",
+        "ma_long_prior",
+        "long_window_high",
+        "near_high_ratio",
+    ]
+    if profile is None or bars.empty or not {"sec_code", "trade_date", "adj_close"}.issubset(bars.columns):
+        return pd.DataFrame(columns=columns)
+
+    rows: list[dict[str, object]] = []
+    normalized = bars[["sec_code", "trade_date", "adj_close"]].copy()
+    normalized["sec_code"] = normalized["sec_code"].astype(str).str.zfill(6)
+    normalized["adj_close"] = pd.to_numeric(normalized["adj_close"], errors="coerce")
+    expected_dates = sorted(normalized["trade_date"].astype(str).unique())
+    for sec_code, frame in normalized.groupby("sec_code", sort=True):
+        close = frame.set_index("trade_date")["adj_close"].reindex(expected_dates)
+        history_sufficient = len(close) >= profile.required_stock_bars and close.tail(profile.required_stock_bars).notna().all()
+        if not history_sufficient:
+            rows.append(
+                {
+                    "sec_code": sec_code,
+                    "history_sufficient": False,
+                    "trend_structure_pass": False,
+                    "adj_close": close.iloc[-1] if not close.empty and pd.notna(close.iloc[-1]) else pd.NA,
+                    "ma_short": pd.NA,
+                    "ma_middle": pd.NA,
+                    "ma_long": pd.NA,
+                    "ma_long_prior": pd.NA,
+                    "long_window_high": pd.NA,
+                    "near_high_ratio": pd.NA,
+                }
+            )
+            continue
+        ma_short = close.rolling(profile.short_window, min_periods=profile.short_window).mean()
+        ma_middle = close.rolling(profile.middle_window, min_periods=profile.middle_window).mean()
+        ma_long = close.rolling(profile.long_window, min_periods=profile.long_window).mean()
+        latest_close = float(close.iloc[-1])
+        latest_short = float(ma_short.iloc[-1])
+        latest_middle = float(ma_middle.iloc[-1])
+        latest_long = float(ma_long.iloc[-1])
+        previous_long = float(ma_long.iloc[-1 - profile.direction_shift])
+        long_high = float(close.iloc[-profile.long_window :].max())
+        rows.append(
+            {
+                "sec_code": sec_code,
+                "history_sufficient": True,
+                "trend_structure_pass": latest_close > latest_short > latest_middle > latest_long
+                and latest_long > previous_long,
+                "adj_close": latest_close,
+                "ma_short": latest_short,
+                "ma_middle": latest_middle,
+                "ma_long": latest_long,
+                "ma_long_prior": previous_long,
+                "long_window_high": long_high,
+                "near_high_ratio": latest_close / long_high if long_high > 0 else pd.NA,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
+
+
+def cross_section_percentile(values: pd.Series) -> pd.Series:
+    """Use one same-unit cross-sectional percentile, retaining missing inputs as missing."""
+    numeric = pd.to_numeric(values, errors="coerce")
+    return numeric.rank(pct=True, method="average")
