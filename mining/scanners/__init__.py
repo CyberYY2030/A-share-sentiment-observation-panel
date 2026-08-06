@@ -58,6 +58,7 @@ def load_builtin_scanners() -> None:
     from . import second_launch  # noqa: F401
     from . import launch_burst  # noqa: F401
     from . import base_breakout  # noqa: F401
+    from . import counter_trend_rs  # noqa: F401
 
     _LOADED = True
 
