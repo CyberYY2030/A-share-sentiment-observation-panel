@@ -144,6 +144,8 @@ def build_selection_universe(
     *,
     snapshot_names: pd.DataFrame | Mapping[str, str] | None = None,
     clean_dates: list[str] | None = None,
+    current_bars: pd.DataFrame | None = None,
+    allow_missing_activity: bool = False,
 ) -> SelectionUniverseResult:
     """Build the sole v2 A-share stock pool without historical metadata look-ahead.
 
@@ -152,7 +154,11 @@ def build_selection_universe(
     explicitly non-publishable instead of silently presenting an official list.
     """
     metadata_as_of = _metadata_as_of(conn)
-    quality = inspect_stock_session(conn, trade_date)
+    quality = (
+        inspect_stock_session(conn, trade_date)
+        if current_bars is None
+        else {"trade_date": str(trade_date), "status": STATUS_UNAVAILABLE, "reasons": ["intraday_snapshot"]}
+    )
     diagnostics: dict[str, Any] = {"session_quality": quality}
     if quality["status"] not in {STATUS_CLEAN, STATUS_UNAVAILABLE}:
         return _empty_selection_result(
@@ -162,28 +168,51 @@ def build_selection_universe(
             diagnostics=diagnostics,
         )
 
-    df = pd.read_sql_query(
-        """
-        SELECT
-          k.sec_code,
-          s.name AS metadata_name,
-          k.open,
-          k.high,
-          k.low,
-          k.close,
-          k.pre_close,
-          k.change,
-          k.change_pct,
-          k.volume,
-          k.amount,
-          k.turnover_ratio
-        FROM ash.kline_daily k
-        LEFT JOIN ash.stock_info s ON s.sec_code = k.sec_code
-        WHERE k.sec_type='stock' AND k.trade_date=?
-        """,
-        conn,
-        params=[str(trade_date)],
-    )
+    if current_bars is None:
+        df = pd.read_sql_query(
+            """
+            SELECT
+              k.sec_code,
+              s.name AS metadata_name,
+              k.open,
+              k.high,
+              k.low,
+              k.close,
+              k.pre_close,
+              k.change,
+              k.change_pct,
+              k.volume,
+              k.amount,
+              k.turnover_ratio
+            FROM ash.kline_daily k
+            LEFT JOIN ash.stock_info s ON s.sec_code = k.sec_code
+            WHERE k.sec_type='stock' AND k.trade_date=?
+            """,
+            conn,
+            params=[str(trade_date)],
+        )
+    else:
+        df = pd.DataFrame(current_bars).copy()
+        required = {"sec_code", "open", "high", "low", "close", "pre_close"}
+        if not allow_missing_activity:
+            required.update({"volume", "amount"})
+        missing = required.difference(df.columns)
+        if missing:
+            raise ValueError(f"current selection bars require columns: {sorted(missing)}")
+        for column in ("change", "change_pct", "turnover_ratio", "volume", "amount"):
+            if column not in df.columns:
+                df[column] = pd.NA
+        snapshot_column = "sec_name" if "sec_name" in df.columns else None
+        df["sec_code"] = df["sec_code"].astype(str).str.zfill(6)
+        metadata = pd.read_sql_query("SELECT sec_code, name AS metadata_name FROM ash.stock_info", conn)
+        metadata["sec_code"] = metadata["sec_code"].astype(str).str.zfill(6)
+        if snapshot_column:
+            df["snapshot_name"] = df[snapshot_column]
+        else:
+            df["snapshot_name"] = pd.NA
+        df = df.drop(columns=[snapshot_column] if snapshot_column else [], errors="ignore").merge(
+            metadata.drop_duplicates("sec_code", keep="last"), on="sec_code", how="left"
+        )
     if df.empty:
         return _empty_selection_result(
             trade_date,
@@ -194,7 +223,9 @@ def build_selection_universe(
 
     df["sec_code"] = df["sec_code"].astype(str).str.zfill(6)
     snapshot_by_code = _snapshot_name_map(snapshot_names)
-    df["snapshot_name"] = df["sec_code"].map(snapshot_by_code)
+    if "snapshot_name" not in df.columns:
+        df["snapshot_name"] = pd.NA
+    df["snapshot_name"] = df["sec_code"].map(snapshot_by_code).fillna(df["snapshot_name"])
     df["sec_name"] = df["snapshot_name"].fillna(df["metadata_name"]).fillna(df["sec_code"])
     df["change_pct"] = df["change_pct"].fillna(df.apply(change_pct, axis=1))
     df["board"] = df["sec_code"].map(board_kind)
@@ -208,7 +239,7 @@ def build_selection_universe(
     prior_dates = [day for day in resolved_clean_dates if day < str(trade_date)][-20:]
     metrics = _history_metrics(conn, resolved_clean_dates, prior_dates)
     df = df.merge(metrics, on="sec_code", how="left")
-    has_snapshot_names = bool(snapshot_by_code)
+    has_snapshot_names = bool(snapshot_by_code) or bool(df["snapshot_name"].notna().any())
     metadata_stale = (
         not has_snapshot_names
         and (metadata_as_of is None or (latest_clean_date is not None and metadata_as_of < latest_clean_date))
@@ -238,17 +269,20 @@ def build_selection_universe(
         df["sec_name"].astype(str).str.contains(r"^\s*(?:\*?ST|S\*?ST)(?![A-Za-z])", case=False, regex=True),
         "st_name",
     )
-    active = (pd.to_numeric(df["volume"], errors="coerce") > 0) & (
-        pd.to_numeric(df["amount"], errors="coerce") > 0
-    )
-    exclude(~active, "no_valid_activity")
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    amount = pd.to_numeric(df["amount"], errors="coerce")
+    active = volume.gt(0) & amount.gt(0)
+    activity_available = volume.notna() & amount.notna()
+    exclude((activity_available & ~active) if allow_missing_activity else ~active, "no_valid_activity")
 
     result = df.loc[eligible].drop(columns=["metadata_name", "snapshot_name"]).reset_index(drop=True)
+    result["activity_available"] = activity_available.loc[eligible].to_numpy()
     for metric in ("amount_mean_20d", "turnover_mean_20d"):
         result[f"{metric}_pct"] = result[metric].rank(pct=True, method="average")
     result["liquidity_pct"] = result["turnover_mean_20d_pct"].where(
         result["turnover_mean_20d_pct"].notna(), result["amount_mean_20d_pct"]
     )
+    diagnostics["activity_unavailable_count"] = int((~activity_available.loc[eligible]).sum())
     return SelectionUniverseResult(
         rows=result,
         trade_date=str(trade_date),

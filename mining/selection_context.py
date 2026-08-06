@@ -99,10 +99,12 @@ def build_selection_context(
     price_as_of: str | None = None,
     snapshot_names: pd.DataFrame | Mapping[str, str] | None = None,
     clean_dates: list[str] | None = None,
+    current_bars: pd.DataFrame | None = None,
+    allow_missing_activity: bool = False,
 ) -> SelectionContext:
     """Build deterministic close-data input for v2 selectors without touching raw SQLite prices."""
     resolved_clean_dates = (
-        clean_stock_trade_dates(conn, end_date=str(trade_date))
+        clean_stock_trade_dates(conn, end_date=str(trade_date), include_end=current_bars is None)
         if clean_dates is None
         else sorted({str(day) for day in clean_dates if str(day) <= str(trade_date)})
     )
@@ -113,6 +115,8 @@ def build_selection_context(
         str(trade_date),
         snapshot_names=snapshot_names,
         clean_dates=resolved_clean_dates,
+        current_bars=current_bars,
+        allow_missing_activity=allow_missing_activity,
     )
     if universe_result.rows.empty:
         return _empty_context(
@@ -125,6 +129,15 @@ def build_selection_context(
 
     sec_codes = universe_result.rows["sec_code"].astype(str).str.zfill(6).drop_duplicates().tolist()
     raw_bars = _load_clean_bars(conn, resolved_clean_dates, sec_codes)
+    if current_bars is not None:
+        current = pd.DataFrame(current_bars).copy()
+        current["sec_code"] = current["sec_code"].astype(str).str.zfill(6)
+        current = current[current["sec_code"].isin(sec_codes)].copy()
+        current["trade_date"] = str(trade_date)
+        for column in raw_bars.columns:
+            if column not in current.columns:
+                current[column] = pd.NA
+        raw_bars = pd.concat([raw_bars, current[raw_bars.columns]], ignore_index=True)
     adjusted: AdjustedPriceResult = build_forward_adjusted_bars(raw_bars)
     valid_codes = adjusted.bars.loc[adjusted.bars["adjustment_valid"], "sec_code"].drop_duplicates()
     universe = universe_result.rows[universe_result.rows["sec_code"].isin(valid_codes)].reset_index(drop=True)
