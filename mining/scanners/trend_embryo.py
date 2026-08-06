@@ -7,8 +7,61 @@ import pandas as pd
 
 from ..db import list_stock_trade_dates
 from ..features import is_limit_up
+from ..selection_context import SelectionContext
 from ..universe import build_universe
 from . import Candidate, Scanner, register
+
+
+def build_v2_path_context(context: SelectionContext) -> pd.DataFrame:
+    """Expose the legacy embryo path evidence as B explanation, never as a ranking gate."""
+    columns = [
+        "sec_code",
+        "limit_up_count_5d",
+        "small_yang_count",
+        "single_day_max_change",
+        "path_context",
+    ]
+    if context.bars.empty or context.universe.empty:
+        return pd.DataFrame(columns=columns)
+    board_by_code = (
+        context.universe.assign(sec_code=context.universe["sec_code"].astype(str).str.zfill(6))
+        .set_index("sec_code")["board"]
+        .to_dict()
+        if "board" in context.universe.columns
+        else {}
+    )
+    rows: list[dict[str, object]] = []
+    for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
+        recent = frame.sort_values("trade_date", kind="stable").tail(5).copy()
+        if len(recent) < 5:
+            continue
+        changes = pd.to_numeric(recent.get("change_pct"), errors="coerce")
+        board = board_by_code.get(code)
+        limit_up_count = (
+            int(sum(is_limit_up(row.close, row.pre_close, board) for row in recent[["close", "pre_close"]].itertuples(index=False)))
+            if board and {"close", "pre_close"}.issubset(recent.columns)
+            else 0
+        )
+        small_yang = int((changes.gt(0) & changes.lt(5.0)).sum())
+        max_change = float(changes.max()) if changes.notna().any() else float("nan")
+        if limit_up_count >= 2:
+            label = "已过度延伸"
+        elif limit_up_count >= 1 or (pd.notna(max_change) and max_change >= 8.0):
+            label = "加速"
+        elif small_yang >= 3:
+            label = "蓄势"
+        else:
+            label = "常态"
+        rows.append(
+            {
+                "sec_code": code,
+                "limit_up_count_5d": limit_up_count,
+                "small_yang_count": small_yang,
+                "single_day_max_change": max_change,
+                "path_context": label,
+            }
+        )
+    return pd.DataFrame(rows, columns=columns)
 
 
 def _load_stock_history(conn: sqlite3.Connection, sec_codes: list[str], dates: list[str]) -> pd.DataFrame:

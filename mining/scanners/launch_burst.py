@@ -2,11 +2,16 @@ from __future__ import annotations
 
 import math
 import sqlite3
+from collections import Counter
 from typing import Any
 
 import pandas as pd
 
 from ..db import list_stock_trade_dates
+from ..event_activity import EventActivityResult, build_event_activity
+from ..selection_context import SelectionContext, build_selection_context
+from ..trend_factors import cross_section_percentile
+from .trend_embryo import build_v2_path_context
 from . import Candidate, Scanner, register
 
 
@@ -324,3 +329,168 @@ class LaunchBurstScanner(Scanner):
             strategy_id=self.strategy_id,
             version=self.version,
         )
+
+
+def evaluate_compression_launch(
+    context: SelectionContext,
+    *,
+    params: dict[str, Any] | None = None,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Formal B/compression path using clean shared bars and T-1-only activity baselines."""
+    p = {
+        "ma_cluster_max": 0.07,
+        "sigma_window": 20,
+        "sigma_floor": 0.008,
+        "first_lookback": 10,
+        "first_sigma": 2.5,
+        "launch_min_pct": 0.045,
+        "launch_sigma": 3.0,
+        "close_strength": 0.95,
+        "vol_contract": 1.0,
+        "activity_expand": 1.5,
+        "amount_min": 200_000_000,
+        **(params or {}),
+    }
+    diagnostics: dict[str, Any] = {"event_subtype": "compression_launch", "skipped_reason_counts": {}}
+    if context.data_status != "ready" or context.bars.empty:
+        diagnostics["skipped_reason_counts"] = {"data_unavailable": len(context.universe)}
+        return pd.DataFrame(), diagnostics
+    dates = [str(date) for date in context.diagnostics.get("clean_dates", [])]
+    if len(dates) < 46:
+        diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
+        return pd.DataFrame(), diagnostics
+    activity: EventActivityResult = build_event_activity(context)
+    activity_by_code = activity.rows.set_index("sec_code") if not activity.rows.empty else pd.DataFrame()
+    paths = build_v2_path_context(context).set_index("sec_code")
+    names = (
+        context.universe.assign(sec_code=context.universe["sec_code"].astype(str).str.zfill(6))
+        .set_index("sec_code")["sec_name"]
+        .astype(str)
+        .to_dict()
+        if "sec_name" in context.universe.columns
+        else {}
+    )
+    skipped = Counter(activity.skipped_reason_counts)
+    rows: list[dict[str, Any]] = []
+    for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
+        if activity_by_code.empty or code not in activity_by_code.index:
+            continue
+        indexed = frame.assign(trade_date=frame["trade_date"].astype(str)).set_index("trade_date").reindex(dates)
+        close = pd.to_numeric(indexed.get("adj_close"), errors="coerce")
+        high = pd.to_numeric(indexed.get("adj_high", indexed.get("high")), errors="coerce")
+        open_price = pd.to_numeric(indexed.get("adj_open", indexed.get("open")), errors="coerce")
+        if not all(series.notna().iloc[-46:].all() for series in (close, high, open_price)):
+            skipped["price_window_missing"] += 1
+            continue
+        source = str(activity_by_code.at[code, "activity_source"])
+        activity_series = pd.to_numeric(indexed.get(source), errors="coerce")
+        if not activity_series.iloc[-46:].notna().all():
+            skipped["activity_window_missing"] += 1
+            continue
+        returns = close.pct_change(fill_method=None)
+        sigma = float(returns.iloc[-21:-1].std())
+        if not math.isfinite(sigma):
+            skipped["sigma_window_missing"] += 1
+            continue
+        sigma = max(sigma, float(p["sigma_floor"]))
+        ma5 = close.rolling(5, min_periods=5).mean()
+        ma10 = close.rolling(10, min_periods=10).mean()
+        ma20 = close.rolling(20, min_periods=20).mean()
+        previous_mas = [float(series.iloc[-2]) for series in (ma5, ma10, ma20)]
+        previous_cluster_width = (max(previous_mas) - min(previous_mas)) / min(previous_mas)
+        previous_cluster_high = max(previous_mas)
+        current_mas = [float(series.iloc[-1]) for series in (ma5, ma10, ma20)]
+        current_cluster_high = max(current_mas)
+        pct_t = float(returns.iloc[-1])
+        current_close = float(close.iloc[-1])
+        current_high = float(high.iloc[-1])
+        current_open = float(open_price.iloc[-1])
+        recent_pct = returns.iloc[-1 - int(p["first_lookback"]) : -1]
+        recent_activity = activity_series.iloc[-6:-1]
+        base_activity = activity_series.iloc[-46:-6]
+        if recent_pct.isna().any() or recent_activity.isna().any() or base_activity.isna().any():
+            skipped["required_window_missing"] += 1
+            continue
+        contract_ratio = float(recent_activity.mean() / base_activity.mean()) if float(base_activity.mean()) > 0 else math.nan
+        expansion_ratio = float(activity_series.iloc[-1] / recent_activity.mean()) if float(recent_activity.mean()) > 0 else math.nan
+        close_strength = current_close / current_high if current_high > 0 else math.nan
+        threshold = max(float(p["launch_min_pct"]), float(p["launch_sigma"]) * sigma)
+        qualifies = (
+            previous_cluster_width <= float(p["ma_cluster_max"])
+            and float(recent_pct.max()) < float(p["first_sigma"]) * sigma
+            and contract_ratio <= float(p["vol_contract"])
+            and pct_t >= threshold
+            and current_close > current_open
+            and close_strength >= float(p["close_strength"])
+            and expansion_ratio >= float(p["activity_expand"])
+            and current_open <= previous_cluster_high
+            and current_close > current_cluster_high
+        )
+        if not qualifies:
+            skipped["compression_gate_failed"] += 1
+            continue
+        amount = pd.to_numeric(indexed.get("amount"), errors="coerce").iloc[-1] if "amount" in indexed.columns else math.nan
+        path = paths.loc[code] if not paths.empty and code in paths.index else None
+        rows.append(
+            {
+                "sec_code": code,
+                "sec_name": names.get(code, code),
+                "event_subtype": "compression_launch",
+                "reference_price": current_close,
+                "sigma_multiple": pct_t / sigma,
+                "cluster_width": previous_cluster_width,
+                "volume_contract_ratio": contract_ratio,
+                "activity_expand_ratio": expansion_ratio,
+                "activity_source": source,
+                "activity_pct": float(activity_by_code.at[code, "activity_pct"]),
+                "close_strength": close_strength,
+                "amount": float(amount) if pd.notna(amount) else None,
+                "amount_min_diagnostic": bool(pd.notna(amount) and float(amount) >= float(p["amount_min"])),
+                "path_context": path.path_context if path is not None else "常态",
+                "limit_up_count_5d": int(path.limit_up_count_5d) if path is not None else 0,
+                "small_yang_count": int(path.small_yang_count) if path is not None else 0,
+                "single_day_max_change": float(path.single_day_max_change) if path is not None else math.nan,
+            }
+        )
+    result = pd.DataFrame(rows)
+    if not result.empty:
+        result["sigma_pct"] = cross_section_percentile(result["sigma_multiple"])
+        result["score"] = 0.65 * result["sigma_pct"] + 0.35 * result["activity_pct"]
+        result = result.sort_values(["score", "activity_pct", "sec_code"], ascending=[False, False, True]).reset_index(drop=True)
+    diagnostics["result_count"] = len(result)
+    diagnostics["skipped_reason_counts"] = dict(sorted((key, value) for key, value in skipped.items() if value))
+    return result, diagnostics
+
+
+def select_compression_launch_from_context(context: SelectionContext) -> list[Candidate]:
+    rows, _ = evaluate_compression_launch(context)
+    candidates: list[Candidate] = []
+    for rank, row in enumerate(rows.itertuples(index=False), start=1):
+        candidates.append(
+            Candidate(
+                strategy_id=CompressionLaunchScanner.strategy_id,
+                version=CompressionLaunchScanner.version,
+                trade_date=context.trade_date,
+                sec_type="stock",
+                sec_code=row.sec_code,
+                sec_name=row.sec_name,
+                entry_price=float(row.reference_price),
+                features={key: getattr(row, key) for key in rows.columns if key not in {"sec_code", "sec_name", "reference_price"}},
+                rank=rank,
+            )
+        )
+    return candidates
+
+
+@register
+class CompressionLaunchScanner(Scanner):
+    strategy_id = "compression_launch"
+    version = "v2.0"
+    kind = "stock"
+    description = "V2 compression-launch event path using shared clean context and activity."
+    default_params: dict[str, Any] = {}
+
+    def run(self, conn: sqlite3.Connection, trade_date: str) -> list[Candidate]:
+        context = build_selection_context(conn, trade_date, mode="close_final")
+        self.last_universe_size = len(context.universe)
+        return select_compression_launch_from_context(context)
