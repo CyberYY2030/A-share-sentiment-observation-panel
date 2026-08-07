@@ -94,18 +94,35 @@ class BackfillRuleTests(unittest.TestCase):
                         trade_date TEXT,
                         sec_type TEXT,
                         sec_code TEXT,
-                        close REAL
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        pre_close REAL,
+                        volume REAL,
+                        amount REAL
                     )
                     """
                 )
-                for day in ("2026-04-21", "2026-04-23"):
+                for day in (
+                    "2026-04-16",
+                    "2026-04-17",
+                    "2026-04-18",
+                    "2026-04-19",
+                    "2026-04-20",
+                    "2026-04-21",
+                    "2026-04-23",
+                ):
                     conn.execute(
-                        "INSERT INTO kline_daily VALUES (?, 'stock', '600001', 10.0)",
+                        """
+                        INSERT INTO kline_daily VALUES
+                        (?, 'stock', '600001', 10.0, 10.0, 10.0, 10.0, 10.0, 100.0, 1000.0)
+                        """,
                         (day,),
                     )
                     for code in ("000001", "399001", "000300", "000852"):
                         conn.execute(
-                            "INSERT INTO kline_daily VALUES (?, 'index', ?, 10.0)",
+                            "INSERT INTO kline_daily (trade_date, sec_type, sec_code, close) VALUES (?, 'index', ?, 10.0)",
                             (day, code),
                         )
                 conn.commit()
@@ -125,6 +142,67 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertIn("index", plan["missing_by_day"]["2026-04-22"])
         self.assertIn("2026-04-22", plan["missing_by_domain"]["stock"])
         self.assertNotIn("2026-04-23", plan["missing_by_domain"]["stock"])
+
+    def test_stock_coverage_accepts_only_usable_session_quality_states(self) -> None:
+        import sqlite3
+
+        from mining.data_quality import (
+            STATUS_CLEAN,
+            STATUS_KNOWN_BAD,
+            STATUS_PARTIAL,
+            STATUS_UNAVAILABLE,
+            STATUS_USABLE_WITH_QUARANTINE,
+        )
+        from offline_daily_update import stock_coverage_for_date
+
+        with tempfile.TemporaryDirectory() as tmp:
+            stock_path = Path(tmp) / "a_share_mvp.db"
+            conn = sqlite3.connect(stock_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE kline_daily (
+                        trade_date TEXT,
+                        sec_type TEXT,
+                        sec_code TEXT,
+                        open REAL,
+                        high REAL,
+                        low REAL,
+                        close REAL,
+                        pre_close REAL,
+                        volume REAL,
+                        amount REAL
+                    )
+                    """
+                )
+                for code in ("600001", "600002", "600003"):
+                    conn.execute(
+                        """
+                        INSERT INTO kline_daily VALUES
+                        ('2026-04-22', 'stock', ?, 10.0, 10.0, 10.0, 10.0, 10.0, 100.0, 1000.0)
+                        """,
+                        (code,),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            expected = {
+                STATUS_CLEAN: True,
+                STATUS_USABLE_WITH_QUARANTINE: True,
+                STATUS_PARTIAL: False,
+                STATUS_KNOWN_BAD: False,
+                STATUS_UNAVAILABLE: False,
+            }
+            for status, usable in expected.items():
+                with mock.patch("offline_daily_update.inspect_stock_session", return_value={"status": status}):
+                    coverage = stock_coverage_for_date(
+                        stock_path,
+                        "2026-04-22",
+                        stock_min_rows=3,
+                        required_index_codes=(),
+                    )
+                self.assertEqual(coverage["stock"], usable, status)
 
     def test_expected_trade_days_use_market_calendar_not_plain_weekdays(self) -> None:
         from unittest import mock

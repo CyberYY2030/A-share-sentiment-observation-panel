@@ -271,6 +271,48 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(marked, ["2026-07-13"])
         self.assertEqual(quality["status"], STATUS_KNOWN_BAD)
 
+    def test_ten_day_repair_plan_skips_quarantined_session_but_repairs_known_bad(self) -> None:
+        from offline_daily_update import build_missing_update_plan
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            stock_path = base / "a_share_mvp.db"
+            conn = _connect(str(stock_path))
+            try:
+                for day in (f"2026-07-{day:02d}" for day in range(1, 11)):
+                    _insert_clean_day(conn, day, count=100)
+                _insert_clean_day(conn, "2026-07-11", count=99)
+                _insert_row(conn, "2026-07-11", "601999", high=9.0)
+                for index in range(5):
+                    _insert_row(
+                        conn,
+                        "2026-07-12",
+                        f"600{index:03d}",
+                        open_price=0.0,
+                        high=0.0,
+                        low=0.0,
+                        close=0.0,
+                        pre_close=0.0,
+                        volume=0.0,
+                        amount=0.0,
+                    )
+                conn.commit()
+            finally:
+                conn.close()
+
+            plan = build_missing_update_plan(
+                base,
+                ["2026-07-11", "2026-07-12"],
+                domains=["stock"],
+                stock_min_rows=3,
+            )
+
+        coverage = plan["coverage"]
+        self.assertEqual(coverage["2026-07-11"]["session_quality"]["status"], STATUS_USABLE_WITH_QUARANTINE)
+        self.assertNotIn("2026-07-11", plan["missing_by_day"])
+        self.assertEqual(coverage["2026-07-12"]["session_quality"]["status"], STATUS_KNOWN_BAD)
+        self.assertEqual(plan["missing_by_day"]["2026-07-12"], ["stock"])
+
 
 if __name__ == "__main__":
     unittest.main()

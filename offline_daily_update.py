@@ -8,7 +8,13 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable
 
-from mining.data_quality import STATUS_BAD, STATUS_UNAVAILABLE, inspect_stock_session, mark_known_bad_session
+from mining.data_quality import (
+    STATUS_BAD,
+    STATUS_CLEAN,
+    STATUS_USABLE_WITH_QUARANTINE,
+    inspect_stock_session,
+    mark_known_bad_session,
+)
 from runtime_paths import build_runtime_paths
 
 
@@ -143,7 +149,7 @@ def stock_coverage_for_date(
         result.update(
             {
                 "stock": stock_rows >= int(stock_min_rows)
-                and session_quality["status"] in {"clean", STATUS_UNAVAILABLE},
+                and session_quality["status"] in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE},
                 "index": required.issubset(set(index_codes)),
                 "stock_rows": stock_rows,
                 "index_codes": index_codes,
