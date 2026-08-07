@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import json
 import datetime as dt
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -30,6 +31,7 @@ from ..scanners.rps_stock import (
 )
 from ..universe import build_universe
 from ..reports import compute_market_regime
+from ..quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
 from ..selection_runtime import (
     CHINA_TZ,
     MODE_CLOSE_FINAL,
@@ -37,12 +39,7 @@ from ..selection_runtime import (
     SelectionRuntime,
 )
 from ..scanners.base_breakout import evaluate_base_breakout
-from ..scanners.counter_trend_rs import (
-    PRIMARY_BENCHMARK,
-    SENSITIVITY_BENCHMARKS,
-    _load_benchmark_close,
-    evaluate_counter_trend_rs,
-)
+from ..scanners.counter_trend_rs import evaluate_counter_trend_rs
 from ..scanners.launch_burst import evaluate_compression_launch
 from ..scanners.momentum_breakout import evaluate_momentum_anomaly
 from ..scanners.strong_trend import evaluate_strong_trend
@@ -59,7 +56,7 @@ from ..playbook import lookup_playbook
 from run_daily import execute_daily_pipeline
 
 
-SnapshotLoader = Callable[[], pd.DataFrame]
+SnapshotLoader = Callable[[], QuoteSnapshotResult | pd.DataFrame]
 
 
 def _safe_float(value: object) -> float:
@@ -165,36 +162,81 @@ def _normalize_snapshot_quotes(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-def _fetch_latest_quotes() -> pd.DataFrame:
-    import akshare as ak  # type: ignore
-
-    loaders = [
-        getattr(ak, "stock_zh_a_spot", None),
-        getattr(ak, "stock_zh_a_spot_em", None),
-    ]
-    for loader in loaders:
-        if loader is None:
-            continue
-        try:
-            df = loader()
-            normalized = _normalize_snapshot_quotes(pd.DataFrame(df))
-            if not normalized.empty:
-                return normalized
-        except Exception:
-            continue
-    return pd.DataFrame()
-
-
 def _build_cached_snapshot_loader(snapshot_loader: SnapshotLoader | None = None) -> SnapshotLoader:
-    cached: pd.DataFrame | None = None
+    cached: QuoteSnapshotResult | pd.DataFrame | None = None
 
-    def _loader() -> pd.DataFrame:
+    def _copy(value: QuoteSnapshotResult | pd.DataFrame) -> QuoteSnapshotResult | pd.DataFrame:
+        if isinstance(value, QuoteSnapshotResult):
+            return replace(value, frame=value.frame.copy())
+        return value.copy()
+
+    def _loader() -> QuoteSnapshotResult | pd.DataFrame:
         nonlocal cached
         if cached is None:
-            cached = snapshot_loader() if snapshot_loader is not None else _fetch_latest_quotes()
-        return cached.copy()
+            cached = snapshot_loader() if snapshot_loader is not None else pd.DataFrame()
+        return _copy(cached)
 
     return _loader
+
+
+def _expected_snapshot_codes(base_dir: str | Path, trade_date: str) -> set[str]:
+    conn = connect(base_dir=base_dir)
+    try:
+        reference_dates = list_stock_trade_dates(conn, end_date=str(trade_date), limit=1, include_end=False)
+        reference_date = reference_dates[-1] if reference_dates else _resolve_close_trade_date(conn, str(trade_date))
+        if reference_date is None:
+            return set()
+        rows = conn.execute(
+            "SELECT DISTINCT sec_code FROM ash.kline_daily WHERE sec_type='stock' AND trade_date=?",
+            (str(reference_date),),
+        ).fetchall()
+        return {str(row[0]).zfill(6) for row in rows}
+    finally:
+        conn.close()
+
+
+def _build_quote_snapshot_loader(
+    base_dir: str | Path,
+    trade_date: str,
+    *,
+    adapter: QuoteSnapshotAdapter | None = None,
+) -> SnapshotLoader:
+    expected_codes = _expected_snapshot_codes(base_dir, trade_date)
+    resolved_adapter = adapter or QuoteSnapshotAdapter(
+        cache_dir=Path(base_dir) / "output" / "screening-v2-work" / "cache"
+    )
+
+    def _loader() -> QuoteSnapshotResult:
+        return resolved_adapter.load(
+            str(trade_date),
+            expected_codes=expected_codes,
+            now=dt.datetime.now(dt.timezone(dt.timedelta(hours=8))),
+        )
+
+    return _build_cached_snapshot_loader(_loader)
+
+
+def _quote_result(value: QuoteSnapshotResult | pd.DataFrame) -> QuoteSnapshotResult:
+    if isinstance(value, QuoteSnapshotResult):
+        return value
+    frame = _normalize_snapshot_quotes(pd.DataFrame(value))
+    status = "snapshot_usable" if not frame.empty else "empty_payload"
+    return QuoteSnapshotResult(
+        frame=frame,
+        provider="injected_loader" if not frame.empty else None,
+        observed_at=None,
+        raw_rows=len(value),
+        normalized_rows=len(frame),
+        coverage=0.0,
+        attempts=1,
+        errors=(),
+        status=status,
+        from_cache=False,
+    )
+
+
+def _snapshot_frame(value: QuoteSnapshotResult | pd.DataFrame) -> pd.DataFrame:
+    return _quote_result(value).frame.copy()
 
 
 def _snapshot_universe(conn, trade_date: str, latest_quotes: pd.DataFrame) -> pd.DataFrame:
@@ -473,7 +515,14 @@ def _filter_pullback_strength_phase(rows: pd.DataFrame, strength_tier: str | Non
     return result.reset_index(drop=True)
 
 
-def _selection_evidence(context, *, mode: str, snapshot_source: str | None, snapshot_coverage: float | None) -> dict[str, object]:
+def _selection_evidence(
+    context,
+    *,
+    mode: str,
+    snapshot_source: str | None,
+    snapshot_coverage: float | None,
+    quote_result: QuoteSnapshotResult | None = None,
+) -> dict[str, object]:
     return {
         "mode": mode,
         "as_of": context.as_of,
@@ -483,6 +532,14 @@ def _selection_evidence(context, *, mode: str, snapshot_source: str | None, snap
         "data_status": context.data_status,
         "snapshot_source": snapshot_source,
         "snapshot_coverage": snapshot_coverage,
+        "snapshot_provider": quote_result.provider if quote_result is not None else None,
+        "snapshot_status": quote_result.status if quote_result is not None else None,
+        "snapshot_observed_at": quote_result.observed_at if quote_result is not None else None,
+        "snapshot_raw_rows": quote_result.raw_rows if quote_result is not None else None,
+        "snapshot_normalized_rows": quote_result.normalized_rows if quote_result is not None else None,
+        "snapshot_errors": list(quote_result.errors) if quote_result is not None else [],
+        "snapshot_from_cache": quote_result.from_cache if quote_result is not None else False,
+        "snapshot_retry_at": quote_result.retry_at if quote_result is not None else None,
     }
 
 
@@ -613,16 +670,7 @@ def _live_formal_capability_rows(conn, context) -> tuple[pd.DataFrame, pd.DataFr
         append_failure("base_breakout", exc)
 
     try:
-        dates = [str(day) for day in context.diagnostics.get("clean_dates", [])]
-        if context.trade_date not in dates:
-            dates.append(context.trade_date)
-        primary = _load_benchmark_close(conn, dates, PRIMARY_BENCHMARK)
-        sensitivity = {code: _load_benchmark_close(conn, dates, code) for code in SENSITIVITY_BENCHMARKS}
-        rs_rows, rs_diagnostics = evaluate_counter_trend_rs(
-            context,
-            primary_benchmark=primary,
-            sensitivity_benchmarks=sensitivity,
-        )
+        rs_rows, rs_diagnostics = evaluate_counter_trend_rs(context)
         append_evaluation("counter_trend_rs", rs_rows, rs_diagnostics)
     except Exception as exc:
         append_failure("counter_trend_rs", exc)
@@ -645,15 +693,23 @@ def _formal_capability_view(
     resolved_runtime = runtime or SelectionRuntime()
     snapshot = None
     snapshot_source = None
+    snapshot_as_of = None
+    quote_result = None
     if str(inspect_stock_session(conn, trade_date).get("status")) != STATUS_CLEAN and snapshot_loader is not None:
-        snapshot = _normalize_snapshot_quotes(snapshot_loader())
-        snapshot_source = "akshare_stock_spot"
+        quote_result = _quote_result(snapshot_loader())
+        if quote_result.observed_at is None:
+            quote_result = replace(quote_result, observed_at=current.isoformat())
+        if quote_result.status in {"snapshot_usable", "snapshot_cache_fallback"}:
+            snapshot = quote_result.frame.copy()
+            snapshot_source = quote_result.provider
+            snapshot_as_of = quote_result.observed_at
     result = resolved_runtime.run(
         conn,
         trade_date,
         now=current,
         snapshot_bars=snapshot,
-        snapshot_as_of=current if snapshot is not None and not snapshot.empty else None,
+        snapshot_benchmark_closes=quote_result.benchmark_closes if quote_result is not None else None,
+        snapshot_as_of=snapshot_as_of if snapshot is not None and not snapshot.empty else None,
         snapshot_source=snapshot_source,
     )
     context = result.context
@@ -664,6 +720,7 @@ def _formal_capability_view(
         mode=result.mode,
         snapshot_source=result.snapshot_source,
         snapshot_coverage=result.snapshot_coverage,
+        quote_result=quote_result,
     )
     if result.mode == MODE_CLOSE_FINAL:
         return _load_formal_capability_candidates(conn, trade_date), _capability_run_status(conn, trade_date), evidence
@@ -754,11 +811,7 @@ def _load_latest_quote_opportunities(
     snapshot_loader: SnapshotLoader | None = None,
 ) -> tuple[pd.DataFrame, bool]:
     try:
-        latest_quotes = (
-            _normalize_snapshot_quotes(snapshot_loader())
-            if snapshot_loader is not None
-            else _fetch_latest_quotes()
-        )
+        latest_quotes = _snapshot_frame(snapshot_loader()) if snapshot_loader is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame(), False
     if latest_quotes.empty:
@@ -796,11 +849,7 @@ def _load_latest_quote_price_map(
     sec_codes: list[str] | None = None,
 ) -> dict[str, float]:
     try:
-        latest_quotes = (
-            _normalize_snapshot_quotes(snapshot_loader())
-            if snapshot_loader is not None
-            else _fetch_latest_quotes()
-        )
+        latest_quotes = _snapshot_frame(snapshot_loader()) if snapshot_loader is not None else pd.DataFrame()
     except Exception:
         return {}
     if latest_quotes.empty:
@@ -1450,11 +1499,18 @@ def render_scanner_tab(
             st.session_state[sync_key] = fallback_trade_date
 
     query_trade_date = latest_quote_trade_date or fallback_trade_date
-    shared_snapshot_loader = (
-        _build_cached_snapshot_loader()
-        if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes)
-        else None
-    )
+    shared_snapshot_loader = None
+    if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes):
+        adapter_key = f"quote_snapshot_adapter_{query_trade_date}"
+        if adapter_key not in st.session_state:
+            st.session_state[adapter_key] = QuoteSnapshotAdapter(
+                cache_dir=Path(base_dir) / "output" / "screening-v2-work" / "cache"
+            )
+        shared_snapshot_loader = _build_quote_snapshot_loader(
+            base_dir,
+            query_trade_date,
+            adapter=st.session_state[adapter_key],
+        )
     today_df, today_date = load_latest_opportunities(
         base_dir=base_dir,
         trade_date=query_trade_date,

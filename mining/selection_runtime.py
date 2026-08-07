@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import sqlite3
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -130,6 +131,7 @@ class SelectionRuntime:
         *,
         now: dt.datetime,
         snapshot_bars: pd.DataFrame | None = None,
+        snapshot_benchmark_closes: Mapping[str, object] | None = None,
         snapshot_as_of: str | dt.datetime | None = None,
         snapshot_source: str | None = None,
         finalizer: Callable[[SelectionContext], Any] | None = None,
@@ -198,6 +200,7 @@ class SelectionRuntime:
                 snapshot_names=snapshot_names,
                 clean_dates=clean_baseline_dates,
                 current_bars=snapshot,
+                current_benchmark_closes=snapshot_benchmark_closes,
                 allow_missing_activity=True,
             )
             context.diagnostics.update(

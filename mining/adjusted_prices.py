@@ -128,6 +128,72 @@ def _flush_segment(segment: list[dict[str, Any]], output: pd.DataFrame) -> None:
     ) * factor_series
 
 
+def _apply_simple_valid_trade_adjustments(
+    output: pd.DataFrame,
+    *,
+    price_tick: float,
+    min_step_ratio: float,
+    max_step_ratio: float,
+) -> tuple[set[str], int]:
+    """Vectorize codes whose rows never need the quarantine/fallback path."""
+    numeric = {column: pd.to_numeric(output[column], errors="coerce") for column in (*PRICE_COLUMNS, "pre_close")}
+    codes = output["sec_code"]
+    starts = output.groupby("sec_code", sort=False).cumcount().eq(0)
+    previous_close = numeric["close"].groupby(codes, sort=False).shift()
+    reported_pre_close = numeric["pre_close"].gt(0) & np.isfinite(numeric["pre_close"])
+    missing_pre_close = numeric["pre_close"].isna()
+    effective_pre_close = numeric["pre_close"].where(reported_pre_close, previous_close).where(~starts, numeric["close"])
+    raw_ratio = effective_pre_close / previous_close
+    tick_sized = (effective_pre_close - previous_close).abs().le(
+        np.maximum(float(price_tick), previous_close * 1e-9)
+    )
+    steps = raw_ratio.where(~tick_sized, 1.0).where(~starts, 1.0)
+    valid_step = (
+        starts
+        | (
+            (reported_pre_close | missing_pre_close)
+            & np.isfinite(previous_close)
+            & np.isfinite(steps)
+            & steps.between(float(min_step_ratio), float(max_step_ratio), inclusive="both")
+        )
+    )
+    simple_rows = output["row_status"].eq("valid_trade") & valid_step
+    simple_codes = set(codes.loc[simple_rows.groupby(codes, sort=False).transform("all")].astype(str))
+    if not simple_codes:
+        return set(), 0
+
+    fast = output.loc[output["sec_code"].isin(simple_codes)].copy()
+    fast_starts = fast.groupby("sec_code", sort=False).cumcount().eq(0)
+    fast_previous_close = numeric["close"].loc[fast.index].groupby(fast["sec_code"], sort=False).shift()
+    fast_reported_pre_close = reported_pre_close.loc[fast.index]
+    fast_effective_pre_close = numeric["pre_close"].loc[fast.index].where(
+        fast_reported_pre_close, fast_previous_close
+    ).where(~fast_starts, numeric["close"].loc[fast.index])
+    fast_raw_ratio = fast_effective_pre_close / fast_previous_close
+    fast_tick_sized = (fast_effective_pre_close - fast_previous_close).abs().le(
+        np.maximum(float(price_tick), fast_previous_close * 1e-9)
+    )
+    fast_steps = fast_raw_ratio.where(~fast_tick_sized, 1.0).where(~fast_starts, 1.0)
+    future_products = fast_steps.iloc[::-1].groupby(fast["sec_code"].iloc[::-1], sort=False).cumprod().iloc[::-1]
+    factors = future_products / fast_steps
+    segment_starts = fast.groupby("sec_code", sort=False)["trade_date"].transform("first").astype(str)
+
+    output.loc[fast.index, "adjustment_factor"] = factors
+    output.loc[fast.index, "adjustment_valid"] = True
+    output.loc[fast.index, "valid_adjusted_bar"] = True
+    output.loc[fast.index, "latest_valid_segment_start"] = segment_starts
+    output.loc[fast.index, "adjustment_pre_close_source"] = np.where(
+        fast_starts,
+        "segment_anchor",
+        np.where(fast_reported_pre_close, "reported", "previous_valid_close"),
+    )
+    for column in PRICE_COLUMNS:
+        output.loc[fast.index, f"adj_{column}"] = numeric[column].loc[fast.index] * factors
+    output.loc[fast.index, "adj_pre_close"] = fast_effective_pre_close * factors
+    fallback_count = int((~fast_starts & ~fast_reported_pre_close).sum())
+    return simple_codes, fallback_count
+
+
 def build_forward_adjusted_bars(
     bars: pd.DataFrame,
     *,
@@ -184,7 +250,17 @@ def build_forward_adjusted_bars(
     reasons: Counter[str] = Counter(duplicate_counts)
     fallback_counts: Counter[str] = Counter()
     invalid_code_reasons: dict[str, list[str]] = {}
+    simple_codes, simple_fallback_count = _apply_simple_valid_trade_adjustments(
+        output,
+        price_tick=price_tick,
+        min_step_ratio=min_step_ratio,
+        max_step_ratio=max_step_ratio,
+    )
+    if simple_fallback_count:
+        fallback_counts["missing_pre_close_used_previous_valid_close"] += simple_fallback_count
     for code, group in output.groupby("sec_code", sort=False):
+        if str(code) in simple_codes:
+            continue
         segment: list[dict[str, Any]] = []
         indexes = group.index.to_list()
         statuses = group["row_status"].astype(str).tolist()

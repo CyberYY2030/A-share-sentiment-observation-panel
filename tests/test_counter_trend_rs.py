@@ -54,17 +54,14 @@ def _rs_context() -> tuple[SelectionContext, pd.Series, dict[str, pd.Series]]:
     )
     primary = pd.Series(benchmark_values, index=dates)
     sensitivity = {code: primary * multiplier for code, multiplier in zip(SENSITIVITY_BENCHMARKS, (1.0, 1.1, 0.9), strict=True)}
+    context.benchmark_closes = {PRIMARY_BENCHMARK: primary, **sensitivity}
     return context, primary, sensitivity
 
 
 class CounterTrendRsTests(unittest.TestCase):
     def test_fixed_weak_primary_accepts_absolute_up_and_reports_sensitivities(self) -> None:
         context, primary, sensitivity = _rs_context()
-        rows, diagnostics = evaluate_counter_trend_rs(
-            context,
-            primary_benchmark=primary,
-            sensitivity_benchmarks=sensitivity,
-        )
+        rows, diagnostics = evaluate_counter_trend_rs(context)
         self.assertEqual(rows["sec_code"].tolist(), ["600001"])
         self.assertGreater(float(rows.iloc[0]["rs_breakout_pct"]), 0.001)
         self.assertEqual(rows.iloc[0]["primary_benchmark"], PRIMARY_BENCHMARK)
@@ -75,19 +72,21 @@ class CounterTrendRsTests(unittest.TestCase):
         context, primary, sensitivity = _rs_context()
         rising = primary.copy()
         rising.iloc[-21:] = pd.Series(range(1000, 1021), index=rising.index[-21:])
-        rows, diagnostics = evaluate_counter_trend_rs(context, primary_benchmark=rising, sensitivity_benchmarks=sensitivity)
+        context.benchmark_closes[PRIMARY_BENCHMARK] = rising
+        rows, diagnostics = evaluate_counter_trend_rs(context)
         self.assertTrue(rows.empty)
         self.assertEqual(diagnostics["skipped_reason_counts"], {"primary_benchmark_not_weak": 2})
 
     def test_stock_that_only_falls_less_is_rejected(self) -> None:
         context, primary, sensitivity = _rs_context()
-        rows, diagnostics = evaluate_counter_trend_rs(context, primary_benchmark=primary, sensitivity_benchmarks=sensitivity)
+        rows, diagnostics = evaluate_counter_trend_rs(context)
         self.assertNotIn("600002", set(rows["sec_code"]))
         self.assertEqual(diagnostics["skipped_reason_counts"]["stock_not_absolutely_up"], 1)
 
     def test_missing_primary_benchmark_day_is_not_forward_filled(self) -> None:
         context, primary, sensitivity = _rs_context()
         missing = primary.drop(primary.index[-10])
-        rows, diagnostics = evaluate_counter_trend_rs(context, primary_benchmark=missing, sensitivity_benchmarks=sensitivity)
+        context.benchmark_closes[PRIMARY_BENCHMARK] = missing
+        rows, diagnostics = evaluate_counter_trend_rs(context)
         self.assertTrue(rows.empty)
         self.assertEqual(diagnostics["skipped_reason_counts"], {"primary_benchmark_missing_or_invalid": 2})

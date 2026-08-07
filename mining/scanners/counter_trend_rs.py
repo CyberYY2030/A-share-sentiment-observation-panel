@@ -1,9 +1,8 @@
 from __future__ import annotations
 
-import math
 import sqlite3
 from collections import Counter
-from typing import Any, Mapping
+from typing import Any
 
 import pandas as pd
 
@@ -24,12 +23,7 @@ def _as_series(values: pd.Series | None, dates: list[str]) -> pd.Series:
     return series.reindex(dates)
 
 
-def evaluate_counter_trend_rs(
-    context: SelectionContext,
-    *,
-    primary_benchmark: pd.Series | None,
-    sensitivity_benchmarks: Mapping[str, pd.Series] | None = None,
-) -> tuple[pd.DataFrame, dict[str, Any]]:
+def evaluate_counter_trend_rs(context: SelectionContext) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Formal E capability with a fixed primary benchmark and report-only sensitivities."""
     clean_dates = [str(value) for value in context.diagnostics.get("clean_dates", [])]
     dates = list(clean_dates)
@@ -55,7 +49,7 @@ def evaluate_counter_trend_rs(
     if len(dates) < max(61, profile.long_window + 1):
         diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
         return pd.DataFrame(columns=output_columns), diagnostics
-    benchmark = _as_series(primary_benchmark, dates)
+    benchmark = _as_series(context.benchmark_closes.get(PRIMARY_BENCHMARK), dates)
     if benchmark.isna().any() or (benchmark <= 0).any():
         diagnostics["skipped_reason_counts"] = {"primary_benchmark_missing_or_invalid": len(context.universe)}
         return pd.DataFrame(columns=output_columns), diagnostics
@@ -68,7 +62,8 @@ def evaluate_counter_trend_rs(
     down_dates = benchmark_returns.iloc[-20:][benchmark_returns.iloc[-20:] < 0].index.tolist()
     sensitivity_returns = {
         code: float(series.iloc[-1] / series.iloc[-21] - 1.0)
-        for code, values in (sensitivity_benchmarks or {}).items()
+        for code, values in context.benchmark_closes.items()
+        if code in SENSITIVITY_BENCHMARKS
         for series in [_as_series(values, dates)]
         if not series.isna().any() and (series > 0).all()
     }
@@ -80,55 +75,59 @@ def evaluate_counter_trend_rs(
         if "sec_name" in context.universe.columns
         else {}
     )
+    bars = context.bars.copy()
+    bars["sec_code"] = bars["sec_code"].astype(str).str.zfill(6)
+    bars["trade_date"] = bars["trade_date"].astype(str)
+    codes = context.universe["sec_code"].astype(str).str.zfill(6).drop_duplicates().tolist()
+    close = bars.pivot(index="trade_date", columns="sec_code", values="adj_close").reindex(index=dates, columns=codes)
+    change_pct = bars.pivot(index="trade_date", columns="sec_code", values="change_pct").reindex(index=dates, columns=codes)
+    close = close.apply(pd.to_numeric, errors="coerce")
+    change_pct = change_pct.apply(pd.to_numeric, errors="coerce")
+    required_window = max(61, profile.long_window + 1)
+    complete_window = close.iloc[-required_window:].notna().all(axis=0) & change_pct.iloc[-1].notna()
+    stock_ret20 = close.iloc[-1] / close.iloc[-21] - 1.0
+    stock_up = stock_ret20.gt(0)
+    rs = close.div(benchmark, axis="index")
+    historical_rs_high = rs.iloc[-61:-1].max(axis=0)
+    rs_breakout_pct = rs.iloc[-1] / historical_rs_high - 1.0
+    ma20_rs = rs.rolling(20, min_periods=20).mean()
+    rs_trend_ok = rs.iloc[-1].gt(ma20_rs.iloc[-1]) & ma20_rs.iloc[-1].gt(ma20_rs.iloc[-11])
+    ma_middle = close.rolling(profile.middle_window, min_periods=profile.middle_window).mean()
+    ma_long = close.rolling(profile.long_window, min_periods=profile.long_window).mean()
+    price_trend_ok = close.iloc[-1].gt(ma_middle.iloc[-1]) & close.iloc[-1].gt(ma_long.iloc[-1])
+    stock_returns = close.pct_change(fill_method=None)
+    aligned = stock_returns.reindex(down_dates).notna().all(axis=0) if down_dates else pd.Series(True, index=codes)
+    separation_raw = (
+        stock_returns.reindex(down_dates).sub(benchmark_returns.reindex(down_dates), axis="index").mean(axis=0)
+        if down_dates
+        else pd.Series(0.0, index=codes)
+    )
+    qualifies = (
+        rs_breakout_pct.ge(0.001)
+        & rs_trend_ok
+        & price_trend_ok
+        & change_pct.iloc[-1].gt(0)
+    )
+    eligible = complete_window & stock_up & aligned & qualifies
     skipped = Counter()
-    rows: list[dict[str, Any]] = []
-    for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
-        indexed = frame.assign(trade_date=frame["trade_date"].astype(str)).set_index("trade_date").reindex(dates)
-        close = pd.to_numeric(indexed.get("adj_close"), errors="coerce")
-        change_pct = pd.to_numeric(indexed.get("change_pct"), errors="coerce")
-        if close.isna().iloc[-max(61, profile.long_window + 1) :].any() or change_pct.isna().iloc[-1]:
-            skipped["stock_window_missing"] += 1
-            continue
-        stock_ret20 = float(close.iloc[-1] / close.iloc[-21] - 1.0)
-        if stock_ret20 <= 0:
-            skipped["stock_not_absolutely_up"] += 1
-            continue
-        rs = close / benchmark
-        historical_rs_high = float(rs.iloc[-61:-1].max())
-        rs_breakout_pct = float(rs.iloc[-1] / historical_rs_high - 1.0) if historical_rs_high > 0 else math.nan
-        ma20_rs = rs.rolling(20, min_periods=20).mean()
-        rs_trend_ok = float(rs.iloc[-1]) > float(ma20_rs.iloc[-1]) and float(ma20_rs.iloc[-1]) > float(ma20_rs.iloc[-11])
-        ma_middle = close.rolling(profile.middle_window, min_periods=profile.middle_window).mean()
-        ma_long = close.rolling(profile.long_window, min_periods=profile.long_window).mean()
-        price_trend_ok = float(close.iloc[-1]) > float(ma_middle.iloc[-1]) and float(close.iloc[-1]) > float(ma_long.iloc[-1])
-        stock_returns = close.pct_change(fill_method=None).reindex(down_dates)
-        if stock_returns.isna().any():
-            skipped["benchmark_down_day_alignment_missing"] += 1
-            continue
-        separation_raw = float((stock_returns - benchmark_returns.reindex(down_dates)).mean()) if down_dates else 0.0
-        qualifies = (
-            rs_breakout_pct >= 0.001
-            and rs_trend_ok
-            and price_trend_ok
-            and float(change_pct.iloc[-1]) > 0
-        )
-        if not qualifies:
-            skipped["counter_trend_gate_failed"] += 1
-            continue
-        rows.append(
-            {
-                "sec_code": code,
-                "sec_name": names.get(code, code),
-                "reference_price": float(close.iloc[-1]),
-                "rs_ret20": float(rs.iloc[-1] / rs.iloc[-21] - 1.0),
-                "rs_breakout_pct": rs_breakout_pct,
-                "separation_raw": separation_raw,
-                "trend_profile": profile.profile_id,
-                "primary_benchmark": PRIMARY_BENCHMARK,
-                "sensitivity_returns_20": sensitivity_returns,
-            }
-        )
-    result = pd.DataFrame(rows, columns=output_columns[:6] + output_columns[9:])
+    skipped["stock_window_missing"] = int((~complete_window).sum())
+    skipped["stock_not_absolutely_up"] = int((complete_window & ~stock_up).sum())
+    skipped["benchmark_down_day_alignment_missing"] = int((complete_window & stock_up & ~aligned).sum())
+    skipped["counter_trend_gate_failed"] = int((complete_window & stock_up & aligned & ~qualifies).sum())
+    result = pd.DataFrame(
+        {
+            "sec_code": [code for code in codes if bool(eligible.get(code, False))],
+        }
+    )
+    if not result.empty:
+        result["sec_name"] = result["sec_code"].map(names).fillna(result["sec_code"])
+        result["reference_price"] = result["sec_code"].map(close.iloc[-1])
+        result["rs_ret20"] = result["sec_code"].map(rs.iloc[-1] / rs.iloc[-21] - 1.0)
+        result["rs_breakout_pct"] = result["sec_code"].map(rs_breakout_pct)
+        result["separation_raw"] = result["sec_code"].map(separation_raw)
+        result["trend_profile"] = profile.profile_id
+        result["primary_benchmark"] = PRIMARY_BENCHMARK
+        result["sensitivity_returns_20"] = [sensitivity_returns] * len(result)
     if not result.empty:
         result["rs_ret20_pct"] = cross_section_percentile(result["rs_ret20"])
         result["rs_breakout_pct_rank"] = cross_section_percentile(result["rs_breakout_pct"])
@@ -141,33 +140,8 @@ def evaluate_counter_trend_rs(
     return result.reindex(columns=output_columns), diagnostics
 
 
-def _load_benchmark_close(conn: sqlite3.Connection, dates: list[str], code: str) -> pd.Series:
-    if not dates:
-        return pd.Series(dtype="float64")
-    marks = ",".join("?" for _ in dates)
-    frame = pd.read_sql_query(
-        f"""
-        SELECT trade_date, close
-        FROM ash.kline_daily
-        WHERE sec_type='index' AND sec_code=? AND trade_date IN ({marks})
-        """,
-        conn,
-        params=[str(code), *dates],
-    )
-    return pd.to_numeric(frame.set_index("trade_date")["close"], errors="coerce") if not frame.empty else pd.Series(dtype="float64")
-
-
-def select_counter_trend_rs_from_context(
-    context: SelectionContext,
-    *,
-    primary_benchmark: pd.Series | None,
-    sensitivity_benchmarks: Mapping[str, pd.Series] | None = None,
-) -> list[Candidate]:
-    rows, _ = evaluate_counter_trend_rs(
-        context,
-        primary_benchmark=primary_benchmark,
-        sensitivity_benchmarks=sensitivity_benchmarks,
-    )
+def select_counter_trend_rs_from_context(context: SelectionContext) -> list[Candidate]:
+    rows, _ = evaluate_counter_trend_rs(context)
     return [
         Candidate(
             strategy_id=CounterTrendRsScanner.strategy_id,
@@ -195,13 +169,4 @@ class CounterTrendRsScanner(Scanner):
     def run(self, conn: sqlite3.Connection, trade_date: str) -> list[Candidate]:
         context = build_selection_context(conn, trade_date, mode="close_final")
         self.last_universe_size = len(context.universe)
-        dates = [str(value) for value in context.diagnostics.get("clean_dates", [])]
-        if str(trade_date) not in dates:
-            dates.append(str(trade_date))
-        primary = _load_benchmark_close(conn, dates, PRIMARY_BENCHMARK)
-        sensitivity = {code: _load_benchmark_close(conn, dates, code) for code in SENSITIVITY_BENCHMARKS}
-        return select_counter_trend_rs_from_context(
-            context,
-            primary_benchmark=primary,
-            sensitivity_benchmarks=sensitivity,
-        )
+        return select_counter_trend_rs_from_context(context)

@@ -175,11 +175,15 @@ def build_selection_universe(
         if current_bars is None
         else {"trade_date": str(trade_date), "status": STATUS_UNAVAILABLE, "reasons": ["intraday_snapshot"]}
     )
-    price_status = {
-        STATUS_CLEAN: "ready",
-        STATUS_USABLE_WITH_QUARANTINE: "ready",
-        STATUS_PARTIAL: "partial",
-    }.get(str(quality["status"]), "unavailable")
+    price_status = (
+        "ready"
+        if current_bars is not None
+        else {
+            STATUS_CLEAN: "ready",
+            STATUS_USABLE_WITH_QUARANTINE: "ready",
+            STATUS_PARTIAL: "partial",
+        }.get(str(quality["status"]), "unavailable")
+    )
     diagnostics: dict[str, Any] = {"session_quality": quality, "price_status": price_status}
     if price_status != "ready" and current_bars is None:
         return _empty_selection_result(

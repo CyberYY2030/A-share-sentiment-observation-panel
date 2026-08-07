@@ -39,7 +39,7 @@ def _event_context(*, mode: str = "close_final", activity: bool = True) -> Selec
                     "adj_close": close,
                     "change_pct": (close / previous_close - 1.0) * 100.0,
                     "turnover_ratio": turnover if activity else None,
-                    "amount": 10.0 if activity else None,
+                    "amount": turnover * 1_000_000.0 if activity else None,
                     "volume": 1_000_000.0,
                 }
             )
@@ -63,7 +63,7 @@ class EventActivityV2Tests(unittest.TestCase):
         context = _event_context()
         activity = build_event_activity(context)
         row = activity.rows.set_index("sec_code").loc["600001"]
-        self.assertAlmostEqual(float(row["activity_ratio"]), 100.0 / 87.5)
+        self.assertAlmostEqual(float(row["activity_ratio"]), 1.0)
 
         rows, diagnostics = evaluate_compression_launch(context)
         self.assertEqual(set(rows["sec_code"]), {"600001", "300001"})
@@ -76,12 +76,14 @@ class EventActivityV2Tests(unittest.TestCase):
         self.assertTrue(rows.empty)
         self.assertEqual(diagnostics["skipped_reason_counts"], {"activity_missing": 2})
 
-    def test_intraday_activity_uses_current_cross_sectional_percentiles(self) -> None:
+    def test_intraday_activity_keeps_median_ratio_and_marks_provisional(self) -> None:
         activity = build_event_activity(_event_context(mode="intraday_snapshot"))
         values = activity.rows.set_index("sec_code")
-        self.assertTrue(values["activity_ratio"].isna().all())
+        self.assertAlmostEqual(float(values.at["600001", "activity_ratio"]), 1.0)
+        self.assertAlmostEqual(float(values.at["300001", "activity_ratio"]), 1.6)
         self.assertAlmostEqual(float(values.at["600001", "activity_pct"]), 0.5)
         self.assertAlmostEqual(float(values.at["300001", "activity_pct"]), 1.0)
+        self.assertTrue(values["activity_provisional"].all())
 
     def test_snapshot_t_bar_is_included_but_not_in_close_baseline(self) -> None:
         context = _event_context(mode="intraday_snapshot")
@@ -93,4 +95,16 @@ class EventActivityV2Tests(unittest.TestCase):
         context.trade_date = snapshot_date
         activity = build_event_activity(context).rows.set_index("sec_code")
         self.assertEqual(set(activity.index), {"600001", "300001"})
-        self.assertTrue(activity["activity_ratio"].isna().all())
+        self.assertTrue(activity["activity_ratio"].notna().all())
+
+    def test_batch_source_falls_back_without_mixing_amount_and_turnover(self) -> None:
+        context = _event_context()
+        context.bars.loc[
+            (context.bars["sec_code"].eq("300001"))
+            & (context.bars["trade_date"].eq(context.trade_date)),
+            "amount",
+        ] = None
+
+        activity = build_event_activity(context).rows
+
+        self.assertEqual(set(activity["activity_source"]), {"turnover_ratio"})

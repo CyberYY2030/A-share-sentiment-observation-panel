@@ -93,7 +93,12 @@ class ScreeningCapabilityRegistryTests(unittest.TestCase):
         evidence = _selection_evidence(context, mode="intraday_snapshot", snapshot_source="unit", snapshot_coverage=0.9)
         self.assertEqual(
             set(evidence),
-            {"mode", "as_of", "price_as_of", "metadata_as_of", "trend_profile", "data_status", "snapshot_source", "snapshot_coverage"},
+            {
+                "mode", "as_of", "price_as_of", "metadata_as_of", "trend_profile", "data_status",
+                "snapshot_source", "snapshot_coverage", "snapshot_provider", "snapshot_status",
+                "snapshot_observed_at", "snapshot_raw_rows", "snapshot_normalized_rows", "snapshot_errors",
+                "snapshot_from_cache", "snapshot_retry_at",
+            },
         )
 
     def test_snapshot_view_recomputes_all_capabilities_without_writing_official_rows(self) -> None:

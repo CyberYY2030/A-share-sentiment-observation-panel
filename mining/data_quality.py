@@ -4,6 +4,7 @@ import datetime as dt
 import math
 import sqlite3
 from collections import Counter
+from itertools import groupby
 from statistics import median
 from typing import Any, Iterable, Mapping
 
@@ -405,7 +406,22 @@ def inspect_stock_sessions(
         str(row[0])
         for row in conn.execute(f"SELECT DISTINCT trade_date FROM {_kline_table(conn)} {where} ORDER BY trade_date", params).fetchall()
     ]
-    summaries = {day: _raw_session_summary(_session_rows(conn, day)) for day in dates}
+    row_cursor = conn.execute(
+        f"""
+        SELECT sec_code, trade_date, open, high, low, close, pre_close, volume, amount
+        FROM {_kline_table(conn)}
+        {where}
+        ORDER BY trade_date
+        """,
+        params,
+    )
+    summaries = {
+        day: _raw_session_summary(rows)
+        for day, rows in (
+            (day, list(group))
+            for day, group in groupby(row_cursor, key=lambda row: str(row["trade_date"]))
+        )
+    }
     try:
         manual_known_bad = {
             str(row[0]): row

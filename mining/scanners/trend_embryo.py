@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from ..db import list_stock_trade_dates
@@ -23,6 +24,10 @@ def build_v2_path_context(context: SelectionContext) -> pd.DataFrame:
     ]
     if context.bars.empty or context.universe.empty:
         return pd.DataFrame(columns=columns)
+    cache_key = "v2_path_context"
+    cached = context.evaluation_cache.get(cache_key)
+    if cached is not None:
+        return cached.copy()
     board_by_code = (
         context.universe.assign(sec_code=context.universe["sec_code"].astype(str).str.zfill(6))
         .set_index("sec_code")["board"]
@@ -30,38 +35,41 @@ def build_v2_path_context(context: SelectionContext) -> pd.DataFrame:
         if "board" in context.universe.columns
         else {}
     )
-    rows: list[dict[str, object]] = []
-    for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
-        recent = frame.sort_values("trade_date", kind="stable").tail(5).copy()
-        if len(recent) < 5:
-            continue
-        changes = pd.to_numeric(recent.get("change_pct"), errors="coerce")
-        board = board_by_code.get(code)
-        limit_up_count = (
-            int(sum(is_limit_up(row.close, row.pre_close, board) for row in recent[["close", "pre_close"]].itertuples(index=False)))
-            if board and {"close", "pre_close"}.issubset(recent.columns)
-            else 0
-        )
-        small_yang = int((changes.gt(0) & changes.lt(5.0)).sum())
-        max_change = float(changes.max()) if changes.notna().any() else float("nan")
-        if limit_up_count >= 2:
-            label = "已过度延伸"
-        elif limit_up_count >= 1 or (pd.notna(max_change) and max_change >= 8.0):
-            label = "加速"
-        elif small_yang >= 3:
-            label = "蓄势"
-        else:
-            label = "常态"
-        rows.append(
-            {
-                "sec_code": code,
-                "limit_up_count_5d": limit_up_count,
-                "small_yang_count": small_yang,
-                "single_day_max_change": max_change,
-                "path_context": label,
-            }
-        )
-    return pd.DataFrame(rows, columns=columns)
+    recent = context.bars.copy()
+    recent["sec_code"] = recent["sec_code"].astype(str).str.zfill(6)
+    recent = recent.sort_values(["sec_code", "trade_date"], kind="stable").groupby("sec_code", sort=True).tail(5)
+    recent = recent[recent.groupby("sec_code", sort=False)["sec_code"].transform("size").eq(5)].copy()
+    if recent.empty:
+        return pd.DataFrame(columns=columns)
+    changes = pd.to_numeric(recent.get("change_pct"), errors="coerce")
+    close = pd.to_numeric(recent.get("close"), errors="coerce")
+    pre_close = pd.to_numeric(recent.get("pre_close"), errors="coerce")
+    rates = recent["sec_code"].map(lambda code: 1.2 if board_by_code.get(code) in {"gem", "star"} else 1.1)
+    recent["_limit_up"] = (
+        close.notna() & pre_close.notna() & close.gt(0) & pre_close.gt(0)
+        & close.ge((pre_close * rates).round(2) - 0.01)
+    )
+    recent["_small_yang"] = changes.gt(0) & changes.lt(5.0)
+    recent["_change"] = changes
+    result = recent.groupby("sec_code", sort=True).agg(
+        limit_up_count_5d=("_limit_up", "sum"),
+        small_yang_count=("_small_yang", "sum"),
+        single_day_max_change=("_change", "max"),
+    ).reset_index()
+    result["limit_up_count_5d"] = result["limit_up_count_5d"].astype(int)
+    result["small_yang_count"] = result["small_yang_count"].astype(int)
+    result["path_context"] = np.select(
+        [
+            result["limit_up_count_5d"].ge(2),
+            result["limit_up_count_5d"].ge(1) | result["single_day_max_change"].ge(8.0),
+            result["small_yang_count"].ge(3),
+        ],
+        ["已过度延伸", "加速", "蓄势"],
+        default="常态",
+    )
+    result = result.reindex(columns=columns)
+    context.evaluation_cache[cache_key] = result
+    return result.copy()
 
 
 def _load_stock_history(conn: sqlite3.Connection, sec_codes: list[str], dates: list[str]) -> pd.DataFrame:
