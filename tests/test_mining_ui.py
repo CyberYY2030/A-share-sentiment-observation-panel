@@ -45,11 +45,10 @@ class MiningUiSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(today_date, dates["next_trade_date"])
-        self.assertIn("strategy_id", today_df.columns)
+        self.assertTrue(today_df.empty)
         self.assertEqual(previous_date, dates["target_trade_date"])
         self.assertEqual(current_date, dates["next_trade_date"])
-        self.assertFalse(follow_df.empty)
-        self.assertIn("today_change_pct", follow_df.columns)
+        self.assertTrue(follow_df.empty)
 
     def test_opportunity_panel_uses_intraday_snapshot_for_today_and_followups(self) -> None:
         import pandas as pd
@@ -117,13 +116,10 @@ class MiningUiSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(today_date, snapshot_today)
-        self.assertFalse(today_df.empty)
-        self.assertIn("600001", set(today_df["sec_code"]))
+        self.assertTrue(today_df.empty)
         self.assertEqual(previous_date, dates["target_trade_date"])
         self.assertEqual(current_date, snapshot_today)
-        self.assertFalse(follow_df.empty)
-        alpha = follow_df[follow_df["sec_code"] == "600001"].iloc[0]
-        self.assertAlmostEqual(alpha["today_change_pct"], (16.8 / 15.6 - 1.0) * 100.0, places=4)
+        self.assertTrue(follow_df.empty)
 
     def test_opportunity_panel_prefers_latest_quotes_outside_trading_hours(self) -> None:
         import pandas as pd
@@ -186,7 +182,7 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertFalse(today_df.empty)
         self.assertEqual(current_date, latest_quote_date)
         self.assertEqual(previous_date, dates["target_trade_date"])
-        self.assertFalse(follow_df.empty)
+        self.assertTrue(follow_df.empty)
 
     def test_after_close_prefers_latest_close_data_over_quotes_when_close_is_available(self) -> None:
         import pandas as pd
@@ -235,12 +231,10 @@ class MiningUiSmokeTests(unittest.TestCase):
             )
 
         self.assertEqual(today_date, dates["next_trade_date"])
-        self.assertFalse(today_df.empty)
-        self.assertIn("rps_stock_top20", set(today_df["strategy_id"]))
+        self.assertTrue(today_df.empty)
         self.assertEqual(previous_date, dates["target_trade_date"])
         self.assertEqual(current_date, dates["next_trade_date"])
-        self.assertFalse(follow_df.empty)
-        self.assertEqual(set(follow_df["status"]), {"日线收盘"})
+        self.assertTrue(follow_df.empty)
 
     def test_force_latest_quotes_uses_quotes_even_when_close_is_available(self) -> None:
         import pandas as pd
@@ -317,8 +311,7 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertEqual(today_date, dates["next_trade_date"])
         self.assertEqual(previous_date, dates["target_trade_date"])
         self.assertEqual(current_date, dates["next_trade_date"])
-        self.assertFalse(follow_df.empty)
-        self.assertEqual(set(follow_df["status"]), {"最新价格"})
+        self.assertTrue(follow_df.empty)
 
     def test_intraday_momentum_prefilter_limits_history_lookup_codes(self) -> None:
         import pandas as pd
@@ -388,7 +381,7 @@ class MiningUiSmokeTests(unittest.TestCase):
                 )
 
         self.assertEqual(today_date, dates["next_trade_date"])
-        self.assertFalse(today_df.empty)
+        self.assertTrue(today_df.empty)
         self.assertTrue(requested_codes)
         self.assertEqual(requested_codes[0], {"600001", "300001"})
 
@@ -522,14 +515,12 @@ class MiningUiSmokeTests(unittest.TestCase):
                 "rps_stock_top20",
                 "trend_embryo",
                 "true_leader",
-                "second_launch",
                 "launch_burst",
             },
         )
         display = _prepare_today_display(loaded)
         self.assertIn("强趋势胚子", set(display["来源"]))
         self.assertIn("真龙/中军", set(display["来源"]))
-        self.assertIn("二次启动低吸", set(display["来源"]))
         self.assertIn("主升启动", set(display["来源"]))
 
     def test_formal_loader_reads_only_current_complete_batch(self) -> None:

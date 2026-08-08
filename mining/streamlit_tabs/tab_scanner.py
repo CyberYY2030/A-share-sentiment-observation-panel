@@ -38,6 +38,7 @@ from ..scanners.rps_stock import (
 from ..universe import build_universe
 from ..reports import compute_market_regime
 from ..quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
+from ..selection_batches import latest_complete_batch, selection_batch_schema_state
 from ..selection_runtime import (
     CHINA_TZ,
     MODE_CLOSE_FINAL,
@@ -413,13 +414,13 @@ def _run_display_scanners_for_snapshot(conn, trade_date: str, universe: pd.DataF
 
 
 def _load_close_opportunities(conn, trade_date: str) -> pd.DataFrame:
-    persisted = _load_persisted_candidates(conn, trade_date)
-    if not persisted.empty:
-        return persisted
-    return _run_display_scanners(conn, trade_date, build_universe(conn, trade_date))
+    """Historical close mode reads persisted evidence only; it never finalizes on read."""
+    return _load_persisted_candidates(conn, trade_date)
 
 
 def _persisted_candidate_dates(conn) -> list[str]:
+    if not selection_batch_schema_state(conn).ready:
+        return []
     try:
         rows = conn.execute(
             """
@@ -430,19 +431,25 @@ def _persisted_candidate_dates(conn) -> list[str]:
             """,
             (SCREENING_DEFINITION_VERSION,),
         ).fetchall()
-    except sqlite3.OperationalError:
-        # Before explicit R3 migration, preserve the legacy history workflow.
-        # Once the batch schema exists, legacy rows can no longer make a formal day complete.
-        strategy_ids = visible_strategy_ids()
-        marks = ",".join("?" for _ in strategy_ids)
+    except sqlite3.DatabaseError:
+        return []
+    return [str(row[0]) for row in rows]
+
+
+def _legacy_persisted_candidate_dates(conn) -> list[str]:
+    """Legacy-only date inventory used by the bounded catch-up path before migration."""
+    marks = ",".join("?" for _ in LEGACY_STRATEGY_IDS)
+    try:
         rows = conn.execute(
             f"""
             SELECT DISTINCT trade_date FROM candidates
             WHERE sec_type='stock' AND strategy_id IN ({marks})
             ORDER BY trade_date
             """,
-            strategy_ids,
+            LEGACY_STRATEGY_IDS,
         ).fetchall()
+    except sqlite3.DatabaseError:
+        return []
     return [str(row[0]) for row in rows]
 
 
@@ -450,20 +457,13 @@ def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
     """Read one complete current-version batch; never combine old versions or batches."""
     definitions = formal_definitions()
     marks = ",".join("?" for _ in definitions)
+    batch = latest_complete_batch(conn, trade_date)
+    if batch.code != "complete":
+        empty = pd.DataFrame()
+        empty.attrs["formal_batch_status"] = batch.code
+        empty.attrs["formal_batch_error"] = batch.error_msg
+        return empty
     try:
-        batch = conn.execute(
-            """
-            SELECT batch_id
-            FROM selection_batches
-            WHERE trade_date=? AND definition_version=?
-              AND mode='close_final' AND status='complete'
-            ORDER BY completed_at DESC, batch_id DESC
-            LIMIT 1
-            """,
-            (str(trade_date), SCREENING_DEFINITION_VERSION),
-        ).fetchone()
-        if batch is None:
-            return pd.DataFrame()
         df = pd.read_sql_query(
             f"""
             SELECT c.strategy_id, c.version, c.trade_date, c.sec_type, c.sec_code,
@@ -476,23 +476,14 @@ def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
             ORDER BY c.strategy_id, c.rank, c.sec_code
             """,
             conn,
-            params=[int(batch[0]), SCREENING_DEFINITION_VERSION, *(definition.strategy_id for definition in definitions), str(trade_date)],
+            params=[batch.batch_id, SCREENING_DEFINITION_VERSION, *(definition.strategy_id for definition in definitions), str(trade_date)],
         )
-    except sqlite3.OperationalError:
-        # Production migration is explicitly authorized later.  Before that point,
-        # preserve the legacy formal view rather than treating an old schema as a
-        # partially written R3 batch.
-        df = pd.read_sql_query(
-            f"""
-            SELECT strategy_id, version, trade_date, sec_type, sec_code,
-                   sec_name, entry_price, rank, features_json
-            FROM candidates
-            WHERE sec_type='stock' AND strategy_id IN ({marks}) AND trade_date=?
-            ORDER BY strategy_id, rank, sec_code
-            """,
-            conn,
-            params=[*(definition.strategy_id for definition in definitions), str(trade_date)],
-        )
+    except (sqlite3.DatabaseError, pd.errors.DatabaseError) as exc:
+        empty = pd.DataFrame()
+        empty.attrs["formal_batch_status"] = "schema_error"
+        empty.attrs["formal_batch_error"] = f"formal candidate query: {type(exc).__name__}: {exc}"
+        return empty
+    df.attrs["formal_batch_status"] = "complete"
     if df.empty:
         return df
     features = pd.json_normalize(df["features_json"].map(lambda text: json.loads(text or "{}")))
@@ -513,11 +504,11 @@ def _load_persisted_candidates(conn, trade_date: str) -> pd.DataFrame:
         SELECT strategy_id, version, trade_date, sec_type, sec_code, sec_name, entry_price, rank, features_json
         FROM candidates
         WHERE sec_type='stock' AND strategy_id IN ({visible_marks}) AND trade_date=?
-          AND (strategy_id NOT IN ({formal_marks}) OR version != ?)
+          AND strategy_id NOT IN ({formal_marks})
         ORDER BY strategy_id, rank, sec_code
         """,
         conn,
-        params=[*visible_ids, str(trade_date), *formal_ids, SCREENING_DEFINITION_VERSION],
+        params=[*visible_ids, str(trade_date), *formal_ids],
     )
     if not legacy_rows.empty:
         features = pd.json_normalize(legacy_rows["features_json"].map(lambda text: json.loads(text or "{}")))
@@ -541,36 +532,51 @@ def _annotate_formal_capability_candidates(rows: pd.DataFrame) -> pd.DataFrame:
 
 def _capability_run_status(conn, trade_date: str) -> pd.DataFrame:
     """Return one explicit availability state per formal capability strategy."""
-    pre_migration = False
-    try:
-        batch = conn.execute(
-            """
-            SELECT batch_id FROM selection_batches
-            WHERE trade_date=? AND definition_version=? AND mode='close_final' AND status='complete'
-            ORDER BY completed_at DESC, batch_id DESC LIMIT 1
-            """,
-            (str(trade_date), SCREENING_DEFINITION_VERSION),
-        ).fetchone()
-        base = pd.read_sql_query(
-            """
-            SELECT strategy_id, status, n_candidates, universe_size, run_at
-            FROM strategy_runs WHERE batch_id=? AND mode='close_final'
-            """,
-            conn,
-            params=[int(batch[0])],
-        ) if batch is not None else pd.DataFrame()
-    except sqlite3.OperationalError:
-        pre_migration = True
-        base = _load_strategy_run_status(conn, trade_date)
+    batch = latest_complete_batch(conn, trade_date)
+    base = pd.DataFrame()
+    if batch.code == "complete":
+        try:
+            base = pd.read_sql_query(
+                """
+                SELECT strategy_id, status, n_candidates, universe_size, run_at
+                FROM strategy_runs WHERE batch_id=? AND mode='close_final'
+                """,
+                conn,
+                params=[batch.batch_id],
+            )
+        except (sqlite3.DatabaseError, pd.errors.DatabaseError) as exc:
+            batch = type(batch)(
+                "schema_error",
+                error_msg=f"formal run query: {type(exc).__name__}: {exc}",
+            )
     rows: list[dict[str, object]] = []
     for definition in formal_definitions():
+        if batch.code != "complete":
+            rows.append(
+                {
+                    "strategy_id": definition.strategy_id,
+                    "capability": definition.capability,
+                    "availability": batch.code,
+                    "error_msg": batch.error_msg,
+                    "last_nonempty": None,
+                }
+            )
+            continue
         matched = base[base["strategy_id"].eq(definition.strategy_id)] if not base.empty else pd.DataFrame()
         if matched.empty:
-            rows.append({"strategy_id": definition.strategy_id, "capability": definition.capability, "availability": "未运行" if pre_migration else "未定版", "last_nonempty": None})
+            rows.append(
+                {
+                    "strategy_id": definition.strategy_id,
+                    "capability": definition.capability,
+                    "availability": "unfinalized",
+                    "error_msg": "complete batch is missing a strategy run",
+                    "last_nonempty": None,
+                }
+            )
             continue
         item = matched.iloc[0]
         status = str(item["status"])
-        availability = "成功但 0 条" if status == "empty" else ("运行失败" if status not in {"ok", "empty"} else "成功")
+        availability = "empty" if status == "empty" else ("failed" if status not in {"ok", "empty"} else "complete")
         rows.append({
             "strategy_id": definition.strategy_id,
             "capability": definition.capability,
@@ -580,7 +586,6 @@ def _capability_run_status(conn, trade_date: str) -> pd.DataFrame:
             "last_nonempty": None,
         })
     return pd.DataFrame(rows)
-
 
 def _filter_pullback_strength_phase(rows: pd.DataFrame, strength_tier: str | None, state: str | None) -> pd.DataFrame:
     result = rows.copy()
@@ -825,13 +830,19 @@ def ensure_close_history_persisted(
     up_to_trade_date: str | None,
     limit: int = 10,
 ) -> dict[str, object]:
+    """Explicit bounded recent-date catch-up; panel reads and the R4 60-day bootstrap do not call this."""
     if up_to_trade_date is None:
         return {"processed": [], "latest_persisted": None}
 
     conn = connect(base_dir=base_dir)
     try:
         close_dates = list_stock_trade_dates(conn, end_date=up_to_trade_date, include_end=True)
-        stored_dates = set(_persisted_candidate_dates(conn))
+        schema = selection_batch_schema_state(conn)
+        stored_dates = set(
+            _persisted_candidate_dates(conn)
+            if schema.ready
+            else _legacy_persisted_candidate_dates(conn)
+        )
     finally:
         conn.close()
 
@@ -850,7 +861,12 @@ def ensure_close_history_persisted(
 
     conn = connect(base_dir=base_dir)
     try:
-        latest_persisted = _persisted_candidate_dates(conn)
+        schema = selection_batch_schema_state(conn)
+        latest_persisted = (
+            _persisted_candidate_dates(conn)
+            if schema.ready
+            else _legacy_persisted_candidate_dates(conn)
+        )
     finally:
         conn.close()
     return {
@@ -1567,13 +1583,6 @@ def render_scanner_tab(
     prefer_latest_quotes: bool = False,
     force_latest_quotes: bool = False,
 ) -> None:
-    if fallback_trade_date:
-        sync_key = f"scanner_close_sync_{fallback_trade_date}"
-        sync_state = st.session_state.get(sync_key)
-        if sync_state != fallback_trade_date:
-            ensure_close_history_persisted(base_dir=base_dir, up_to_trade_date=fallback_trade_date)
-            st.session_state[sync_key] = fallback_trade_date
-
     query_trade_date = latest_quote_trade_date or fallback_trade_date
     shared_snapshot_loader = None
     if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes):

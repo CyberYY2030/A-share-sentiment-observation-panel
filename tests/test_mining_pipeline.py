@@ -1183,7 +1183,7 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual(_limit_up_threshold("688001", p), 19.5)
         self.assertEqual(_limit_up_threshold("830001", p), 19.5)
 
-    def test_second_launch_selects_pullback_shrink_and_stop_setup(self) -> None:
+    def test_second_launch_rejects_unbatched_a_history(self) -> None:
         from mining.db import connect
         from mining.scanners.second_launch import SecondLaunchScanner
 
@@ -1264,13 +1264,7 @@ class MiningPipelineTests(unittest.TestCase):
             finally:
                 conn.close()
 
-        self.assertEqual([candidate.sec_code for candidate in candidates], ["600001"])
-        features = candidates[0].features
-        self.assertLessEqual(features["pullback_pct"], -0.08)
-        self.assertAlmostEqual(features["ma_proximity"], abs(11.0 / 10.27 - 1.0))
-        self.assertAlmostEqual(features["shrink_ratio"], 0.5)
-        self.assertTrue(features["stop_signal"])
-        self.assertEqual(features["flag_strategies"], "strong_trend")
+        self.assertEqual(candidates, [])
 
     def test_second_launch_excludes_without_volume_shrink(self) -> None:
         from mining.db import connect
@@ -1288,7 +1282,7 @@ class MiningPipelineTests(unittest.TestCase):
 
         self.assertEqual(candidates, [])
 
-    def test_execute_daily_pipeline_persists_second_launch_via_generic_scanner_branch(self) -> None:
+    def test_execute_daily_pipeline_does_not_persist_unbatched_second_launch(self) -> None:
         from mining.db import connect
         from run_daily import execute_daily_pipeline
 
@@ -1389,10 +1383,7 @@ class MiningPipelineTests(unittest.TestCase):
             finally:
                 conn.close()
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0][0], "600001")
-        self.assertIn("pullback_pct", rows[0][1])
-        self.assertIn("stop_signal", rows[0][1])
+        self.assertEqual(rows, [])
 
     def test_persist_watchlist_snapshot_is_idempotent_and_keeps_context(self) -> None:
         from mining.db import connect

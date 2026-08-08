@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from ..db import list_stock_trade_dates
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..event_activity import EventActivityResult, build_event_activity
 from ..selection_context import SelectionContext, build_selection_context
 from ..trend_factors import cross_section_percentile
@@ -487,7 +488,7 @@ def select_compression_launch_from_context(context: SelectionContext) -> list[Ca
 @register
 class CompressionLaunchScanner(Scanner):
     strategy_id = "compression_launch"
-    version = "v2.0"
+    version = SCREENING_DEFINITION_VERSION
     kind = "stock"
     description = "V2 compression-launch event path using shared clean context and activity."
     default_params: dict[str, Any] = {}

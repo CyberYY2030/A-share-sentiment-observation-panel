@@ -193,6 +193,20 @@ class MiningReportTests(unittest.TestCase):
                         "cluster_days": 14,
                     },
                 )
+                previous_trade_date = conn.execute(
+                    "SELECT MAX(trade_date) FROM ash.kline_daily WHERE sec_type='stock' AND trade_date < ?",
+                    (trade_date,),
+                ).fetchone()[0]
+                _insert_candidate_outcome(
+                    conn,
+                    2,
+                    "launch_burst",
+                    previous_trade_date,
+                    "600001",
+                    10.0,
+                    10.5,
+                    11.0,
+                )
                 path = generate_markdown_report(conn, trade_date, base / "output")
             finally:
                 conn.close()

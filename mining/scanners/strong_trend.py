@@ -10,12 +10,13 @@ from typing import Any
 import pandas as pd
 
 from ..features import board_kind
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..selection_context import SelectionContext, build_selection_context
 from ..trend_factors import TrendProfile, cross_section_percentile, resolve_trend_profile
 from . import Candidate, Scanner, register
 
 
-FORMAL_A_DEFINITION_VERSION = "v2.5"
+FORMAL_A_DEFINITION_VERSION = SCREENING_DEFINITION_VERSION
 _A_OUTPUT_COLUMNS = [
     "sec_code", "sec_name", "reference_price", "strength_tier", "rank_band", "score",
     "rps10_pct", "rps20_pct", "near_high_pct", "separation_pct", "liquidity_pct",
@@ -327,7 +328,7 @@ def evaluate_strong_trend(
     *,
     min_down_days: int = 3,
 ) -> StrongTrendEvaluation:
-    """Evaluate frozen v2.5 capability A: absolute gates first, ranking second."""
+    """Evaluate the frozen current-definition capability A: gates first, ranking second."""
     dates = [str(day) for day in context.diagnostics.get("clean_dates", [])]
     if str(context.trade_date) not in dates:
         dates.append(str(context.trade_date))

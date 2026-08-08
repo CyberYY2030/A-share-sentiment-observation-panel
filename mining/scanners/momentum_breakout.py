@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from ..db import list_stock_trade_dates
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..event_activity import EventActivityResult, build_event_activity
 from ..features import (
     high_breakout_from_close_pct,
@@ -354,7 +355,7 @@ def select_momentum_anomaly_from_context(context: SelectionContext) -> list[Cand
 @register
 class MomentumAnomalyScanner(Scanner):
     strategy_id = "momentum_anomaly"
-    version = "v2.0"
+    version = SCREENING_DEFINITION_VERSION
     kind = "stock"
     description = "V2 board-aware momentum anomaly path with independent subtype ranking."
     default_params: dict[str, Any] = {}

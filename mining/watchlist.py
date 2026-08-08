@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .capabilities import SCREENING_DEFINITION_VERSION
+from .selection_batches import selection_batch_schema_state
 from .db import list_stock_trade_dates, now_str
 from .features import board_kind, moving_average, volume_shrink_ratio
 from .selection_context import SelectionContext, build_selection_context
@@ -823,6 +824,8 @@ def _load_a_qualified_pool(
     if not clean_dates:
         return {}, {}
     marks = ",".join("?" for _ in clean_dates)
+    if not selection_batch_schema_state(conn).ready:
+        return {}, {}
     try:
         rows = conn.execute(
             f"""
@@ -836,15 +839,8 @@ def _load_a_qualified_pool(
             """,
             [SCREENING_DEFINITION_VERSION, *clean_dates, SCREENING_DEFINITION_VERSION],
         ).fetchall()
-    except sqlite3.OperationalError:
-        rows = conn.execute(
-            f"""
-            SELECT sec_code, trade_date, features_json
-            FROM candidates
-            WHERE strategy_id='strong_trend' AND version=? AND sec_type='stock' AND trade_date IN ({marks})
-            """,
-            [SCREENING_DEFINITION_VERSION, *clean_dates],
-        ).fetchall()
+    except sqlite3.DatabaseError:
+        return {}, {}
     qualified: dict[str, set[str]] = {}
     tiers: dict[str, str] = {}
     for sec_code, trade_date, features_json in rows:
@@ -898,8 +894,10 @@ def load_prior_pullback_states(
             """,
             (str(trade_date),),
         ).fetchall()
-    except sqlite3.OperationalError:
-        return {}
+    except sqlite3.DatabaseError as exc:
+        if "no such table" in str(exc).lower():
+            return {}
+        raise
     grouped: dict[str, list[str]] = {}
     for sec_code, state_date, state in rows:
         if allowed_dates is not None and str(state_date) not in allowed_dates:

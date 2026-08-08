@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import sqlite3
 
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..selection_context import build_selection_context
 from ..watchlist import (
     PULLBACK_STATE_RETRIGGER,
@@ -81,7 +82,7 @@ def select_candidates_from_pullback_support(
 @register
 class SecondLaunchScanner(Scanner):
     strategy_id = "second_launch"
-    version = "v2.0"
+    version = SCREENING_DEFINITION_VERSION
     kind = "stock"
     description = "V2 second-launch candidates sourced exclusively from pullback-support state."
     default_params = {"top_n": 20}

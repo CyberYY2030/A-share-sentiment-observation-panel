@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 from .capabilities import SCREENING_DEFINITION_VERSION, formal_definitions, formal_strategy_ids
+from .selection_batches import latest_complete_batch
 
 
 def _load_candidates(
@@ -39,17 +40,13 @@ def load_formal_capability_candidates(conn: sqlite3.Connection, trade_date: str)
     if not definitions:
         return pd.DataFrame()
     marks = ",".join("?" for _ in definitions)
+    batch = latest_complete_batch(conn, trade_date)
+    if batch.code != "complete":
+        empty = pd.DataFrame()
+        empty.attrs["formal_batch_status"] = batch.code
+        empty.attrs["formal_batch_error"] = batch.error_msg
+        return empty
     try:
-        batch = conn.execute(
-            """
-            SELECT batch_id FROM selection_batches
-            WHERE trade_date=? AND definition_version=? AND mode='close_final' AND status='complete'
-            ORDER BY completed_at DESC, batch_id DESC LIMIT 1
-            """,
-            (str(trade_date), SCREENING_DEFINITION_VERSION),
-        ).fetchone()
-        if batch is None:
-            return pd.DataFrame()
         frame = pd.read_sql_query(
             f"""
             SELECT c.strategy_id, c.version, c.trade_date, c.sec_code, c.sec_name,
@@ -61,19 +58,14 @@ def load_formal_capability_candidates(conn: sqlite3.Connection, trade_date: str)
             ORDER BY c.strategy_id, c.rank, c.sec_code
             """,
             conn,
-            params=[int(batch[0]), SCREENING_DEFINITION_VERSION, str(trade_date), *(definition.strategy_id for definition in definitions)],
+            params=[batch.batch_id, SCREENING_DEFINITION_VERSION, str(trade_date), *(definition.strategy_id for definition in definitions)],
         )
-    except sqlite3.OperationalError:
-        frame = pd.read_sql_query(
-            f"""
-            SELECT strategy_id, version, trade_date, sec_code, sec_name, entry_price, rank, features_json
-            FROM candidates
-            WHERE sec_type='stock' AND trade_date=? AND strategy_id IN ({marks})
-            ORDER BY strategy_id, rank, sec_code
-            """,
-            conn,
-            params=[str(trade_date), *(definition.strategy_id for definition in definitions)],
-        )
+    except (sqlite3.DatabaseError, pd.errors.DatabaseError) as exc:
+        empty = pd.DataFrame()
+        empty.attrs["formal_batch_status"] = "schema_error"
+        empty.attrs["formal_batch_error"] = f"formal candidate query: {type(exc).__name__}: {exc}"
+        return empty
+    frame.attrs["formal_batch_status"] = "complete"
     if frame.empty:
         return frame
     features = pd.json_normalize(frame["features_json"].map(lambda value: json.loads(value or "{}")))
@@ -90,6 +82,9 @@ def formal_capability_report_sections(conn: sqlite3.Connection, trade_date: str)
     """Registry-driven close-final report sections; no snapshot row is queried or exported."""
     rows = load_formal_capability_candidates(conn, trade_date)
     lines = ["## 正式筛选 A–E（收盘定版）"]
+    if rows.attrs.get("formal_batch_status") not in {None, "complete"}:
+        error = rows.attrs.get("formal_batch_error") or "no complete close_final batch"
+        lines.extend(["", f"Formal A-E unfinalized: {error}"])
     for capability in ("A", "B", "C", "D", "E"):
         definitions = formal_definitions(capability)
         label = definitions[0].label if definitions else capability
@@ -391,7 +386,7 @@ def generate_markdown_report(
     review = pd.DataFrame()
     if previous_trade_date:
         review = pd.read_sql_query(
-            """
+            f"""
             SELECT
               c.strategy_id,
               c.sec_code,

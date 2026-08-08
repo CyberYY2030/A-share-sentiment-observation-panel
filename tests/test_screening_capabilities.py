@@ -61,26 +61,30 @@ class ScreeningCapabilityRegistryTests(unittest.TestCase):
             self.assertTrue(item.fields)
             self.assertTrue(item.sort_keys)
 
-    def test_panel_and_report_consume_the_same_formal_strategy_rows(self) -> None:
+    def test_unmigrated_panel_and_report_refuse_legacy_formal_rows(self) -> None:
         conn = _conn_with_formal_rows()
         try:
             report_rows = load_formal_capability_candidates(conn, "2026-08-06")
             panel_rows = _load_formal_capability_candidates(conn, "2026-08-06")
-            self.assertEqual(set(report_rows["strategy_id"]), set(panel_rows["strategy_id"]))
-            self.assertEqual(set(panel_rows["capability"]), {"A", "B", "C"})
-            self.assertEqual(panel_rows.loc[panel_rows["strategy_id"].eq("second_launch"), "reference_price"].iloc[0], 9.5)
+            status = _capability_run_status(conn, "2026-08-06")
+            self.assertTrue(report_rows.empty)
+            self.assertTrue(panel_rows.empty)
+            self.assertEqual("migration_required", report_rows.attrs["formal_batch_status"])
+            self.assertEqual("migration_required", panel_rows.attrs["formal_batch_status"])
+            self.assertEqual({"migration_required"}, set(status["availability"]))
         finally:
             conn.close()
 
-    def test_pullback_strength_by_phase_filter_and_empty_run_status_are_explicit(self) -> None:
+    def test_pullback_strength_by_phase_filter_and_migration_status_are_explicit(self) -> None:
         conn = _conn_with_formal_rows()
         try:
-            rows = _load_formal_capability_candidates(conn, "2026-08-06")
-            pullback = rows[rows["strategy_id"].eq("second_launch")]
-            filtered = _filter_pullback_strength_phase(pullback, "强趋势", "回调到位")
+            pullback = pd.DataFrame(
+                [{"sec_code": "600002", "strength_tier": "tier", "state": "state"}]
+            )
+            filtered = _filter_pullback_strength_phase(pullback, "tier", "state")
             self.assertEqual(filtered["sec_code"].tolist(), ["600002"])
             status = _capability_run_status(conn, "2026-08-06")
-            self.assertEqual(status.loc[status["strategy_id"].eq("base_breakout"), "availability"].iloc[0], "未运行")
+            self.assertEqual({"migration_required"}, set(status["availability"]))
         finally:
             conn.close()
 

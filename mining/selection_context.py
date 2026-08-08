@@ -11,6 +11,7 @@ from typing import Any, TypeVar
 import pandas as pd
 
 from .adjusted_prices import AdjustedPriceResult, build_forward_adjusted_bars
+from .capabilities import SCREENING_DEFINITION_VERSION
 from .data_quality import usable_stock_trade_dates
 from .universe import SelectionUniverseResult, build_selection_universe
 from .trend_factors import resolve_trend_profile
@@ -121,7 +122,7 @@ def _fingerprint(bars: pd.DataFrame, dates: list[str], benchmarks: dict[str, pd.
     canonical = bars.sort_values([column for column in ("trade_date", "sec_code") if column in bars.columns]).reset_index(drop=True)
     digest = hashlib.sha256()
     digest.update(pd.util.hash_pandas_object(canonical, index=False).values.tobytes())
-    digest.update(json.dumps({"dates": dates, "benchmarks": {key: value.tolist() for key, value in sorted(benchmarks.items())}, "version": "v2.5"}, default=str, sort_keys=True).encode())
+    digest.update(json.dumps({"dates": dates, "benchmarks": {key: value.tolist() for key, value in sorted(benchmarks.items())}, "version": SCREENING_DEFINITION_VERSION}, default=str, sort_keys=True).encode())
     return digest.hexdigest()
 
 

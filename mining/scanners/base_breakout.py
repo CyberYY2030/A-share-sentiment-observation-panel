@@ -8,6 +8,7 @@ from typing import Any
 import pandas as pd
 
 from ..event_activity import build_event_activity
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..selection_context import SelectionContext, build_selection_context
 from ..trend_factors import resolve_trend_profile
 from . import Candidate, Scanner, register
@@ -158,7 +159,7 @@ def select_base_breakout_from_context(context: SelectionContext) -> list[Candida
 @register
 class BaseBreakoutScanner(Scanner):
     strategy_id = "base_breakout"
-    version = "v2.0"
+    version = SCREENING_DEFINITION_VERSION
     kind = "stock"
     description = "V2 medium-base breakout with T-1-defined base and shared activity."
     default_params: dict[str, Any] = {}

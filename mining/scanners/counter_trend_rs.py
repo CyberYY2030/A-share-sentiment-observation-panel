@@ -7,6 +7,7 @@ from typing import Any
 import pandas as pd
 
 from ..selection_context import SelectionContext, build_selection_context
+from ..capabilities import SCREENING_DEFINITION_VERSION
 from ..trend_factors import cross_section_percentile, resolve_trend_profile
 from . import Candidate, Scanner, register
 
@@ -161,7 +162,7 @@ def select_counter_trend_rs_from_context(context: SelectionContext) -> list[Cand
 @register
 class CounterTrendRsScanner(Scanner):
     strategy_id = "counter_trend_rs"
-    version = "v2.0"
+    version = SCREENING_DEFINITION_VERSION
     kind = "stock"
     description = "V2 counter-trend relative-strength scanner with fixed 000852 primary benchmark."
     default_params: dict[str, Any] = {}

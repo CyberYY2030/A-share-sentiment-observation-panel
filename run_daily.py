@@ -10,7 +10,6 @@ from mining.capabilities import formal_definitions, formal_strategy_ids
 from mining.candidate_persistence import (
     evaluate_formal_capabilities,
     persist_close_final_batch,
-    selection_batch_schema_ready,
 )
 from mining.db import (
     connect,
@@ -25,6 +24,7 @@ from mining.refresh_basics import refresh_basics
 from mining.reports import generate_excel_report, generate_markdown_report
 from mining.scanners import get_registered_scanners
 from mining.selection_context import build_selection_context
+from mining.selection_batches import selection_batch_schema_state
 from mining.scanners.momentum_breakout import (
     MomentumBreakoutScanner,
     select_candidates_from_universe as select_momentum_candidates,
@@ -123,13 +123,14 @@ def _run_scanners(conn: Any, trade_date: str) -> list[dict[str, Any]]:
 
 def _run_formal_capabilities(conn: Any, trade_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evaluate A-E once from a shared close-final context and persist one batch."""
-    if not selection_batch_schema_ready(conn):
+    schema = selection_batch_schema_state(conn)
+    if not schema.ready:
         return (
             [
-                {"strategy_id": definition.strategy_id, "status": "migration_required", "count": 0}
+                {"strategy_id": definition.strategy_id, "status": schema.code, "count": 0, "error": schema.error_msg}
                 for definition in formal_definitions()
             ],
-            {"status": "migration_required", "batch_id": None},
+            {"status": schema.code, "batch_id": None, "error": schema.error_msg},
         )
     context = build_selection_context(conn, trade_date, mode="close_final")
     capability_results = evaluate_formal_capabilities(conn, context)
@@ -167,11 +168,8 @@ def execute_daily_pipeline(
         if refresh:
             refresh_result = refresh_basics(conn, trade_date=resolved_trade_date)
         formal_results, formal_batch = _run_formal_capabilities(conn, resolved_trade_date)
-        if formal_batch["status"] == "migration_required":
-            scanner_results = _run_scanners(conn, resolved_trade_date)
-        else:
-            legacy_results = _run_legacy_scanners(conn, resolved_trade_date)
-            scanner_results = [*formal_results, *legacy_results]
+        legacy_results = _run_legacy_scanners(conn, resolved_trade_date)
+        scanner_results = [*formal_results, *legacy_results]
         backfill_result = backfill_outcomes(conn, trade_date=resolved_trade_date)
         watchlist_validation = None
         try:

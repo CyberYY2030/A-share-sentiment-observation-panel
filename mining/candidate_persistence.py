@@ -24,6 +24,7 @@ from .scanners.launch_burst import evaluate_compression_launch
 from .scanners.momentum_breakout import evaluate_momentum_anomaly
 from .scanners.second_launch import select_candidates_from_pullback_support
 from .scanners.strong_trend import evaluate_strong_trend
+from .selection_batches import selection_batch_schema_ready, selection_batch_schema_state
 from .watchlist import build_pullback_support
 
 
@@ -42,16 +43,6 @@ class BatchPersistenceResult:
     status: str
     reused: bool
     error_msg: str | None = None
-
-
-def selection_batch_schema_ready(conn: sqlite3.Connection) -> bool:
-    table = conn.execute(
-        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='selection_batches'"
-    ).fetchone()
-    if table is None:
-        return False
-    columns = {row[1] for row in conn.execute("PRAGMA table_info(strategy_runs)")}
-    return {"batch_id", "mode", "input_fingerprint"}.issubset(columns)
 
 
 def migrate_selection_batch_schema(conn: sqlite3.Connection) -> None:
@@ -235,28 +226,43 @@ def evaluate_formal_capabilities(conn: sqlite3.Connection, context: Any) -> tupl
     return tuple(results)
 
 
-def _failed_batch(conn: sqlite3.Connection, context: Any, error_msg: str) -> BatchPersistenceResult:
-    cursor = conn.execute(
-        """
-        INSERT INTO selection_batches (
-          trade_date, definition_version, mode, observed_at, price_as_of,
-          input_fingerprint, status, error_msg, created_at, completed_at
-        ) VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?)
-        """,
-        (
-            str(context.trade_date),
-            SCREENING_DEFINITION_VERSION,
-            str(context.mode),
-            str(context.as_of),
-            str(context.price_as_of),
-            str(context.input_fingerprint),
-            error_msg,
-            now_str(),
-            now_str(),
-        ),
-    )
-    conn.commit()
-    return BatchPersistenceResult(int(cursor.lastrowid), "failed", False, error_msg)
+def _failed_batch(
+    conn: sqlite3.Connection,
+    context: Any,
+    error_msg: str,
+    *,
+    result_status: str = "failed",
+) -> BatchPersistenceResult:
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO selection_batches (
+              trade_date, definition_version, mode, observed_at, price_as_of,
+              input_fingerprint, status, error_msg, created_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'failed', ?, ?, ?)
+            """,
+            (
+                str(context.trade_date),
+                SCREENING_DEFINITION_VERSION,
+                str(context.mode),
+                str(context.as_of),
+                str(context.price_as_of),
+                str(context.input_fingerprint),
+                error_msg,
+                now_str(),
+                now_str(),
+            ),
+        )
+        conn.commit()
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
+        return BatchPersistenceResult(
+            None,
+            "persistence_error",
+            False,
+            f"{error_msg}; failed to record batch: {type(exc).__name__}: {exc}",
+        )
+    return BatchPersistenceResult(int(cursor.lastrowid), result_status, False, error_msg)
 
 
 def _validate_results(results: Iterable[CapabilityResult]) -> tuple[CapabilityResult, ...]:
@@ -295,8 +301,9 @@ def persist_close_final_batch(
     capability_results: Iterable[CapabilityResult],
 ) -> BatchPersistenceResult:
     """Atomically replace one close-final A–E batch, or record a failed batch separately."""
-    if not selection_batch_schema_ready(conn):
-        return BatchPersistenceResult(None, "migration_required", False, "selection batch migration required")
+    schema = selection_batch_schema_state(conn)
+    if not schema.ready:
+        return BatchPersistenceResult(None, schema.code, False, schema.error_msg)
     if str(context.mode) != "close_final" or not context.input_fingerprint:
         return _failed_batch(conn, context, "close_final mode and input_fingerprint are required")
     try:
@@ -304,21 +311,21 @@ def persist_close_final_batch(
     except Exception as exc:
         return _failed_batch(conn, context, str(exc))
 
-    existing = conn.execute(
-        """
-        SELECT batch_id FROM selection_batches
-        WHERE trade_date=? AND definition_version=? AND mode='close_final'
-          AND input_fingerprint=? AND status='complete'
-        ORDER BY completed_at DESC, batch_id DESC
-        LIMIT 1
-        """,
-        (str(context.trade_date), SCREENING_DEFINITION_VERSION, str(context.input_fingerprint)),
-    ).fetchone()
-    if existing is not None:
-        return BatchPersistenceResult(int(existing[0]), "complete", True)
-
     try:
         conn.execute("BEGIN IMMEDIATE")
+        latest = conn.execute(
+            """
+            SELECT batch_id, input_fingerprint
+            FROM selection_batches
+            WHERE trade_date=? AND definition_version=? AND mode='close_final' AND status='complete'
+            ORDER BY completed_at DESC, batch_id DESC
+            LIMIT 1
+            """,
+            (str(context.trade_date), SCREENING_DEFINITION_VERSION),
+        ).fetchone()
+        if latest is not None and str(latest[1]) == str(context.input_fingerprint):
+            conn.commit()
+            return BatchPersistenceResult(int(latest[0]), "complete", True)
         created_at = now_str()
         cursor = conn.execute(
             """
@@ -450,6 +457,14 @@ def persist_close_final_batch(
         )
         conn.commit()
         return BatchPersistenceResult(batch_id, "complete", False)
+    except sqlite3.DatabaseError as exc:
+        conn.rollback()
+        return _failed_batch(
+            conn,
+            context,
+            f"persistence SQL error: {type(exc).__name__}: {exc}",
+            result_status="persistence_error",
+        )
     except Exception as exc:
         conn.rollback()
         return _failed_batch(conn, context, f"{type(exc).__name__}: {exc}")
