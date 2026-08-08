@@ -370,6 +370,7 @@ class R4HistoryAndIsolationTests(unittest.TestCase):
                     errors=(),
                     status="snapshot_usable",
                     from_cache=False,
+                    benchmark_closes={"000852": 6123.45, "399006": 2456.78},
                 ),
             )
             loader = _build_quote_snapshot_loader(
@@ -383,7 +384,92 @@ class R4HistoryAndIsolationTests(unittest.TestCase):
 
         self.assertTrue(cached.from_cache)
         self.assertEqual(cached.status, "snapshot_cache_fallback")
+        self.assertEqual(cached.observed_at, observed_at.isoformat())
+        self.assertEqual(cached.benchmark_closes, {"000852": 6123.45, "399006": 2456.78})
         self.assertEqual(calls, [])
+
+    def test_snapshot_cache_fail_closed_matrix_never_requires_a_provider(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
+
+        trade_date = "2026-08-07"
+        now = dt.datetime(2026, 8, 7, 10, 10, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        expected = {"600001", "600002", "600003"}
+        full_frame = pd.DataFrame(
+            [
+                {"sec_code": code, "close": 10.0 + index}
+                for index, code in enumerate(sorted(expected))
+            ]
+        )
+
+        def result(*, frame=full_frame, observed_at=now - dt.timedelta(minutes=5)):
+            return QuoteSnapshotResult(
+                frame=frame,
+                provider="isolated-cache",
+                observed_at=observed_at.isoformat(),
+                raw_rows=len(frame),
+                normalized_rows=len(frame),
+                coverage=1.0,
+                attempts=0,
+                errors=(),
+                status="snapshot_usable",
+                from_cache=False,
+                benchmark_closes={
+                    "000852": 6123.45,
+                    "399006": 0.0,
+                    "000300": float("inf"),
+                    "000905": float("nan"),
+                },
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = QuoteSnapshotAdapter(cache_dir=Path(tmp), provider_fetcher=mock.Mock(side_effect=AssertionError))
+            frame_path, metadata_path = adapter._cache_paths(trade_date)
+            frame_path.parent.mkdir(parents=True)
+            full_frame.to_pickle(frame_path)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "trade_date": trade_date,
+                        "provider": "legacy-cache",
+                        "observed_at": (now - dt.timedelta(minutes=5)).isoformat(),
+                        "raw_rows": len(full_frame),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy = adapter._cached_result(trade_date, expected, now, close_final=False)
+            self.assertTrue(legacy.from_cache)
+            self.assertEqual({}, legacy.benchmark_closes)
+            self.assertIn("legacy cache has no benchmark_closes", legacy.errors)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = QuoteSnapshotAdapter(cache_dir=Path(tmp), provider_fetcher=mock.Mock(side_effect=AssertionError))
+            adapter._save_success(trade_date, result())
+            cached = adapter._cached_result(trade_date, expected, now, close_final=False)
+            self.assertEqual({"000852": 6123.45}, cached.benchmark_closes)
+            self.assertFalse(adapter._bundle_path(trade_date).with_suffix(".tmp.pkl").exists())
+
+            bundle = pd.read_pickle(adapter._bundle_path(trade_date))
+            bundle["trade_date"] = "2026-08-06"
+            pd.to_pickle(bundle, adapter._bundle_path(trade_date))
+            self.assertIsNone(adapter._cached_result(trade_date, expected, now, close_final=False))
+
+            adapter._bundle_path(trade_date).write_bytes(b"corrupted")
+            corrupted = adapter._cached_result(trade_date, expected, now, close_final=False)
+            self.assertEqual("provider_failed", corrupted.status)
+            self.assertFalse(corrupted.from_cache)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = QuoteSnapshotAdapter(cache_dir=Path(tmp), provider_fetcher=mock.Mock(side_effect=AssertionError))
+            adapter._save_success(trade_date, result(observed_at=now - dt.timedelta(minutes=11)))
+            stale = adapter._cached_result(trade_date, expected, now, close_final=False)
+            self.assertEqual("snapshot_stale", stale.status)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = QuoteSnapshotAdapter(cache_dir=Path(tmp), provider_fetcher=mock.Mock(side_effect=AssertionError))
+            adapter._save_success(trade_date, result(frame=full_frame.iloc[:1].copy()))
+            low = adapter._cached_result(trade_date, expected, now, close_final=False)
+            self.assertEqual("coverage_below_threshold", low.status)
 
 
 if __name__ == "__main__":

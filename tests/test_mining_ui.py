@@ -12,6 +12,28 @@ from tests._mining_test_helpers import create_sample_market_dbs, trading_days
 
 
 class MiningUiSmokeTests(unittest.TestCase):
+    def test_followup_change_accepts_object_typed_sql_prices(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _build_followups
+
+        previous = pd.DataFrame(
+            {
+                "strategy_id": ["strong_trend", "second_launch"],
+                "sec_code": ["600001", "600003"],
+                "sec_name": ["Alpha", "Gamma"],
+                "rank": [1, 1],
+                "entry_price": pd.Series([10.0, 20.0], dtype="object"),
+            }
+        )
+
+        result = _build_followups(
+            previous,
+            {"600001": 11.0, "600003": 19.0},
+            "snapshot_usable",
+        )
+
+        self.assertEqual(result["sec_code"].tolist(), ["600003", "600001"])
+        self.assertEqual(result["today_change_pct"].tolist(), [-5.0, 10.0])
+
     def test_streamlit_tab_helpers_import(self) -> None:
         from mining.streamlit_tabs import (
             render_review_tab,
@@ -560,6 +582,7 @@ class MiningUiSmokeTests(unittest.TestCase):
         from mining.capabilities import formal_definitions
         from mining.candidate_persistence import (
             CapabilityResult,
+            PullbackStateRow,
             migrate_selection_batch_schema,
             persist_close_final_batch,
         )
@@ -597,7 +620,19 @@ class MiningUiSmokeTests(unittest.TestCase):
                         {"reference_price": 10.0},
                         1,
                     )
-                    results.append(CapabilityResult(definition.strategy_id, (candidate,), 6))
+                    state_rows = (
+                        (PullbackStateRow(candidate.sec_code, "再启动", "P60"),)
+                        if definition.strategy_id == "second_launch"
+                        else ()
+                    )
+                    results.append(
+                        CapabilityResult(
+                            definition.strategy_id,
+                            (candidate,),
+                            6,
+                            state_rows=state_rows,
+                        )
+                    )
                 persist_close_final_batch(conn, context, results)
                 legacy_run = conn.execute(
                     """

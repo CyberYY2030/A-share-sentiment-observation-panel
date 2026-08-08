@@ -557,3 +557,31 @@
 - 研究链路：仍然把“收盘后正式筛选并落库”的结果作为历史复盘基准
 
 这套做法的优点是实用，缺点是“实时展示”和“正式历史样本”不是同一套口径，这正是最值得和 Claude 讨论的核心点。
+
+---
+
+## 15. 2026-08-08 Screening v2.5 R4.2 正式闭环
+
+本节记录当前正式 A–E 链路的边界；旧的 legacy 展示和 outcome 说明仍按前文处理。
+
+### 15.1 C 状态是 formal batch 的原子组成部分
+
+- `pullback_state_history` 保存 `batch_id` 与 `definition_version`。
+- A–E runs、candidates 与 C 当日状态在同一个 `BEGIN IMMEDIATE` 事务内写入；任一部分失败会整体回滚，并保留此前 complete batch。
+- 读取端只认当前 `definition_version`、`close_final`、每个交易日最新 complete batch。intraday、failed、旧版本及没有 batch/version 的 legacy 状态均不可见。
+- 同 fingerprint 重跑复用原 complete batch，不增加 runs、candidates 或状态行；新 fingerprint 才创建新 batch。
+- `再启动`必须由先前正式 A 入池和连续正式状态演化产生，禁止通过 SQL 手工植入状态。
+
+### 15.2 E 的快照缓存边界
+
+- v2 cache 是单文件原子 bundle，同时保存行情 frame、`trade_date`、`observed_at` 与有限正数的 `benchmark_closes`。
+- cache hit 必须恢复同一 benchmark/as-of，且不得触发 provider 请求。
+- 旧双文件缓存仍可只读降级；缺少 benchmark 时明确标记，E 不会伪造可用。
+- 损坏、过期、低覆盖或日期不符均 fail closed。
+
+### 15.3 history dry-run 与浏览器证据边界
+
+- history CLI 必须显式指定 shadow DB。manifest 绑定四个源库 SHA-256、target、sessions 与定义版本；默认拒绝已有 shadow，只有显式 reuse 且 manifest 完全一致才可零增长复用。
+- JSON 报告记录失败、各策略 empty、逐日 C 状态、自然 `再启动`、表增量和源库前后哈希；持久化失败仍写报告并非零退出。
+- 浏览器的 selected/effective/formal 日期按 formal 目标日展示；六态分别保留 intraday、pending、final、unavailable、not_run、failed 证据。
+- 盘中和 pending 只展示临时结果，不写正式候选或状态历史；final 只读正式 complete batch。

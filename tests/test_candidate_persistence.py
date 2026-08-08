@@ -14,24 +14,30 @@ from tests._mining_test_helpers import create_sample_market_dbs
 
 class CandidatePersistenceTests(unittest.TestCase):
     @staticmethod
-    def _context(fingerprint: str, *, mode: str = "close_final") -> SimpleNamespace:
+    def _context(
+        fingerprint: str,
+        *,
+        mode: str = "close_final",
+        trade_date: str = "2026-08-05",
+    ) -> SimpleNamespace:
         return SimpleNamespace(
-            trade_date="2026-08-05",
+            trade_date=trade_date,
             mode=mode,
-            as_of="2026-08-05 15:10:00",
-            price_as_of="2026-08-05",
+            as_of=f"{trade_date} 15:10:00",
+            price_as_of=trade_date,
             input_fingerprint=fingerprint,
         )
 
     @staticmethod
     def _results(*, code_suffix: str = "1", include_all: bool = True):
-        from mining.candidate_persistence import CapabilityResult
+        from mining.candidate_persistence import CapabilityResult, PullbackStateRow
         from mining.capabilities import formal_definitions
         from mining.scanners import Candidate
 
         results = []
         for index, definition in enumerate(formal_definitions(), start=1):
             candidates = ()
+            candidate_code = f"{600000 + index + (10 if code_suffix != '1' else 0):06d}"
             if include_all or index == 1:
                 candidates = (
                     Candidate(
@@ -39,14 +45,25 @@ class CandidatePersistenceTests(unittest.TestCase):
                         version="v2.0",
                         trade_date="2026-08-05",
                         sec_type="stock",
-                        sec_code=f"{600000 + index + (10 if code_suffix != '1' else 0):06d}",
+                        sec_code=candidate_code,
                         sec_name=f"测试{index}",
                         entry_price=10.0 + index,
                         features={"reference_price": 10.0 + index, "score": index},
                         rank=1,
                     ),
                 )
-            results.append(CapabilityResult(definition.strategy_id, candidates, 10, "ok" if candidates else "empty"))
+            state_rows = ()
+            if definition.strategy_id == "second_launch":
+                state_rows = (PullbackStateRow(candidate_code, "回调中", "P120"),)
+            results.append(
+                CapabilityResult(
+                    definition.strategy_id,
+                    candidates,
+                    10,
+                    "ok" if candidates else "empty",
+                    state_rows=state_rows,
+                )
+            )
         return tuple(results)
 
     @staticmethod
@@ -73,6 +90,160 @@ class CandidatePersistenceTests(unittest.TestCase):
                 {"batch_id", "mode", "input_fingerprint"},
                 {row[1] for row in conn.execute("PRAGMA table_info(strategy_runs)")} & {"batch_id", "mode", "input_fingerprint"},
             )
+        finally:
+            conn.close()
+
+    def test_close_final_batch_owns_versioned_pullback_state_rows(self) -> None:
+        from mining.candidate_persistence import (
+            CapabilityResult,
+            PullbackStateRow,
+            migrate_selection_batch_schema,
+            persist_close_final_batch,
+        )
+
+        conn = self._conn()
+        try:
+            migrate_selection_batch_schema(conn)
+            results = list(self._results(include_all=False))
+            c_index = next(index for index, item in enumerate(results) if item.strategy_id == "second_launch")
+            c_result = results[c_index]
+            results[c_index] = CapabilityResult(
+                c_result.strategy_id,
+                c_result.candidates,
+                c_result.universe_size,
+                c_result.status,
+                c_result.error_msg,
+                state_rows=(PullbackStateRow("600004", "回调中", "P120"),),
+            )
+
+            persisted = persist_close_final_batch(conn, self._context("formal-state"), results)
+
+            self.assertEqual("complete", persisted.status)
+            self.assertEqual(
+                [(persisted.batch_id, "v2.5", "2026-08-05", "600004", "回调中")],
+                [
+                    tuple(row)
+                    for row in conn.execute(
+                        """
+                        SELECT batch_id, definition_version, trade_date, sec_code, state
+                        FROM pullback_state_history
+                        """
+                    ).fetchall()
+                ],
+            )
+        finally:
+            conn.close()
+
+    def test_migration_upgrades_legacy_state_schema_but_legacy_rows_stay_ineligible(self) -> None:
+        from mining.candidate_persistence import migrate_selection_batch_schema
+        from mining.watchlist import load_prior_pullback_states
+
+        conn = self._conn()
+        try:
+            conn.execute(
+                """
+                CREATE TABLE pullback_state_history (
+                  trade_date TEXT NOT NULL,
+                  sec_code TEXT NOT NULL,
+                  state TEXT NOT NULL,
+                  trend_profile TEXT,
+                  as_of TEXT,
+                  created_at TEXT,
+                  PRIMARY KEY (trade_date, sec_code)
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO pullback_state_history
+                  (trade_date, sec_code, state, trend_profile, as_of, created_at)
+                VALUES ('2026-08-04', '600001', '回调中', 'P120', '2026-08-04 15:10:00', 'legacy')
+                """
+            )
+            conn.commit()
+
+            migrate_selection_batch_schema(conn)
+            migrate_selection_batch_schema(conn)
+
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(pullback_state_history)")}
+            self.assertTrue({"batch_id", "definition_version", "state_id"}.issubset(columns))
+            self.assertEqual(
+                [(None, None, "2026-08-04", "600001", "回调中")],
+                [tuple(row) for row in conn.execute(
+                    """
+                    SELECT batch_id, definition_version, trade_date, sec_code, state
+                    FROM pullback_state_history
+                    """
+                ).fetchall()],
+            )
+            self.assertEqual({}, load_prior_pullback_states(conn, "2026-08-05"))
+        finally:
+            conn.close()
+
+    def test_prior_state_reader_uses_latest_current_complete_batch_only(self) -> None:
+        from mining.candidate_persistence import (
+            CapabilityResult,
+            PullbackStateRow,
+            migrate_selection_batch_schema,
+            persist_close_final_batch,
+        )
+        from mining.watchlist import load_prior_pullback_states
+
+        conn = self._conn()
+
+        def results_with_state(state: str):
+            results = list(self._results(include_all=False))
+            c_index = next(index for index, item in enumerate(results) if item.strategy_id == "second_launch")
+            c_result = results[c_index]
+            results[c_index] = CapabilityResult(
+                c_result.strategy_id,
+                c_result.candidates,
+                c_result.universe_size,
+                c_result.status,
+                c_result.error_msg,
+                state_rows=(PullbackStateRow("600004", state, "P120"),),
+            )
+            return results
+
+        try:
+            migrate_selection_batch_schema(conn)
+            first = persist_close_final_batch(conn, self._context("state-first"), results_with_state("回调中"))
+            second = persist_close_final_batch(conn, self._context("state-second"), results_with_state("回调到位"))
+            self.assertEqual("complete", first.status, first.error_msg)
+            self.assertEqual("complete", second.status, second.error_msg)
+            self.assertEqual(
+                {"600004": ("回调到位",)},
+                load_prior_pullback_states(
+                    conn,
+                    "2026-08-06",
+                    clean_dates=["2026-08-05", "2026-08-06"],
+                ),
+            )
+
+            conn.execute(
+                "UPDATE selection_batches SET definition_version='v2.4' WHERE batch_id=?",
+                (second.batch_id,),
+            )
+            conn.execute(
+                "UPDATE pullback_state_history SET definition_version='v2.4' WHERE batch_id=?",
+                (second.batch_id,),
+            )
+            conn.commit()
+            self.assertEqual(
+                {"600004": ("回调中",)},
+                load_prior_pullback_states(conn, "2026-08-06"),
+            )
+
+            third = persist_close_final_batch(conn, self._context("state-third"), results_with_state("再启动"))
+            self.assertEqual("complete", third.status, third.error_msg)
+            conn.execute("UPDATE selection_batches SET status='failed' WHERE batch_id=?", (third.batch_id,))
+            conn.commit()
+            self.assertEqual(
+                {"600004": ("回调中",)},
+                load_prior_pullback_states(conn, "2026-08-06"),
+            )
+            self.assertEqual(3, conn.execute("SELECT COUNT(*) FROM pullback_state_history").fetchone()[0])
+            self.assertEqual("complete", first.status)
         finally:
             conn.close()
 
@@ -114,6 +285,11 @@ class CandidatePersistenceTests(unittest.TestCase):
             self.assertEqual(set(visible["sec_code"]), set(panel_visible["sec_code"]))
             self.assertEqual(6, len(rows))
             self.assertIn(("strong_trend", "600001"), [tuple(row) for row in rows])
+            self.assertEqual(3, conn.execute("SELECT COUNT(*) FROM pullback_state_history").fetchone()[0])
+            self.assertEqual(
+                3,
+                conn.execute("SELECT COUNT(DISTINCT batch_id) FROM pullback_state_history").fetchone()[0],
+            )
         finally:
             conn.close()
 
@@ -149,8 +325,57 @@ class CandidatePersistenceTests(unittest.TestCase):
             try:
                 self.assertEqual(1, verify.execute("SELECT COUNT(*) FROM selection_batches WHERE status='complete'").fetchone()[0])
                 self.assertEqual(6, verify.execute("SELECT COUNT(*) FROM strategy_runs WHERE mode='close_final'").fetchone()[0])
+                self.assertEqual(1, verify.execute("SELECT COUNT(*) FROM pullback_state_history").fetchone()[0])
             finally:
                 verify.close()
+
+    def test_pullback_state_sql_failure_rolls_back_new_batch_and_preserves_old_complete(self) -> None:
+        from mining.candidate_persistence import (
+            CapabilityResult,
+            PullbackStateRow,
+            migrate_selection_batch_schema,
+            persist_close_final_batch,
+        )
+        from mining.reports import load_formal_capability_candidates
+
+        conn = self._conn()
+        try:
+            migrate_selection_batch_schema(conn)
+            seed = persist_close_final_batch(conn, self._context("seed-state"), self._results(include_all=True))
+            conn.execute(
+                """
+                CREATE TRIGGER reject_retrigger_state
+                BEFORE INSERT ON pullback_state_history
+                WHEN NEW.state='再启动'
+                BEGIN
+                  SELECT RAISE(ABORT, 'deliberate C state failure');
+                END
+                """
+            )
+            failed_results = list(self._results(code_suffix="9", include_all=False))
+            c_index = next(index for index, item in enumerate(failed_results) if item.strategy_id == "second_launch")
+            c_result = failed_results[c_index]
+            failed_results[c_index] = CapabilityResult(
+                c_result.strategy_id,
+                c_result.candidates,
+                c_result.universe_size,
+                c_result.status,
+                c_result.error_msg,
+                state_rows=(PullbackStateRow("600014", "再启动", "P120"),),
+            )
+
+            failed = persist_close_final_batch(conn, self._context("failed-state"), failed_results)
+            visible = load_formal_capability_candidates(conn, "2026-08-05")
+
+            self.assertEqual("complete", seed.status)
+            self.assertEqual("persistence_error", failed.status)
+            self.assertEqual(seed.batch_id, conn.execute(
+                "SELECT batch_id FROM selection_batches WHERE status='complete'"
+            ).fetchone()[0])
+            self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM pullback_state_history").fetchone()[0])
+            self.assertEqual(6, len(visible))
+        finally:
+            conn.close()
 
     def test_missing_or_invalid_schema_never_reads_unbatched_formal_rows(self) -> None:
         from mining.reports import load_formal_capability_candidates

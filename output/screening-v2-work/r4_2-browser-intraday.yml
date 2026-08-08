@@ -1,0 +1,346 @@
+- generic [ref=e2]:
+  - generic [ref=e11]:
+    - status [ref=e14]:
+      - paragraph [ref=e18]: 隔离验收模式：只读取 SCREENING_BASE_DIR 中的副本；自动修复与回填已禁用。
+    - heading "参数" [level=2] [ref=e22]
+    - heading "情绪总分权重（默认=你的固定权重）" [level=3] [ref=e26]
+    - generic [ref=e28]:
+      - paragraph [ref=e32]: "wB(广度: 上涨家数占比/涨跌家数比)"
+      - generic [ref=e33]:
+        - 'spinbutton "wB(广度: 上涨家数占比/涨跌家数比)" [ref=e36]': "0.35"
+        - generic [ref=e37]:
+          - button [ref=e38] [cursor=pointer]
+          - button [ref=e41] [cursor=pointer]
+    - generic [ref=e45]:
+      - paragraph [ref=e49]: "wL(流动性: 成交额/MA10-1)"
+      - generic [ref=e50]:
+        - 'spinbutton "wL(流动性: 成交额/MA10-1)" [ref=e53]': "0.25"
+        - generic [ref=e54]:
+          - button [ref=e55] [cursor=pointer]
+          - button [ref=e58] [cursor=pointer]
+    - generic [ref=e62]:
+      - paragraph [ref=e66]: "wH(热度: 热股超额)"
+      - generic [ref=e67]:
+        - 'spinbutton "wH(热度: 热股超额)" [ref=e70]': "0.15"
+        - generic [ref=e71]:
+          - button [ref=e72] [cursor=pointer]
+          - button [ref=e75] [cursor=pointer]
+    - generic [ref=e79]:
+      - paragraph [ref=e83]: "wR(风格: 小盘-大盘相对)"
+      - generic [ref=e84]:
+        - 'spinbutton "wR(风格: 小盘-大盘相对)" [ref=e87]': "0.15"
+        - generic [ref=e88]:
+          - button [ref=e89] [cursor=pointer]
+          - button [ref=e92] [cursor=pointer]
+    - generic [ref=e96]:
+      - paragraph [ref=e100]: "wE(资金: 权益ETF份额日增幅%)"
+      - generic [ref=e101]:
+        - 'spinbutton "wE(资金: 权益ETF份额日增幅%)" [ref=e104]': "0.10"
+        - generic [ref=e105]:
+          - button [ref=e106] [cursor=pointer]
+          - button [ref=e109] [cursor=pointer]
+    - generic [ref=e113]:
+      - paragraph [ref=e117]: 热股TopN(按成交额)
+      - generic [ref=e118]:
+        - spinbutton "热股TopN(按成交额)" [ref=e121]: "100"
+        - generic [ref=e122]:
+          - button [ref=e123] [cursor=pointer]
+          - button [ref=e126] [cursor=pointer]
+    - generic [ref=e130]:
+      - paragraph [ref=e134]: 日线回看(交易日)
+      - generic [ref=e135]:
+        - spinbutton "日线回看(交易日)" [ref=e138]: "60"
+        - generic [ref=e139]:
+          - button [ref=e140] [cursor=pointer]
+          - button [ref=e143] [cursor=pointer]
+    - generic [ref=e147]:
+      - paragraph [ref=e151]: 题材TopK
+      - generic [ref=e152]:
+        - spinbutton "题材TopK" [ref=e155]: "30"
+        - generic [ref=e156]:
+          - button [ref=e157] [cursor=pointer]
+          - button [ref=e160] [cursor=pointer]
+    - heading "数据日期切换" [level=3] [ref=e166]
+    - generic [ref=e168]:
+      - paragraph [ref=e172]: 北京时间偏移(UTC+?)
+      - generic [ref=e173]:
+        - spinbutton "北京时间偏移(UTC+?)" [ref=e176]: "8"
+        - generic [ref=e177]:
+          - button [ref=e178] [cursor=pointer]
+          - button [ref=e181] [cursor=pointer]
+    - generic [ref=e185]:
+      - paragraph [ref=e189]: 查看数据日期
+      - radiogroup "查看数据日期" [ref=e190] [cursor=pointer]:
+        - generic [ref=e191]:
+          - radio "盘中快照（2026-08-06）" [checked]
+          - paragraph [ref=e196]: 盘中快照（2026-08-06）
+        - generic [ref=e197]:
+          - radio "T-1 收盘（2026-08-05）"
+          - paragraph [ref=e202]: T-1 收盘（2026-08-05）
+        - generic [ref=e203]:
+          - radio "T-2 收盘（2026-08-04）"
+          - paragraph [ref=e208]: T-2 收盘（2026-08-04）
+    - paragraph [ref=e213]: 接口最新收盘：stock=2026-08-05｜concept=2026-08-05｜aligned(T-1)=2026-08-05｜T-2=2026-08-04
+    - paragraph [ref=e218]: 说明：选择“最近收盘”将禁用所有盘中快照；选择“盘中快照优先”则尽可能使用快照并对不可取字段回退到最近收盘。
+    - heading "数据库追平（对齐接口最新收盘）" [level=3] [ref=e222]
+    - alert [ref=e225]:
+      - paragraph [ref=e229]: "DB date gaps detected: {'stock': ['2026-07-23', '2026-07-24', '2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31', '2026-08-03', '2026-08-04', '2026-08-05'], 'concept': ['2026-07-23', '2026-07-24', '2026-07-27', '2026-07-28', '2026-07-29', '2026-07-30', '2026-07-31', '2026-08-03', '2026-08-04', '2026-08-05'], 'mining': ['2026-07-23', '2026-07-24', '2026-07-27']}"
+    - paragraph [ref=e234]: 隔离验收模式不启动 offline_daily_update；数据库副本保持冻结。
+    - generic [ref=e237] [cursor=pointer]:
+      - checkbox "自动追平（DB落后时自动更新）"
+      - paragraph [ref=e242]: 自动追平（DB落后时自动更新）
+    - generic [ref=e245] [cursor=pointer]:
+      - checkbox "强制全量 backfill（60日）"
+      - paragraph [ref=e250]: 强制全量 backfill（60日）
+    - generic [ref=e253] [cursor=pointer]:
+      - checkbox "显示追平日志"
+      - paragraph [ref=e258]: 显示追平日志
+    - paragraph [ref=e263]: 本地最新：stock=2026-08-05｜index=2026-08-05｜concept=2026-04-16｜etf=2026-08-06
+    - heading "数据库日线更新（adata/baostock）" [level=3] [ref=e267]
+    - generic [ref=e270] [cursor=pointer]:
+      - checkbox "盘后自动：使用日线接口更新DB并重算"
+      - paragraph [ref=e275]: 盘后自动：使用日线接口更新DB并重算
+    - button [ref=e278] [cursor=pointer]:
+      - paragraph [ref=e282]: 核验DB最新交易日数据
+    - button [ref=e285] [cursor=pointer]:
+      - paragraph [ref=e289]: 手动更新DB（日线接口）
+    - button [ref=e292] [cursor=pointer]:
+      - paragraph [ref=e296]: 修复最新交易日（日线接口，覆写当日数据）
+    - group [ref=e299]:
+      - generic "keyboard_arrow_right 日线更新 / 核验日志" [ref=e300] [cursor=pointer]:
+        - generic [ref=e301]:
+          - generic [ref=e302]: keyboard_arrow_right
+          - paragraph [ref=e306]: 日线更新 / 核验日志
+  - generic [ref=e3]:
+    - banner [ref=e309]:
+      - generic [ref=e312]:
+        - button "Deploy" [ref=e314] [cursor=pointer]
+        - button "Main menu" [ref=e318] [cursor=pointer]
+    - generic [ref=e322]:
+      - heading "A股情绪 & 板块风险观察" [level=1] [ref=e327]:
+        - text: A股情绪 & 板块风险观察
+        - generic [ref=e328]:
+          - link "Link to heading":
+            - /url: "#a-and"
+      - group [ref=e331]:
+        - generic "keyboard_arrow_right 数据核验（成交额/索引）" [ref=e332] [cursor=pointer]:
+          - generic [ref=e333]:
+            - generic [ref=e334]: keyboard_arrow_right
+            - paragraph [ref=e338]: 数据核验（成交额/索引）
+      - group [ref=e341]:
+        - generic "keyboard_arrow_down 缺失/提示" [ref=e342] [cursor=pointer]:
+          - generic [ref=e343]:
+            - generic [ref=e344]: keyboard_arrow_down
+            - paragraph [ref=e348]: 缺失/提示
+        - generic [ref=e350]:
+          - list [ref=e355]:
+            - listitem [ref=e356]: 成交额/MA10 指标检测到异常极值：已做[-90%, +300%]裁剪以避免口径错误/缺数据导致的失真
+          - list [ref=e361]:
+            - listitem [ref=e362]: 全A成交额单位推断：已乘以 1000 转为元口径
+          - list [ref=e367]:
+            - listitem [ref=e368]: 严格分母(000001+399001)成交额缩放因子=1
+      - group [ref=e371]:
+        - generic "keyboard_arrow_right QVIX 调试" [ref=e372] [cursor=pointer]:
+          - generic [ref=e373]:
+            - generic [ref=e374]: keyboard_arrow_right
+            - paragraph [ref=e378]: QVIX 调试
+      - paragraph [ref=e383]: "北京时间 2026-08-06 10:30:00 ｜交易时段: 是 ｜盘中快照: 未启用"
+      - paragraph [ref=e388]: 标记说明：🟢=盘中实时快照；(昨)=使用昨日收盘/最新日线；—=取值失败或缺数据（详见上方提示）
+      - generic [ref=e390]:
+        - generic [ref=e395]:
+          - paragraph [ref=e398]: 情绪总分（0-100）
+          - paragraph [ref=e401]: "42.97"
+        - generic [ref=e406]:
+          - paragraph [ref=e409]: 动量(EMA3-EMA10)
+          - paragraph [ref=e412]: "-2.42"
+        - generic [ref=e417]:
+          - paragraph [ref=e420]: 动量Z
+          - paragraph [ref=e423]: "-0.12"
+        - generic [ref=e428]:
+          - paragraph [ref=e431]: 涨跌家数比(涨:跌)
+          - paragraph [ref=e434]: 3:0
+        - generic [ref=e439]:
+          - paragraph [ref=e442]: 全A等权涨跌幅
+          - paragraph [ref=e445]: 2.07%
+      - generic [ref=e447]:
+        - generic [ref=e452]:
+          - paragraph [ref=e455]: 500ETF QVIX / 分位
+          - paragraph [ref=e458]: 28.02 (83%)
+        - generic [ref=e463]:
+          - paragraph [ref=e466]: 热股超额(Top热-全A等权)
+          - paragraph [ref=e469]: 0.00%
+        - generic [ref=e474]:
+          - paragraph [ref=e477]: 小盘-大盘相对(1000-300)
+          - paragraph [ref=e480]: 0.00%
+        - generic [ref=e485]:
+          - paragraph [ref=e488]: 权益ETF份额日增幅
+          - paragraph [ref=e491]: "-0.85%"
+        - generic [ref=e496]:
+          - paragraph [ref=e499]: 成交额/MA10-1
+          - paragraph [ref=e502]: 0.00%
+      - heading "情绪总分（日线）" [level=3] [ref=e508]:
+        - text: 情绪总分（日线）
+        - generic [ref=e509]:
+          - link "Link to heading":
+            - /url: "#7cb9e372"
+      - generic [ref=e512]:
+        - generic [ref=e514]:
+          - button "Show data" [ref=e517] [cursor=pointer]
+          - button "Fullscreen" [ref=e523] [cursor=pointer]
+        - generic [ref=e527]:
+          - generic "Vega visualization" [ref=e528]:
+            - img [ref=e529]:
+              - generic [ref=e534]:
+                - generic "X-axis for a time scale with values from Thursday, 11 June 2026, 12:00:00 AM to Wednesday, 05 August 2026, 12:00:00 AM" [ref=e538]:
+                  - generic [ref=e540]:
+                    - generic:
+                      - generic: Thu 11
+                      - generic: Sat 13
+                      - generic: Mon 15
+                      - generic: Wed 17
+                      - generic: Fri 19
+                      - generic: Jun 21
+                      - generic: Tue 23
+                      - generic: Thu 25
+                      - generic: Sat 27
+                      - generic: Mon 29
+                      - generic: July
+                      - generic: Fri 03
+                      - generic: Jul 05
+                      - generic: Tue 07
+                      - generic: Thu 09
+                      - generic: Sat 11
+                      - generic: Mon 13
+                      - generic: Wed 15
+                      - generic: Fri 17
+                      - generic: Jul 19
+                      - generic: Tue 21
+                      - generic: Thu 23
+                      - generic: Sat 25
+                      - generic: Mon 27
+                      - generic: Wed 29
+                      - generic: Fri 31
+                      - generic: August
+                      - generic: Mon 03
+                      - generic: Wed 05
+                - generic "Y-axis for a linear scale with values from 0 to 70" [ref=e541]:
+                  - generic [ref=e543]:
+                    - generic:
+                      - generic: "0"
+                      - generic: "10"
+                      - generic: "20"
+                      - generic: "30"
+                      - generic: "40"
+                      - generic: "50"
+                      - generic: "60"
+                      - generic: "70"
+                - 'generic "trade_date: Jun 11, 2026; sentiment_score: 54.6972513219" [ref=e545]'
+                - generic [ref=e546]:
+                  - 'generic "trade_date: Jun 11, 2026; sentiment_score: 54.6972513219" [ref=e547]'
+                  - 'generic "trade_date: Jun 12, 2026; sentiment_score: 51.5510605751" [ref=e548]'
+                  - 'generic "trade_date: Jun 15, 2026; sentiment_score: 52.0836167655" [ref=e549]'
+                  - 'generic "trade_date: Jun 16, 2026; sentiment_score: 47.4606985898" [ref=e550]'
+                  - 'generic "trade_date: Jun 17, 2026; sentiment_score: 41.44697231" [ref=e551]'
+                  - 'generic "trade_date: Jun 18, 2026; sentiment_score: 44.4918438985" [ref=e552]'
+                  - 'generic "trade_date: Jun 19, 2026; sentiment_score: 50" [ref=e553]'
+                  - 'generic "trade_date: Jun 22, 2026; sentiment_score: 46.5471513722" [ref=e554]'
+                  - 'generic "trade_date: Jun 23, 2026; sentiment_score: 44.4361376225" [ref=e555]'
+                  - 'generic "trade_date: Jun 24, 2026; sentiment_score: 51.6240633776" [ref=e556]'
+                  - 'generic "trade_date: Jun 25, 2026; sentiment_score: 54.7600281965" [ref=e557]'
+                  - 'generic "trade_date: Jun 26, 2026; sentiment_score: 62.4510953722" [ref=e558]'
+                  - 'generic "trade_date: Jun 29, 2026; sentiment_score: 50.9788743281" [ref=e559]'
+                  - 'generic "trade_date: Jun 30, 2026; sentiment_score: 51.5970456411" [ref=e560]'
+                  - 'generic "trade_date: Jul 01, 2026; sentiment_score: 53.1273983622" [ref=e561]'
+                  - 'generic "trade_date: Jul 02, 2026; sentiment_score: 69.3492155829" [ref=e562]'
+                  - 'generic "trade_date: Jul 03, 2026; sentiment_score: 69.3492155829" [ref=e563]'
+                  - 'generic "trade_date: Jul 06, 2026; sentiment_score: 63.5475896273" [ref=e564]'
+                  - 'generic "trade_date: Jul 07, 2026; sentiment_score: 60.367950048" [ref=e565]'
+                  - 'generic "trade_date: Jul 08, 2026; sentiment_score: 62.1207929323" [ref=e566]'
+                  - 'generic "trade_date: Jul 09, 2026; sentiment_score: 66.6845880665" [ref=e567]'
+                  - 'generic "trade_date: Jul 10, 2026; sentiment_score: 56.4395362702" [ref=e568]'
+                  - 'generic "trade_date: Jul 13, 2026; sentiment_score: 62.7692713414" [ref=e569]'
+                  - 'generic "trade_date: Jul 14, 2026; sentiment_score: 54.4308676522" [ref=e570]'
+                  - 'generic "trade_date: Jul 15, 2026; sentiment_score: 51.312216077" [ref=e571]'
+                  - 'generic "trade_date: Jul 16, 2026; sentiment_score: 56.2891552983" [ref=e572]'
+                  - 'generic "trade_date: Jul 17, 2026; sentiment_score: 69.3411946428" [ref=e573]'
+                  - 'generic "trade_date: Jul 20, 2026; sentiment_score: 69.3492155829" [ref=e574]'
+                  - 'generic "trade_date: Jul 21, 2026; sentiment_score: 45.0224481507" [ref=e575]'
+                  - 'generic "trade_date: Jul 22, 2026; sentiment_score: 45.0233037196" [ref=e576]'
+                  - 'generic "trade_date: Jul 23, 2026; sentiment_score: 54.0243634076" [ref=e577]'
+                  - 'generic "trade_date: Jul 24, 2026; sentiment_score: 53.5633287377" [ref=e578]'
+                  - 'generic "trade_date: Jul 27, 2026; sentiment_score: 50.9121803494" [ref=e579]'
+                  - 'generic "trade_date: Jul 28, 2026; sentiment_score: 56.9015859975" [ref=e580]'
+                  - 'generic "trade_date: Jul 29, 2026; sentiment_score: 6.72476409108" [ref=e581]'
+                  - 'generic "trade_date: Jul 30, 2026; sentiment_score: 58.5829998314" [ref=e582]'
+                  - 'generic "trade_date: Jul 31, 2026; sentiment_score: 44.6624863684" [ref=e583]'
+                  - 'generic "trade_date: Aug 03, 2026; sentiment_score: 55.9999692332" [ref=e584]'
+                  - 'generic "trade_date: Aug 04, 2026; sentiment_score: 42.4875771511" [ref=e585]'
+                  - 'generic "trade_date: Aug 05, 2026; sentiment_score: 42.96539752" [ref=e586]'
+          - group "Click to view actions":
+            - generic [ref=e628] [cursor=pointer]
+      - separator [ref=e637]
+      - heading "机会挖掘" [level=3] [ref=e642]:
+        - text: 机会挖掘
+        - generic [ref=e643]:
+          - link "Link to heading":
+            - /url: "#d5fddeab"
+      - paragraph [ref=e648]:
+        - strong [ref=e649]: 当时市场背景
+      - paragraph [ref=e654]: 市场灯不可用：样本不足
+      - paragraph [ref=e659]:
+        - strong [ref=e660]: 筛选证据
+      - generic [ref=e665]:
+        - button "Show/hide columns" [ref=e669] [cursor=pointer]
+        - button "Download as CSV" [ref=e675] [cursor=pointer]
+        - button "Search" [ref=e681] [cursor=pointer]
+        - button "Fullscreen" [ref=e687] [cursor=pointer]
+      - paragraph [ref=e703]: 日期对齐：selected=2026-08-06 ｜ effective=2026-08-06 ｜ formal trade_date=2026-08-06
+      - alert [ref=e706]:
+        - paragraph [ref=e710]: 盘中临时结果：不会写入正式收盘候选或状态历史。
+      - paragraph [ref=e715]:
+        - strong [ref=e716]: 正式筛选 A–E
+      - generic [ref=e721]:
+        - button "Show/hide columns" [ref=e725] [cursor=pointer]
+        - button "Download as CSV" [ref=e731] [cursor=pointer]
+        - button "Search" [ref=e737] [cursor=pointer]
+        - button "Fullscreen" [ref=e743] [cursor=pointer]
+      - paragraph [ref=e759]:
+        - strong [ref=e760]: A · 强趋势
+      - paragraph [ref=e765]: "strong_trend：成功但 0 条；跳过={'a_path_failed': 2, 'liquidity_failed': 1, 'ma20_slope_failed': 1, 'rps20_failed': 2, 'short_medium_structure_failed': 1}"
+      - status [ref=e768]:
+        - paragraph [ref=e772]: 该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。
+      - paragraph [ref=e777]:
+        - strong [ref=e778]: B · 异动起爆
+      - paragraph [ref=e783]: "compression_launch：成功但 0 条；跳过={'compression_gate_failed': 3} | momentum_anomaly：成功但 0 条；跳过={'momentum_gate_failed': 3}"
+      - status [ref=e786]:
+        - paragraph [ref=e790]: 该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。
+      - paragraph [ref=e795]:
+        - strong [ref=e796]: C · 回调支撑
+      - alert [ref=e799]:
+        - paragraph [ref=e803]: a_history_coverage=7/60；bootstrapping/partial recall，已有候选保持展示。
+      - paragraph [ref=e808]: "second_launch：成功但 0 条；跳过={'never_in_a_qualified_pool': 1}"
+      - status [ref=e811]:
+        - paragraph [ref=e815]: 该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。
+      - paragraph [ref=e820]:
+        - strong [ref=e821]: D · 平台突破
+      - paragraph [ref=e826]: "base_breakout：成功但 0 条；跳过={'base_breakout_gate_failed': 3}"
+      - status [ref=e829]:
+        - paragraph [ref=e833]: 该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。
+      - paragraph [ref=e838]:
+        - strong [ref=e839]: E · 逆势强度
+      - paragraph [ref=e844]: "counter_trend_rs：成功但 0 条；跳过={'primary_benchmark_not_weak': 3}"
+      - status [ref=e847]:
+        - paragraph [ref=e851]: 该能力暂无收盘定版候选；请结合上方运行状态区分未运行、失败、空榜或数据缺失。
+      - group [ref=e854]:
+        - generic "keyboard_arrow_right Legacy / 其他观察（对照）" [ref=e855] [cursor=pointer]:
+          - generic [ref=e856]:
+            - generic [ref=e857]: keyboard_arrow_right
+            - paragraph [ref=e861]: Legacy / 其他观察（对照）
+      - separator [ref=e866]
+      - heading "指标体系B：同花顺概念板块（Theme Cycle）" [level=3] [ref=e871]:
+        - text: 指标体系B：同花顺概念板块（Theme Cycle）
+        - generic [ref=e872]:
+          - link "Link to heading":
+            - /url: "#b-theme-cycle"
+      - alert [ref=e875]:
+        - paragraph [ref=e879]: 题材数据缺失：concept_kline_ths 为空或不可用。

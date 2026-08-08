@@ -1,0 +1,12 @@
+{
+  "state": "final",
+  "url": "http://127.0.0.1:18623/",
+  "command": "playwright-cli --json console",
+  "total_messages": 24,
+  "errors": 0,
+  "warnings": 24,
+  "unique_warnings": [
+    "WARN Infinite extent for field trade_date: [Infinity, -Infinity]",
+    "WARN Infinite extent for field sentiment_score: [Infinity, -Infinity]"
+  ]
+}

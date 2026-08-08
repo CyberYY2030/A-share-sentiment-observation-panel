@@ -1004,17 +1004,11 @@ def _build_followups(
         return pd.DataFrame()
 
     follow = previous_df[["strategy_id", "sec_code", "sec_name", "rank", "entry_price"]].copy()
-    follow["latest_price"] = follow["sec_code"].map(latest_prices)
-    valid = (
-        pd.to_numeric(follow["entry_price"], errors="coerce").gt(0)
-        & pd.to_numeric(follow["latest_price"], errors="coerce").notna()
-    )
-    follow["today_change_pct"] = math.nan
-    follow.loc[valid, "today_change_pct"] = (
-        (follow.loc[valid, "latest_price"] - follow.loc[valid, "entry_price"])
-        / follow.loc[valid, "entry_price"]
-        * 100.0
-    )
+    follow["latest_price"] = pd.to_numeric(follow["sec_code"].map(latest_prices), errors="coerce")
+    entry_price = pd.to_numeric(follow["entry_price"], errors="coerce")
+    valid = entry_price.gt(0) & follow["latest_price"].notna()
+    change_pct = ((follow["latest_price"] - entry_price) / entry_price * 100.0).where(valid)
+    follow["today_change_pct"] = pd.to_numeric(change_pct, errors="coerce").astype("float64")
     follow["status"] = status
     return follow.sort_values(["strategy_id", "rank", "sec_code"]).reset_index(drop=True)
 
@@ -1702,11 +1696,12 @@ def render_scanner_tab(
     st.caption(_format_market_regime(market_summary))
 
     formal_trade_date = query_trade_date or today_date
+    effective_trade_date = formal_trade_date
     st.markdown("**筛选证据**")
     st.dataframe(pd.DataFrame([selection_evidence]), width="stretch", hide_index=True)
     st.caption(
         "日期对齐："
-        f"selected={query_trade_date or 'N/A'} ｜ effective={today_date or 'N/A'} ｜ "
+        f"selected={query_trade_date or 'N/A'} ｜ effective={effective_trade_date or 'N/A'} ｜ "
         f"formal trade_date={formal_trade_date or 'N/A'}"
     )
     if selection_evidence["mode"] == "intraday_snapshot":

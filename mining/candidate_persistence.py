@@ -25,7 +25,7 @@ from .scanners.momentum_breakout import evaluate_momentum_anomaly
 from .scanners.second_launch import select_candidates_from_pullback_support
 from .scanners.strong_trend import evaluate_strong_trend
 from .selection_batches import selection_batch_schema_ready, selection_batch_schema_state
-from .watchlist import build_pullback_support
+from .watchlist import PULLBACK_STATE_HISTORY_TABLE, PULLBACK_SUPPORT_STATES, build_pullback_support
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,17 @@ class CapabilityResult:
     universe_size: int
     status: str = "ok"
     error_msg: str | None = None
+    state_rows: tuple[PullbackStateRow, ...] = ()
+
+
+@dataclass(frozen=True)
+class PullbackStateRow:
+    sec_code: str
+    state: str
+    trend_profile: str | None
+    pullback_pct: float | None = None
+    reclaim_ma10: bool | None = None
+    activity_expand: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ def migrate_selection_batch_schema(conn: sqlite3.Connection) -> None:
         ):
             if column not in existing:
                 conn.execute(f"ALTER TABLE strategy_runs ADD COLUMN {column} {definition}")
+        _migrate_pullback_state_history(conn)
         conn.execute(
             """
             CREATE INDEX IF NOT EXISTS idx_selection_batches_lookup
@@ -90,6 +102,80 @@ def migrate_selection_batch_schema(conn: sqlite3.Connection) -> None:
     except Exception:
         conn.rollback()
         raise
+
+
+def _create_pullback_state_history(conn: sqlite3.Connection, table_name: str) -> None:
+    conn.execute(
+        f"""
+        CREATE TABLE {table_name} (
+          state_id INTEGER PRIMARY KEY AUTOINCREMENT,
+          batch_id INTEGER,
+          definition_version TEXT,
+          trade_date TEXT NOT NULL,
+          sec_code TEXT NOT NULL,
+          state TEXT NOT NULL,
+          trend_profile TEXT,
+          as_of TEXT,
+          created_at TEXT,
+          CHECK (
+            (batch_id IS NULL AND definition_version IS NULL)
+            OR (batch_id IS NOT NULL AND definition_version IS NOT NULL)
+          ),
+          UNIQUE (batch_id, sec_code),
+          FOREIGN KEY (batch_id) REFERENCES selection_batches(batch_id)
+        )
+        """
+    )
+
+
+def _migrate_pullback_state_history(conn: sqlite3.Connection) -> None:
+    """Create the R4.2 batch-owned state table while retaining legacy rows as ineligible audit data."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (PULLBACK_STATE_HISTORY_TABLE,),
+    ).fetchone()
+    required = {
+        "state_id",
+        "batch_id",
+        "definition_version",
+        "trade_date",
+        "sec_code",
+        "state",
+        "trend_profile",
+        "as_of",
+        "created_at",
+    }
+    if exists is None:
+        _create_pullback_state_history(conn, PULLBACK_STATE_HISTORY_TABLE)
+    else:
+        columns = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({PULLBACK_STATE_HISTORY_TABLE})")}
+        if not required.issubset(columns):
+            legacy_columns = {"trade_date", "sec_code", "state", "trend_profile", "as_of", "created_at"}
+            if not legacy_columns.issubset(columns):
+                raise sqlite3.DatabaseError("pullback_state_history has an unsupported legacy schema")
+            replacement = f"{PULLBACK_STATE_HISTORY_TABLE}_r42"
+            _create_pullback_state_history(conn, replacement)
+            conn.execute(
+                f"""
+                INSERT INTO {replacement} (
+                  batch_id, definition_version, trade_date, sec_code, state,
+                  trend_profile, as_of, created_at
+                )
+                SELECT NULL, NULL, trade_date, sec_code, state,
+                       trend_profile, as_of, created_at
+                FROM {PULLBACK_STATE_HISTORY_TABLE}
+                """
+            )
+            conn.execute(f"DROP TABLE {PULLBACK_STATE_HISTORY_TABLE}")
+            conn.execute(f"ALTER TABLE {replacement} RENAME TO {PULLBACK_STATE_HISTORY_TABLE}")
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{PULLBACK_STATE_HISTORY_TABLE}_code_date "
+        f"ON {PULLBACK_STATE_HISTORY_TABLE}(sec_code, trade_date)"
+    )
+    conn.execute(
+        f"CREATE INDEX IF NOT EXISTS idx_{PULLBACK_STATE_HISTORY_TABLE}_batch "
+        f"ON {PULLBACK_STATE_HISTORY_TABLE}(batch_id, definition_version)"
+    )
 
 
 def _json_value(value: Any) -> Any:
@@ -210,7 +296,27 @@ def evaluate_formal_capabilities(conn: sqlite3.Connection, context: Any) -> tupl
                 top_n=20,
             )
         )
-        results.append(CapabilityResult("second_launch", candidates, universe_size, "ok" if candidates else "empty"))
+        profile_id = evaluation.trend_profile.profile_id if evaluation.trend_profile else None
+        state_rows = tuple(
+            PullbackStateRow(
+                str(row.sec_code).zfill(6),
+                str(row.state),
+                profile_id,
+                float(row.pullback_pct),
+                bool(row.reclaim_ma10),
+                bool(row.activity_expand),
+            )
+            for row in evaluation.rows.itertuples(index=False)
+        )
+        results.append(
+            CapabilityResult(
+                "second_launch",
+                candidates,
+                universe_size,
+                "ok" if candidates else "empty",
+                state_rows=state_rows,
+            )
+        )
     except Exception as exc:
         append_failure("second_launch", exc)
     try:
@@ -292,6 +398,19 @@ def _validate_results(results: Iterable[CapabilityResult]) -> tuple[CapabilityRe
         for candidate in result.candidates:
             if candidate.strategy_id != definition.strategy_id:
                 raise ValueError(f"candidate strategy mismatch for {definition.strategy_id}")
+        if result.strategy_id != "second_launch" and result.state_rows:
+            raise ValueError(f"state rows are not allowed for {result.strategy_id}")
+        if result.strategy_id == "second_launch":
+            state_codes = [str(row.sec_code).zfill(6) for row in result.state_rows]
+            if len(state_codes) != len(set(state_codes)):
+                raise ValueError("duplicate second_launch state row")
+            if any(not code.strip("0") for code in state_codes):
+                raise ValueError("second_launch state row has no sec_code")
+            if any(row.state not in PULLBACK_SUPPORT_STATES for row in result.state_rows):
+                raise ValueError("second_launch state row has an invalid state")
+            candidate_codes = {str(candidate.sec_code).zfill(6) for candidate in result.candidates}
+            if not candidate_codes.issubset(set(state_codes)):
+                raise ValueError("second_launch candidate has no matching state row")
     return ordered
 
 
@@ -428,6 +547,27 @@ def persist_close_final_batch(
                             int(existing_candidate[0]),
                         ),
                     )
+
+        c_result = next(result for result in results if result.strategy_id == "second_launch")
+        for state_row in c_result.state_rows:
+            conn.execute(
+                f"""
+                INSERT INTO {PULLBACK_STATE_HISTORY_TABLE} (
+                  batch_id, definition_version, trade_date, sec_code, state,
+                  trend_profile, as_of, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    batch_id,
+                    SCREENING_DEFINITION_VERSION,
+                    str(context.trade_date),
+                    str(state_row.sec_code).zfill(6),
+                    state_row.state,
+                    state_row.trend_profile,
+                    str(context.as_of),
+                    created_at,
+                ),
+            )
 
         strategy_marks = ",".join("?" for _ in formal_strategy_ids())
         run_marks = ",".join("?" for _ in run_ids)

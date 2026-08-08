@@ -975,16 +975,29 @@ def load_prior_pullback_states(
     clean_dates: Sequence[str] | None = None,
 ) -> dict[str, tuple[str, ...]]:
     """Read only already-finalized C states from the five immediately prior sessions."""
+    if not selection_batch_schema_state(conn).ready:
+        return {}
     allowed_dates = set(map(str, clean_dates[-6:-1])) if clean_dates and len(clean_dates) >= 2 else None
     try:
         rows = conn.execute(
             f"""
-            SELECT sec_code, trade_date, state
-            FROM {PULLBACK_STATE_HISTORY_TABLE}
-            WHERE trade_date < ?
-            ORDER BY sec_code, trade_date DESC
+            WITH ranked_batches AS (
+              SELECT batch_id, trade_date,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY trade_date
+                       ORDER BY completed_at DESC, batch_id DESC
+                     ) AS row_rank
+              FROM selection_batches
+              WHERE definition_version=? AND mode='close_final'
+                AND status='complete' AND trade_date < ?
+            )
+            SELECT h.sec_code, h.trade_date, h.state
+            FROM ranked_batches b
+            JOIN {PULLBACK_STATE_HISTORY_TABLE} h ON h.batch_id=b.batch_id
+            WHERE b.row_rank=1 AND h.definition_version=?
+            ORDER BY h.sec_code, h.trade_date DESC
             """,
-            (str(trade_date),),
+            (SCREENING_DEFINITION_VERSION, str(trade_date), SCREENING_DEFINITION_VERSION),
         ).fetchall()
     except sqlite3.DatabaseError as exc:
         if "no such table" in str(exc).lower():
@@ -1029,20 +1042,5 @@ def persist_pullback_support_states(
     context: SelectionContext,
     evaluation: PullbackSupportEvaluation,
 ) -> int:
-    """Persist only close-final C state; snapshot calls intentionally leave no history."""
-    if context.mode != "close_final" or evaluation.rows.empty:
-        return 0
-    _ensure_pullback_state_history(conn)
-    created_at = now_str()
-    profile_id = evaluation.trend_profile.profile_id if evaluation.trend_profile else None
-    for row in evaluation.rows.itertuples(index=False):
-        conn.execute(
-            f"""
-            INSERT OR REPLACE INTO {PULLBACK_STATE_HISTORY_TABLE}
-              (trade_date, sec_code, state, trend_profile, as_of, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (context.trade_date, str(row.sec_code).zfill(6), row.state, profile_id, context.as_of, created_at),
-        )
-    conn.commit()
-    return len(evaluation.rows)
+    """Compatibility no-op: formal C state is owned by persist_close_final_batch."""
+    return 0

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
@@ -46,6 +47,18 @@ def _canonical_codes(values: Iterable[object]) -> set[str]:
     return {str(value).zfill(6) for value in values if str(value).strip()}
 
 
+def _finite_positive_benchmarks(values: dict[str, float] | None) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for raw_code, raw_close in (values or {}).items():
+        try:
+            close = float(raw_close)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(close) and close > 0:
+            normalized[str(raw_code).zfill(6)] = close
+    return dict(sorted(normalized.items()))
+
+
 class QuoteSnapshotAdapter:
     """One bounded quote path with explicit failover, cooling, and restart cache rules."""
 
@@ -77,6 +90,9 @@ class QuoteSnapshotAdapter:
         root = self.cache_dir / str(trade_date)
         return root / "snapshot.pkl", root / "metadata.json"
 
+    def _bundle_path(self, trade_date: str) -> Path:
+        return self.cache_dir / str(trade_date) / "snapshot_v2.pkl"
+
     def _coverage(self, frame: pd.DataFrame, expected_codes: set[str]) -> float:
         if not expected_codes or "sec_code" not in frame.columns:
             return 0.0
@@ -84,28 +100,24 @@ class QuoteSnapshotAdapter:
         return len(observed.intersection(expected_codes)) / len(expected_codes)
 
     def _save_success(self, trade_date: str, result: QuoteSnapshotResult) -> None:
-        frame_path, metadata_path = self._cache_paths(trade_date)
-        frame_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_frame = frame_path.with_suffix(".tmp.pkl")
-        temp_metadata = metadata_path.with_suffix(".tmp.json")
-        result.frame.to_pickle(temp_frame)
-        temp_metadata.write_text(
-            json.dumps(
-                {
-                    "trade_date": str(trade_date),
-                    "provider": result.provider,
-                    "observed_at": result.observed_at,
-                    "raw_rows": result.raw_rows,
-                    "normalized_rows": result.normalized_rows,
-                    "coverage": result.coverage,
-                },
-                ensure_ascii=False,
-                sort_keys=True,
-            ),
-            encoding="utf-8",
+        bundle_path = self._bundle_path(trade_date)
+        bundle_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = bundle_path.with_suffix(".tmp.pkl")
+        pd.to_pickle(
+            {
+                "schema_version": 2,
+                "trade_date": str(trade_date),
+                "provider": result.provider,
+                "observed_at": result.observed_at,
+                "raw_rows": result.raw_rows,
+                "normalized_rows": result.normalized_rows,
+                "coverage": result.coverage,
+                "benchmark_closes": _finite_positive_benchmarks(result.benchmark_closes),
+                "frame": result.frame.copy(),
+            },
+            temporary,
         )
-        temp_frame.replace(frame_path)
-        temp_metadata.replace(metadata_path)
+        temporary.replace(bundle_path)
 
     def _cached_result(
         self,
@@ -117,17 +129,29 @@ class QuoteSnapshotAdapter:
     ) -> QuoteSnapshotResult | None:
         if close_final:
             return None
+        bundle_path = self._bundle_path(trade_date)
         frame_path, metadata_path = self._cache_paths(trade_date)
-        if not frame_path.exists() or not metadata_path.exists():
+        if not bundle_path.exists() and (not frame_path.exists() or not metadata_path.exists()):
             return None
         try:
-            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+            if bundle_path.exists():
+                bundle = pd.read_pickle(bundle_path)
+                if not isinstance(bundle, dict) or bundle.get("schema_version") != 2:
+                    raise ValueError("unsupported snapshot bundle schema")
+                metadata = bundle
+                frame = pd.DataFrame(bundle["frame"]).copy()
+                benchmark_closes = _finite_positive_benchmarks(bundle.get("benchmark_closes"))
+                cache_errors: tuple[str, ...] = () if benchmark_closes else ("cached snapshot has no benchmark_closes",)
+            else:
+                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                frame = pd.read_pickle(frame_path)
+                benchmark_closes = _finite_positive_benchmarks(metadata.get("benchmark_closes"))
+                cache_errors = ("legacy cache has no benchmark_closes",) if not benchmark_closes else ()
             if str(metadata.get("trade_date")) != str(trade_date):
                 return None
             observed_at = dt.datetime.fromisoformat(str(metadata["observed_at"]))
             observed_at = _as_china_time(observed_at)
             age_minutes = (now - observed_at).total_seconds() / 60.0
-            frame = pd.read_pickle(frame_path)
             coverage = self._coverage(frame, expected_codes)
             if age_minutes < 0 or age_minutes > self.max_age_minutes:
                 return QuoteSnapshotResult(
@@ -163,9 +187,10 @@ class QuoteSnapshotAdapter:
                 normalized_rows=len(frame),
                 coverage=coverage,
                 attempts=0,
-                errors=(),
+                errors=cache_errors,
                 status="snapshot_cache_fallback",
                 from_cache=True,
+                benchmark_closes=benchmark_closes,
             )
         except Exception as exc:
             return QuoteSnapshotResult(

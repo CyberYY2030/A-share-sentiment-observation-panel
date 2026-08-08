@@ -1,0 +1,57 @@
+{
+  "fixture_kind": "synthetic UI evidence only",
+  "source": "tests._mining_test_helpers.create_sample_market_dbs + tests.test_history_bootstrap._extend_to_p60_history",
+  "core_state_insertion": false,
+  "full_history_target": "2026-08-07",
+  "evidence_close_date": "2026-08-05",
+  "snapshot_trade_date": "2026-08-06",
+  "processed_formal_sessions": 8,
+  "failed": 0,
+  "retrigger_evidence": [
+    {
+      "trade_date": "2026-08-05",
+      "input_fingerprint": "aebc3379f8bd5178719fc15fbb2aa63a79856fb20dccc214377eb2f237d1358b",
+      "status": "complete",
+      "batch_id": 7,
+      "reused": false,
+      "candidate_counts": {
+        "strong_trend": 1,
+        "compression_launch": 0,
+        "momentum_anomaly": 0,
+        "second_launch": 1,
+        "base_breakout": 0,
+        "counter_trend_rs": 0
+      },
+      "c_state_counts": {
+        "再启动": 1,
+        "延伸中": 1
+      },
+      "c_retriggers": [
+        {
+          "sec_code": "600003",
+          "state": "再启动",
+          "pullback_pct": -0.05102551275637812,
+          "reclaim_ma10": true,
+          "activity_expand": true
+        }
+      ],
+      "error": null
+    }
+  ],
+  "candidate_counts": {
+    "strong_trend": 8,
+    "compression_launch": 0,
+    "momentum_anomaly": 0,
+    "second_launch": 1,
+    "base_breakout": 0,
+    "counter_trend_rs": 0
+  },
+  "benchmark_closes": {
+    "000001": 3505.91,
+    "000300": 4674.6,
+    "000852": 7011.85,
+    "399001": 11686.43
+  },
+  "snapshot_rows": 3,
+  "ui_derivation": "source bars after evidence_close_date removed only after formal replay so UI selects the natural retrigger date"
+}

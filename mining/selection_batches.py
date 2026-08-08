@@ -20,6 +20,17 @@ _BATCH_COLUMNS = {
     "completed_at",
 }
 _RUN_COLUMNS = {"batch_id", "mode", "input_fingerprint"}
+_STATE_COLUMNS = {
+    "state_id",
+    "batch_id",
+    "definition_version",
+    "trade_date",
+    "sec_code",
+    "state",
+    "trend_profile",
+    "as_of",
+    "created_at",
+}
 
 
 @dataclass(frozen=True)
@@ -45,7 +56,11 @@ def selection_batch_schema_state(conn: sqlite3.Connection) -> BatchSchemaState:
         tables = {
             str(row[0])
             for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('selection_batches', 'strategy_runs')"
+                """
+                SELECT name FROM sqlite_master
+                WHERE type='table'
+                  AND name IN ('selection_batches', 'strategy_runs', 'pullback_state_history')
+                """
             )
         }
     except sqlite3.DatabaseError as exc:
@@ -55,7 +70,6 @@ def selection_batch_schema_state(conn: sqlite3.Connection) -> BatchSchemaState:
         return BatchSchemaState("migration_required", "selection_batches table is absent")
     if "strategy_runs" not in tables:
         return BatchSchemaState("schema_invalid", "strategy_runs table is absent")
-
     try:
         batch_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(selection_batches)")}
         run_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(strategy_runs)")}
@@ -71,6 +85,18 @@ def selection_batch_schema_state(conn: sqlite3.Connection) -> BatchSchemaState:
         if missing_run:
             parts.append("strategy_runs missing " + ",".join(missing_run))
         return BatchSchemaState("schema_invalid", "; ".join(parts))
+    if "pullback_state_history" not in tables:
+        return BatchSchemaState("migration_required", "pullback_state_history table is absent")
+    try:
+        state_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(pullback_state_history)")}
+    except sqlite3.DatabaseError as exc:
+        return BatchSchemaState("schema_error", f"state table_info: {type(exc).__name__}: {exc}")
+    missing_state = sorted(_STATE_COLUMNS - state_columns)
+    if missing_state:
+        return BatchSchemaState(
+            "schema_invalid",
+            "pullback_state_history missing " + ",".join(missing_state),
+        )
     return BatchSchemaState("ready")
 
 

@@ -90,7 +90,7 @@ class PullbackStateMachineTests(unittest.TestCase):
         self.assertIn(result.rows.iloc[0]["first_structure_date"], context.diagnostics["clean_dates"][-60:])
         self.assertEqual(result.diagnostics["skipped_reason_counts"], {"never_in_a_qualified_pool": 1})
 
-    def test_intraday_does_not_write_state_history_and_close_final_does(self) -> None:
+    def test_legacy_state_writer_is_disabled_for_intraday_and_close_final(self) -> None:
         context = _context()
         rows = pd.DataFrame([{"sec_code": "600001", "state": PULLBACK_STATE_READY}])
         evaluation = PullbackSupportEvaluation(rows=rows, trend_profile=None, diagnostics={})
@@ -99,7 +99,11 @@ class PullbackStateMachineTests(unittest.TestCase):
             intraday = SelectionContext(**{**context.__dict__, "mode": "intraday_snapshot"})
             self.assertEqual(persist_pullback_support_states(conn, intraday, evaluation), 0)
             self.assertEqual(load_prior_pullback_states(conn, "2025-12-31"), {})
-            self.assertEqual(persist_pullback_support_states(conn, context, evaluation), 1)
-            self.assertEqual(load_prior_pullback_states(conn, "2025-12-31"), {"600001": (PULLBACK_STATE_READY,)})
+            self.assertEqual(persist_pullback_support_states(conn, context, evaluation), 0)
+            self.assertIsNone(
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='pullback_state_history'"
+                ).fetchone()
+            )
         finally:
             conn.close()

@@ -250,19 +250,25 @@ def main() -> None:
     parser.add_argument("--history-bootstrap-dry-run", action="store_true")
     parser.add_argument("--target-date")
     parser.add_argument("--sessions", type=int, default=60)
+    parser.add_argument("--shadow-db")
+    parser.add_argument("--reuse-shadow", action="store_true")
     parser.add_argument("--out")
     args = parser.parse_args()
 
     if args.history_bootstrap_dry_run:
-        if not args.target_date or not args.out:
-            parser.error("--history-bootstrap-dry-run requires --target-date and --out")
+        if not args.target_date or not args.out or not args.shadow_db:
+            parser.error("--history-bootstrap-dry-run requires --target-date, --shadow-db, and --out")
         result = run_history_bootstrap_dry_run(
             args.base_dir,
             args.target_date,
             sessions=args.sessions,
+            shadow_db_path=args.shadow_db,
+            reuse_shadow=args.reuse_shadow,
         )
         output_path = write_history_bootstrap_report(result, args.out)
         print({"history_bootstrap": result, "out": str(output_path)})
+        if int(result.get("failed", 0)):
+            raise SystemExit(1)
         return
 
     if args.intraday:
