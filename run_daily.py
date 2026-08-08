@@ -21,6 +21,7 @@ from mining.db import (
 )
 from mining.intraday import scan_intraday
 from mining.refresh_basics import refresh_basics
+from mining.history_bootstrap import run_history_bootstrap_dry_run, write_history_bootstrap_report
 from mining.reports import generate_excel_report, generate_markdown_report
 from mining.scanners import get_registered_scanners
 from mining.selection_context import build_selection_context
@@ -246,7 +247,23 @@ def main() -> None:
     parser.add_argument("--intraday", action="store_true")
     parser.add_argument("--intraday-start", default="14:00")
     parser.add_argument("--intraday-end", default="15:00")
+    parser.add_argument("--history-bootstrap-dry-run", action="store_true")
+    parser.add_argument("--target-date")
+    parser.add_argument("--sessions", type=int, default=60)
+    parser.add_argument("--out")
     args = parser.parse_args()
+
+    if args.history_bootstrap_dry_run:
+        if not args.target_date or not args.out:
+            parser.error("--history-bootstrap-dry-run requires --target-date and --out")
+        result = run_history_bootstrap_dry_run(
+            args.base_dir,
+            args.target_date,
+            sessions=args.sessions,
+        )
+        output_path = write_history_bootstrap_report(result, args.out)
+        print({"history_bootstrap": result, "out": str(output_path)})
+        return
 
     if args.intraday:
         conn = connect(base_dir=args.base_dir)

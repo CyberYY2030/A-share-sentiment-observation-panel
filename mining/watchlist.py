@@ -575,6 +575,21 @@ PULLBACK_STATE_HISTORY_TABLE = "pullback_state_history"
 A_HISTORY_TARGET_SESSIONS = 60
 
 
+def prior_usable_dates(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    target_sessions: int = A_HISTORY_TARGET_SESSIONS,
+    usable_dates: Sequence[str] | None = None,
+) -> list[str]:
+    """Return the C-eligible usable-session window, excluding the evaluation day."""
+    if usable_dates is None:
+        resolved_dates, _ = usable_stock_trade_dates(conn, end_date=str(trade_date))
+    else:
+        resolved_dates = sorted({str(day) for day in usable_dates})
+    return [date for date in resolved_dates if date < str(trade_date)][-int(target_sessions):]
+
+
 def a_history_coverage(
     conn: sqlite3.Connection,
     trade_date: str,
@@ -584,11 +599,12 @@ def a_history_coverage(
 ) -> dict[str, object]:
     """Report finalized A-history coverage without creating or recalculating a batch."""
     target = int(target_sessions)
-    if usable_dates is None:
-        resolved_dates, _ = usable_stock_trade_dates(conn, end_date=str(trade_date))
-    else:
-        resolved_dates = sorted({str(day) for day in usable_dates if str(day) <= str(trade_date)})
-    window_dates = resolved_dates[-target:]
+    window_dates = prior_usable_dates(
+        conn,
+        trade_date,
+        target_sessions=target,
+        usable_dates=usable_dates,
+    )
     result: dict[str, object] = {
         "covered_sessions": 0,
         "target_sessions": target,
@@ -993,7 +1009,11 @@ def build_pullback_support(
     """Build the formal C result; no raw price query is performed outside shared context."""
     resolved_context = context or build_selection_context(conn, trade_date, mode="close_final")
     clean_dates = [str(date) for date in resolved_context.diagnostics.get("clean_dates", [])]
-    window_dates = [date for date in clean_dates if str(date) < str(trade_date)][-60:]
+    window_dates = prior_usable_dates(
+        conn,
+        trade_date,
+        usable_dates=resolved_context.diagnostics.get("usable_dates"),
+    )
     a_qualified_dates, strength_tiers = _load_a_qualified_pool(conn, window_dates)
     prior_states = load_prior_pullback_states(conn, trade_date, clean_dates=clean_dates)
     return evaluate_pullback_support(

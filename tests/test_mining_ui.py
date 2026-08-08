@@ -121,6 +121,37 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertEqual(current_date, snapshot_today)
         self.assertTrue(follow_df.empty)
 
+    def test_snapshot_universe_derives_change_pct_when_cached_bar_has_no_pct_column(self) -> None:
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _snapshot_universe
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            raw_cached_bar = pd.DataFrame(
+                [
+                    {
+                        "sec_code": "600001",
+                        "sec_name": "Cached Bar",
+                        "open": 16.0,
+                        "high": 18.1,
+                        "low": 15.9,
+                        "close": 16.8,
+                        "pre_close": 15.6,
+                        "volume": 12_000_000,
+                        "amount": 2_100_000_000,
+                    }
+                ]
+            )
+            conn = connect(base_dir=base)
+            try:
+                universe = _snapshot_universe(conn, dates["next_trade_date"], raw_cached_bar)
+            finally:
+                conn.close()
+
+        self.assertEqual(universe.loc[0, "sec_code"], "600001")
+        self.assertAlmostEqual(float(universe.loc[0, "change_pct"]), (16.8 / 15.6 - 1.0) * 100.0)
+
     def test_opportunity_panel_prefers_latest_quotes_outside_trading_hours(self) -> None:
         import pandas as pd
 

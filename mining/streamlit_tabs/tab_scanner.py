@@ -208,17 +208,41 @@ def _build_quote_snapshot_loader(
     trade_date: str,
     *,
     adapter: QuoteSnapshotAdapter | None = None,
+    now: dt.datetime | None = None,
+    cache_only: bool = False,
 ) -> SnapshotLoader:
     expected_codes = _expected_snapshot_codes(base_dir, trade_date)
     resolved_adapter = adapter or QuoteSnapshotAdapter(
         cache_dir=Path(base_dir) / "output" / "screening-v2-work" / "cache"
     )
+    current = now or dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
 
     def _loader() -> QuoteSnapshotResult:
+        if cache_only:
+            cached = resolved_adapter._cached_result(
+                str(trade_date),
+                expected_codes,
+                current,
+                close_final=False,
+            )
+            if cached is not None:
+                return cached
+            return QuoteSnapshotResult(
+                frame=pd.DataFrame(),
+                provider=None,
+                observed_at=current.isoformat(),
+                raw_rows=0,
+                normalized_rows=0,
+                coverage=0.0,
+                attempts=0,
+                errors=("isolated acceptance requires a cached snapshot",),
+                status="provider_failed",
+                from_cache=False,
+            )
         return resolved_adapter.load(
             str(trade_date),
             expected_codes=expected_codes,
-            now=dt.datetime.now(dt.timezone(dt.timedelta(hours=8))),
+            now=current,
         )
 
     return _build_cached_snapshot_loader(_loader)
@@ -265,6 +289,8 @@ def _snapshot_universe(conn, trade_date: str, latest_quotes: pd.DataFrame) -> pd
     snapshot_name = universe.get("sec_name_snapshot", pd.Series(pd.NA, index=universe.index))
     metadata_name = universe.get("sec_name_metadata", pd.Series(pd.NA, index=universe.index))
     universe["sec_name"] = snapshot_name.fillna(metadata_name).fillna(universe["sec_code"])
+    if "change_pct" not in universe.columns:
+        universe["change_pct"] = math.nan
     universe["change_pct"] = universe["change_pct"].fillna(universe.apply(change_pct, axis=1))
     universe["board"] = universe["sec_code"].map(board_kind)
     universe = universe[
@@ -1592,6 +1618,8 @@ def render_scanner_tab(
     use_intraday: bool = False,
     prefer_latest_quotes: bool = False,
     force_latest_quotes: bool = False,
+    now: dt.datetime | None = None,
+    isolated_acceptance: bool = False,
 ) -> None:
     query_trade_date = latest_quote_trade_date or fallback_trade_date
     shared_snapshot_loader = None
@@ -1605,6 +1633,8 @@ def render_scanner_tab(
             base_dir,
             query_trade_date,
             adapter=st.session_state[adapter_key],
+            now=now,
+            cache_only=isolated_acceptance,
         )
     today_df, today_date = load_latest_opportunities(
         base_dir=base_dir,
@@ -1640,6 +1670,7 @@ def render_scanner_tab(
                 status_conn,
                 query_trade_date or today_date,
                 snapshot_loader=shared_snapshot_loader,
+                now=now,
                 runtime=st.session_state[runtime_key],
             )
             c_history = capability_status_df.attrs.get("a_history_coverage") or a_history_coverage(status_conn, today_date)
@@ -1670,8 +1701,14 @@ def render_scanner_tab(
     st.markdown("**当时市场背景**")
     st.caption(_format_market_regime(market_summary))
 
+    formal_trade_date = query_trade_date or today_date
     st.markdown("**筛选证据**")
     st.dataframe(pd.DataFrame([selection_evidence]), width="stretch", hide_index=True)
+    st.caption(
+        "日期对齐："
+        f"selected={query_trade_date or 'N/A'} ｜ effective={today_date or 'N/A'} ｜ "
+        f"formal trade_date={formal_trade_date or 'N/A'}"
+    )
     if selection_evidence["mode"] == "intraday_snapshot":
         st.warning("盘中临时结果：不会写入正式收盘候选或状态历史。")
     elif selection_evidence["mode"] == "close_pending":

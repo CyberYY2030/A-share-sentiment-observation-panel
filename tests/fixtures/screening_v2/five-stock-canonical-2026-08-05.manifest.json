@@ -7,6 +7,15 @@
   "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
   "as_of": "2026-08-05",
   "date_range": ["2026-04-21", "2026-08-05"],
+  "metric_context": {
+    "source_metrics": "R0.1 full-market SelectionContext values captured in r1-audit.md; they are provenance, not replay targets.",
+    "replay_metrics": "The frozen CSV plus the deterministic 20-stock synthetic cross-section constructed in test_r4_screening_regression._fixture_context()."
+  },
+  "tolerance": {
+    "numeric_absolute": 1e-06,
+    "boolean": "exact",
+    "first_failed_gate": "exact"
+  },
   "records": [
     {
       "sec_code": "300996",
@@ -14,7 +23,10 @@
       "source": "five-stock-canonical-2026-08-05.csv",
       "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
       "expected_path": "fresh_breakout",
-      "key_metrics": {"reference_price": 19.2, "ret20": 0.7410324705, "rps20_pct": 0.998996387, "prior_close_high_20": 18.62},
+      "source_metrics": {"reference_price": 19.2, "ret20": 0.7410324705, "rps20_pct": 0.998996387, "prior_close_high_20": 18.62},
+      "replay_metrics": {"reference_price": 19.2, "ret10": 0.7235188509874326, "ret20": 0.741032470476584, "rps10_pct": 1.0, "rps20_pct": 1.0, "prior_close_high_20": 18.62, "near_high_distance_atr": 1.045252487409853},
+      "replay_gates": {"gate_valid_trade": true, "gate_structure": true, "gate_ma20_slope": true, "gate_ret10": true, "gate_ret20": true, "gate_rps20": true, "gate_near_high": true, "gate_liquidity": true, "gate_path": true},
+      "first_failed_gate": null,
       "failure_conditions": ["none: all formal A gates must pass in the frozen full-market evaluation"]
     },
     {
@@ -23,7 +35,10 @@
       "source": "five-stock-canonical-2026-08-05.csv",
       "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
       "expected_path": "fresh_breakout",
-      "key_metrics": {"reference_price": 25.36, "ret20": 0.5611559133, "rps20_pct": 0.9975913288, "prior_close_high_20": 23.94},
+      "source_metrics": {"reference_price": 25.36, "ret20": 0.5611559133, "rps20_pct": 0.9975913288, "prior_close_high_20": 23.94},
+      "replay_metrics": {"reference_price": 25.36, "ret10": 0.4926427310182462, "ret20": 0.5611559133140811, "rps10_pct": 0.96, "rps20_pct": 0.96, "prior_close_high_20": 23.94, "near_high_distance_atr": 0.22095542165225915},
+      "replay_gates": {"gate_valid_trade": true, "gate_structure": true, "gate_ma20_slope": true, "gate_ret10": true, "gate_ret20": true, "gate_rps20": true, "gate_near_high": true, "gate_liquidity": true, "gate_path": true},
+      "first_failed_gate": null,
       "failure_conditions": ["none: all formal A gates must pass in the frozen full-market evaluation"]
     },
     {
@@ -32,7 +47,10 @@
       "source": "five-stock-canonical-2026-08-05.csv",
       "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
       "expected_path": "rejected",
-      "key_metrics": {"gate_valid_trade": true, "gate_near_high": true},
+      "source_metrics": {"gate_valid_trade": true, "gate_near_high": true},
+      "replay_metrics": {},
+      "replay_gates": {"gate_valid_trade": true, "gate_structure": false, "gate_ma20_slope": false, "gate_ret10": false, "gate_ret20": false, "gate_rps20": false, "gate_near_high": true, "gate_liquidity": true, "gate_path": false},
+      "first_failed_gate": "close_ma10_ma20",
       "failure_conditions": ["close_ma10_ma20"]
     },
     {
@@ -41,7 +59,10 @@
       "source": "five-stock-canonical-2026-08-05.csv",
       "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
       "expected_path": "rejected",
-      "key_metrics": {"gate_valid_trade": true, "gate_near_high": false},
+      "source_metrics": {"gate_valid_trade": true, "gate_near_high": false},
+      "replay_metrics": {},
+      "replay_gates": {"gate_valid_trade": true, "gate_structure": false, "gate_ma20_slope": false, "gate_ret10": false, "gate_ret20": false, "gate_rps20": false, "gate_near_high": false, "gate_liquidity": true, "gate_path": false},
+      "first_failed_gate": "close_ma10_ma20",
       "failure_conditions": ["close_ma10_ma20"]
     },
     {
@@ -50,7 +71,10 @@
       "source": "five-stock-canonical-2026-08-05.csv",
       "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
       "expected_path": "rejected",
-      "key_metrics": {"gate_valid_trade": true, "gate_ret20": true},
+      "source_metrics": {"gate_valid_trade": true, "gate_ret20": true},
+      "replay_metrics": {},
+      "replay_gates": {"gate_valid_trade": true, "gate_structure": false, "gate_ma20_slope": false, "gate_ret10": false, "gate_ret20": true, "gate_rps20": true, "gate_near_high": true, "gate_liquidity": true, "gate_path": false},
+      "first_failed_gate": "close_ma10_ma20",
       "failure_conditions": ["close_ma10_ma20"]
     }
   ]

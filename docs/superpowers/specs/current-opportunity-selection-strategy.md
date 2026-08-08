@@ -49,3 +49,33 @@ C 在第一个有效 A complete batch 后即可对后续日期运行。面板显
 ## 6. 解释边界
 
 本口径证明的是定义、数据状态和持久化边界可复跑。历史价格路径不是可交易收益：A 股执行评估仍需在 T+1、涨跌停、成本、流动性与样本时点条件下单独验证。
+
+## 7. R4.1 验收补充：prior coverage、dry-run 与确定性页面
+
+`a_history_coverage=N/60` 的 `N` 只统计评估日之前、当前
+`SCREENING_DEFINITION_VERSION` 的最新 `complete` A batch 所覆盖的最近 60 个
+usable sessions；评估日 T 不进入分母。C 的 A 资格查询和这个 coverage 共用同一
+strict-prior 日期集合。因此 T 有 complete A 且 T-1 有 complete A 时，T 的 coverage
+只能是 `1/60`，C 只能读取 T-1 的 A。
+
+60 日冷启动仍不是面板副作用，也不是生产写入。隔离库可显式执行：
+
+```powershell
+& 'C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe' run_daily.py `
+  --base-dir <isolated-sandbox> --history-bootstrap-dry-run `
+  --target-date YYYY-MM-DD --sessions 60 --out <report.json>
+```
+
+它会先复制 `mining_mvp.db` 为 shadow，再按日期升序逐日走
+`build_selection_context → evaluate_formal_capabilities → persist_close_final_batch`。
+每一个可处理日写入六个 formal strategy 的原子 close-final batch；
+`trend_profile is None` 只记为 `skipped_insufficient_history`。它不写
+`outcomes`、legacy candidates、watchlist 或日报。对同一 shadow 的第二次运行必须
+复用 fingerprint，`selection_batches`、`strategy_runs` 和 `candidates` 增量均为零。
+
+浏览器验收可使用 `SCREENING_BASE_DIR` 与
+`SCREENING_ACCEPTANCE_NOW_CN`。后者只在前者非空时生效，单独设置会 fail closed；
+两者均未设置时生产行为不变。在隔离验收中，正式 snapshot 只读 sandbox cache，
+不得调用 provider；其他面板盘中 provider 同时关闭，避免外部行情混入证据。页面对
+每一状态都显示 `selected/effective/formal trade_date`，只有三者等于目标选择日才可把
+该页面作为 formal 证据。

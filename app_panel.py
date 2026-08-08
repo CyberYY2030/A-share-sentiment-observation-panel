@@ -64,6 +64,7 @@ DEFAULT_ETF_DB = "etf_mvp.db"
 DEFAULT_CSV_OUT = "daily_metrics_last40.csv"
 CATCHUP_THROTTLE_SECONDS = 1800.0
 SCREENING_BASE_DIR_ENV = "SCREENING_BASE_DIR"
+SCREENING_ACCEPTANCE_NOW_CN_ENV = "SCREENING_ACCEPTANCE_NOW_CN"
 
 
 # Backfill scripts (place them in the same folder as this Streamlit app)
@@ -136,6 +137,18 @@ def screening_base_dir() -> str:
     """Return the isolated screening-data root when the acceptance seam is set."""
     configured = os.environ.get(SCREENING_BASE_DIR_ENV, "").strip()
     return str(Path(configured).resolve()) if configured else app_dir()
+
+
+def screening_acceptance_now_cn() -> Optional[dt.datetime]:
+    """Return the isolated-acceptance clock, never a production clock override."""
+    configured = os.environ.get(SCREENING_ACCEPTANCE_NOW_CN_ENV, "").strip()
+    if not configured:
+        return None
+    if not os.environ.get(SCREENING_BASE_DIR_ENV, "").strip():
+        raise RuntimeError(f"{SCREENING_ACCEPTANCE_NOW_CN_ENV} requires {SCREENING_BASE_DIR_ENV}")
+    parsed = dt.datetime.fromisoformat(configured.replace("Z", "+00:00"))
+    china_tz = dt.timezone(dt.timedelta(hours=8))
+    return parsed.replace(tzinfo=china_tz) if parsed.tzinfo is None else parsed.astimezone(china_tz)
 
 
 def abs_in_app_dir(filename: str) -> str:
@@ -465,9 +478,10 @@ def discover_data_dates_bundle(
     concept_db: Optional[str],
     tz_offset_hours: int = 8,
     local_last_dates: Optional[Dict[str, Optional[str]]] = None,
+    now_cn: Optional[dt.datetime] = None,
 ) -> Dict[str, Optional[str]]:
     try:
-        cal_last = str(last_completed_trade_date_cn(tz_offset_hours=int(tz_offset_hours)).date())
+        cal_last = str(last_completed_trade_date_cn(now_cn, tz_offset_hours=int(tz_offset_hours)).date())
     except Exception:
         cal_last = _weekday_last_trade_day(int(tz_offset_hours))
 
@@ -490,6 +504,36 @@ def discover_data_dates_bundle(
         "remote_latest_concept_close_day": remote_concept,
         "remote_latest_etf_close_day": remote_etf,
         "t1_close_day": t1_aligned,
+        "t2_close_day": t2,
+    }
+
+
+def isolated_acceptance_dates_bundle(stock_db: str, now_cn: dt.datetime) -> Dict[str, Optional[str]]:
+    """Resolve browser-acceptance dates from the isolated stock database only."""
+    try:
+        con = _raw_db_connect(stock_db)
+        rows = con.execute(
+            """
+            SELECT DISTINCT trade_date
+            FROM kline_daily
+            WHERE sec_type='stock' AND trade_date <= ?
+            ORDER BY trade_date DESC
+            LIMIT 3
+            """,
+            (now_cn.date().isoformat(),),
+        ).fetchall()
+        con.close()
+    except Exception:
+        rows = []
+    dates = [str(row[0]).replace("/", "-")[:10] for row in rows]
+    t1 = dates[0] if dates else None
+    t2 = dates[1] if len(dates) > 1 else None
+    return {
+        "calendar_last_trade_day": t1,
+        "remote_latest_stock_close_day": t1,
+        "remote_latest_concept_close_day": t1,
+        "remote_latest_etf_close_day": t1,
+        "t1_close_day": t1,
         "t2_close_day": t2,
     }
 
@@ -4058,13 +4102,19 @@ def main():
 
     st.sidebar.subheader("数据日期切换")
     tz_offset = st.sidebar.number_input("北京时间偏移(UTC+?)", min_value=-12, max_value=14, value=8, step=1)
-    now_cn = _now_with_tz_offset(int(tz_offset))
+    acceptance_now_cn = screening_acceptance_now_cn()
+    now_cn = acceptance_now_cn or _now_with_tz_offset(int(tz_offset))
     local_before = get_local_last_dates(stock_db, concept_db, etf_db)
 
-    remote_bundle = discover_data_dates_bundle(
-        concept_db if (concept_db and os.path.exists(concept_db)) else None,
-        tz_offset_hours=int(tz_offset),
-        local_last_dates=local_before,
+    remote_bundle = (
+        isolated_acceptance_dates_bundle(stock_db, now_cn)
+        if isolated_screening
+        else discover_data_dates_bundle(
+            concept_db if (concept_db and os.path.exists(concept_db)) else None,
+            tz_offset_hours=int(tz_offset),
+            local_last_dates=local_before,
+            now_cn=now_cn,
+        )
     )
     st.session_state["remote_bundle"] = remote_bundle
 
@@ -4096,8 +4146,11 @@ def main():
     requested_close_day = t2_close if (effective_view == "t2") else t1_close
     snapshot_trade_dt = pd.Timestamp(now_cn.date()) if (effective_view == "snapshot") else None
 
-    use_intraday = bool(effective_mode == "snapshot")
-    use_intraday_theme = bool(effective_mode == "snapshot")
+    # Isolated acceptance must use only the pre-seeded screening cache.  The
+    # rest of the dashboard therefore stays on its persisted close data so no
+    # unrelated quote/theme provider result can enter the browser evidence.
+    use_intraday = bool(effective_mode == "snapshot") and not isolated_screening
+    use_intraday_theme = bool(effective_mode == "snapshot") and not isolated_screening
     force_intraday = False
 
     st.sidebar.caption(
@@ -4509,7 +4562,7 @@ def main():
 
     
     # ---- 口径与对齐：用于保证“成交额/占比”等指标的分母分子来自同一时点 ----
-    now_cn2 = _now_with_tz_offset(int(tz_offset))
+    now_cn2 = acceptance_now_cn or _now_with_tz_offset(int(tz_offset))
     today_ts = pd.Timestamp(now_cn2.date())
     close_ref_dt_cal = last_completed_trade_date_cn(now_cn2, int(tz_offset))
     requested_close_dt0 = pd.Timestamp(requested_close_day) if requested_close_day else close_ref_dt_cal
@@ -4811,7 +4864,7 @@ def main():
                     st.write(f"- {m}")
 
     try:
-        now_cn2 = _now_with_tz_offset(int(tz_offset))
+        now_cn2 = acceptance_now_cn or _now_with_tz_offset(int(tz_offset))
         is_trade2 = is_cn_trading_time(now_cn2, int(tz_offset))
         st.caption(
             f"北京时间 {now_cn2.strftime('%Y-%m-%d %H:%M:%S')} ｜交易时段: {'是' if is_trade2 else '否'} ｜盘中快照: {'启用' if (intraday_row is not None) else '未启用'}"
@@ -4886,6 +4939,8 @@ def main():
         use_intraday=bool(opportunity_runtime.get("use_intraday")),
         prefer_latest_quotes=bool(opportunity_runtime.get("force_latest_quotes")),
         force_latest_quotes=bool(opportunity_runtime.get("force_latest_quotes")),
+        now=now_cn2,
+        isolated_acceptance=isolated_screening,
     )
 
     # ---- Theme Cycle ----

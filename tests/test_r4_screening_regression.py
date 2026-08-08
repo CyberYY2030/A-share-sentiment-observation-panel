@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import datetime as dt
+import numbers
 import tempfile
 import unittest
 from pathlib import Path
@@ -15,7 +17,7 @@ from mining.data_quality import usable_stock_trade_dates
 from mining.db import connect
 from mining.scanners.strong_trend import evaluate_strong_trend
 from mining.selection_context import SelectionContext, build_selection_context
-from mining.watchlist import _load_a_qualified_pool, a_history_coverage
+from mining.watchlist import _load_a_qualified_pool, a_history_coverage, prior_usable_dates
 from tests._mining_test_helpers import create_sample_market_dbs
 
 
@@ -81,12 +83,39 @@ class R4FixtureRegressionTests(unittest.TestCase):
             {record["sec_code"] for record in manifest["records"]},
             {"300996", "601858", "688141", "688627", "301571"},
         )
+        self.assertIn("source_metrics", manifest["metric_context"])
+        self.assertIn("replay_metrics", manifest["metric_context"])
+        self.assertEqual(manifest["tolerance"]["boolean"], "exact")
+        self.assertEqual(manifest["tolerance"]["first_failed_gate"], "exact")
+
+        evaluation = evaluate_strong_trend(_fixture_context())
+        replayed_rows = evaluation.rows.set_index("sec_code")
+        rejected_rows = {
+            row["sec_code"]: row
+            for row in evaluation.diagnostics["diagnostic_rows"]
+            if row["sec_code"] in {"688141", "688627", "301571"}
+        }
+        numeric_tolerance = float(manifest["tolerance"]["numeric_absolute"])
         for record in manifest["records"]:
             self.assertEqual(record["as_of"], manifest["as_of"])
             self.assertEqual(record["data_hash"], actual_hash)
             self.assertTrue(record["expected_path"])
-            self.assertTrue(record["key_metrics"])
+            self.assertTrue(record["source_metrics"])
             self.assertTrue(record["failure_conditions"])
+            for value in record["source_metrics"].values():
+                self.assertIsInstance(value, (numbers.Real, bool))
+
+            code = record["sec_code"]
+            if record["expected_path"] == "rejected":
+                actual = rejected_rows[code]
+            else:
+                actual = replayed_rows.loc[code].to_dict()
+                self.assertEqual(actual["strength_tier"], record["expected_path"])
+            for metric, expected in record["replay_metrics"].items():
+                self.assertAlmostEqual(float(actual[metric]), float(expected), delta=numeric_tolerance)
+            for gate, expected in record["replay_gates"].items():
+                self.assertEqual(bool(actual[gate]), expected)
+            self.assertEqual(actual.get("first_failed_gate"), record["first_failed_gate"])
 
     def test_fixture_replays_fresh_breakouts_with_synthetic_cross_section(self) -> None:
         rows = evaluate_strong_trend(_fixture_context()).rows
@@ -230,9 +259,47 @@ class R4HistoryAndIsolationTests(unittest.TestCase):
                 conn.close()
 
         self.assertEqual(coverage["status"], "complete")
-        self.assertEqual(coverage["covered_sessions"], 2)
+        self.assertEqual(coverage["covered_sessions"], 1)
         self.assertEqual(qualified, {})
         self.assertEqual(before, after)
+
+    def test_a_history_coverage_uses_the_same_prior_usable_window_as_c(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            conn = connect(base)
+            try:
+                migrate_selection_batch_schema(conn)
+                usable_dates = pd.bdate_range("2026-01-02", periods=61).strftime("%Y-%m-%d").tolist()
+                current_day = usable_dates[-1]
+                prior_window = prior_usable_dates(conn, current_day, usable_dates=usable_dates)
+                self.assertEqual(prior_window, usable_dates[-61:-1])
+
+                zero = a_history_coverage(conn, current_day, usable_dates=usable_dates)
+                self._insert_a_batch(
+                    conn,
+                    prior_window[-1],
+                    status="empty",
+                    include_candidate=False,
+                    completed_at=f"{prior_window[-1]}T15:01:00",
+                )
+                one = a_history_coverage(conn, current_day, usable_dates=usable_dates)
+                for trade_date in prior_window[:-1]:
+                    self._insert_a_batch(
+                        conn,
+                        trade_date,
+                        status="empty",
+                        include_candidate=False,
+                        completed_at=f"{trade_date}T15:01:00",
+                    )
+                full = a_history_coverage(conn, current_day, usable_dates=usable_dates)
+            finally:
+                conn.close()
+
+        self.assertEqual((zero["covered_sessions"], zero["target_sessions"]), (0, 60))
+        self.assertEqual((one["covered_sessions"], one["target_sessions"]), (1, 60))
+        self.assertEqual((full["covered_sessions"], full["target_sessions"]), (60, 60))
+        self.assertNotIn(current_day, full["covered_dates"])
 
     def test_a_history_is_explicitly_unavailable_without_migration(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -248,13 +315,75 @@ class R4HistoryAndIsolationTests(unittest.TestCase):
         self.assertEqual(coverage["covered_sessions"], 0)
 
     def test_screening_base_dir_env_is_an_opt_in_seam(self) -> None:
-        from app_panel import app_dir, screening_base_dir
+        from app_panel import app_dir, screening_acceptance_now_cn, screening_base_dir
 
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(os.environ, {"SCREENING_BASE_DIR": tmp}, clear=False):
                 self.assertEqual(screening_base_dir(), str(Path(tmp).resolve()))
         with mock.patch.dict(os.environ, {"SCREENING_BASE_DIR": ""}, clear=False):
             self.assertEqual(screening_base_dir(), app_dir())
+        with mock.patch.dict(os.environ, {"SCREENING_BASE_DIR": "", "SCREENING_ACCEPTANCE_NOW_CN": "2026-08-07T10:30:00+08:00"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "requires SCREENING_BASE_DIR"):
+                screening_acceptance_now_cn()
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"SCREENING_BASE_DIR": tmp, "SCREENING_ACCEPTANCE_NOW_CN": "2026-08-07T10:30:00+08:00"},
+                clear=False,
+            ):
+                self.assertEqual(screening_acceptance_now_cn(), dt.datetime(2026, 8, 7, 10, 30, tzinfo=dt.timezone(dt.timedelta(hours=8))))
+
+    def test_isolated_snapshot_loader_uses_only_a_valid_cache(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
+        from mining.streamlit_tabs.tab_scanner import _build_quote_snapshot_loader
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            observed_at = dt.datetime(2026, 4, 9, 10, 30, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+            calls: list[str] = []
+
+            def provider_fetcher(provider: str, timeout: float) -> pd.DataFrame:
+                calls.append(provider)
+                raise AssertionError("isolated acceptance must not call a provider")
+
+            adapter = QuoteSnapshotAdapter(
+                cache_dir=base / "output" / "screening-v2-work" / "cache",
+                provider_fetcher=provider_fetcher,
+            )
+            adapter._save_success(
+                dates["target_trade_date"],
+                QuoteSnapshotResult(
+                    frame=pd.DataFrame(
+                        [
+                            {"sec_code": "600001", "sec_name": "Alpha", "open": 10.0, "high": 10.2, "low": 9.9, "close": 10.1, "pre_close": 10.0, "volume": 1_000_000, "amount": 10_000_000},
+                            {"sec_code": "300001", "sec_name": "Beta", "open": 20.0, "high": 20.2, "low": 19.9, "close": 20.1, "pre_close": 20.0, "volume": 1_000_000, "amount": 10_000_000},
+                            {"sec_code": "600003", "sec_name": "Gamma", "open": 30.0, "high": 30.2, "low": 29.9, "close": 30.1, "pre_close": 30.0, "volume": 1_000_000, "amount": 10_000_000},
+                        ]
+                    ),
+                    provider="isolated-cache",
+                    observed_at=observed_at.isoformat(),
+                    raw_rows=3,
+                    normalized_rows=3,
+                    coverage=1.0,
+                    attempts=0,
+                    errors=(),
+                    status="snapshot_usable",
+                    from_cache=False,
+                ),
+            )
+            loader = _build_quote_snapshot_loader(
+                base,
+                dates["target_trade_date"],
+                adapter=adapter,
+                now=observed_at + dt.timedelta(minutes=5),
+                cache_only=True,
+            )
+            cached = loader()
+
+        self.assertTrue(cached.from_cache)
+        self.assertEqual(cached.status, "snapshot_cache_fallback")
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":
