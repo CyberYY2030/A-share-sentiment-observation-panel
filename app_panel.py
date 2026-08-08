@@ -63,6 +63,7 @@ DEFAULT_CONCEPT_DB = "ths_concept.db"
 DEFAULT_ETF_DB = "etf_mvp.db"
 DEFAULT_CSV_OUT = "daily_metrics_last40.csv"
 CATCHUP_THROTTLE_SECONDS = 1800.0
+SCREENING_BASE_DIR_ENV = "SCREENING_BASE_DIR"
 
 
 # Backfill scripts (place them in the same folder as this Streamlit app)
@@ -129,6 +130,12 @@ def app_dir() -> str:
         return os.path.dirname(os.path.abspath(__file__))
     except Exception:
         return os.getcwd()
+
+
+def screening_base_dir() -> str:
+    """Return the isolated screening-data root when the acceptance seam is set."""
+    configured = os.environ.get(SCREENING_BASE_DIR_ENV, "").strip()
+    return str(Path(configured).resolve()) if configured else app_dir()
 
 
 def abs_in_app_dir(filename: str) -> str:
@@ -4023,7 +4030,8 @@ def main():
 
     msgs_turnover: List[str] = []
 
-    runtime_paths = build_runtime_paths(app_dir())
+    isolated_screening = bool(os.environ.get(SCREENING_BASE_DIR_ENV, "").strip())
+    runtime_paths = build_runtime_paths(screening_base_dir())
     ensure_runtime_dirs(runtime_paths)
     stock_db = runtime_paths.stock_db
     if not stock_db:
@@ -4032,6 +4040,8 @@ def main():
 
     concept_db = runtime_paths.concept_db
     etf_db = runtime_paths.etf_db
+    if isolated_screening:
+        st.sidebar.info("隔离验收模式：只读取 SCREENING_BASE_DIR 中的副本；自动修复与回填已禁用。")
 
     # Sidebar config（不改你已有参数命名风格）
     st.sidebar.header("参数")
@@ -4121,7 +4131,13 @@ def main():
             )
         )
         if not required_throttled:
-            if can_use_snapshot_for_close_target(requested_close_day):
+            if isolated_screening:
+                local_after_required = local_before
+                required_logs = [
+                    f"target_close_day={requested_close_day}",
+                    "[ISOLATED_SCREENING] close-data repair is disabled during browser acceptance",
+                ]
+            elif can_use_snapshot_for_close_target(requested_close_day):
                 with st.spinner(f"正在用收盘快照补齐 {requested_close_day} 数据..."):
                     local_after_required, required_logs = maybe_backfill_to_close_day(
                         stock_db=stock_db,
@@ -4180,13 +4196,15 @@ def main():
     offline_missing = offline_plan.get("missing_by_domain") or {}
     if offline_missing:
         st.sidebar.warning(f"DB date gaps detected: {offline_missing}")
+        if isolated_screening:
+            st.sidebar.caption("隔离验收模式不启动 offline_daily_update；数据库副本保持冻结。")
         offline_key = str(offline_plan.get("missing_by_day") or {})
         offline_state = st.session_state.get("offline_daily_update_state") or {}
         offline_throttled = bool(
             offline_state.get("target") == offline_key
             and (now_ts - float(offline_state.get("ts") or 0.0) < CATCHUP_THROTTLE_SECONDS)
         )
-        if not offline_throttled:
+        if (not isolated_screening) and (not offline_throttled):
             sp = pick_existing_script(SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES)
             if sp:
                 job = start_background_job(

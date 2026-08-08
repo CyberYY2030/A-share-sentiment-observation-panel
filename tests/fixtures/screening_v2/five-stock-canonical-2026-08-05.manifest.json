@@ -1,0 +1,57 @@
+{
+  "fixture_id": "five-stock-canonical-2026-08-05",
+  "human_calibration": "not-provided",
+  "source": "isolated R0.1 canonical forward-adjusted local price slice",
+  "source_sha256": "D6A505ADF402A4200D8074D7D708F33FD8EAE1C00AC938545C948821EAA33DE4",
+  "data_file": "five-stock-canonical-2026-08-05.csv",
+  "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+  "as_of": "2026-08-05",
+  "date_range": ["2026-04-21", "2026-08-05"],
+  "records": [
+    {
+      "sec_code": "300996",
+      "as_of": "2026-08-05",
+      "source": "five-stock-canonical-2026-08-05.csv",
+      "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+      "expected_path": "fresh_breakout",
+      "key_metrics": {"reference_price": 19.2, "ret20": 0.7410324705, "rps20_pct": 0.998996387, "prior_close_high_20": 18.62},
+      "failure_conditions": ["none: all formal A gates must pass in the frozen full-market evaluation"]
+    },
+    {
+      "sec_code": "601858",
+      "as_of": "2026-08-05",
+      "source": "five-stock-canonical-2026-08-05.csv",
+      "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+      "expected_path": "fresh_breakout",
+      "key_metrics": {"reference_price": 25.36, "ret20": 0.5611559133, "rps20_pct": 0.9975913288, "prior_close_high_20": 23.94},
+      "failure_conditions": ["none: all formal A gates must pass in the frozen full-market evaluation"]
+    },
+    {
+      "sec_code": "688141",
+      "as_of": "2026-08-05",
+      "source": "five-stock-canonical-2026-08-05.csv",
+      "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+      "expected_path": "rejected",
+      "key_metrics": {"gate_valid_trade": true, "gate_near_high": true},
+      "failure_conditions": ["close_ma10_ma20"]
+    },
+    {
+      "sec_code": "688627",
+      "as_of": "2026-08-05",
+      "source": "five-stock-canonical-2026-08-05.csv",
+      "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+      "expected_path": "rejected",
+      "key_metrics": {"gate_valid_trade": true, "gate_near_high": false},
+      "failure_conditions": ["close_ma10_ma20"]
+    },
+    {
+      "sec_code": "301571",
+      "as_of": "2026-08-05",
+      "source": "five-stock-canonical-2026-08-05.csv",
+      "data_hash": "185FD7EE4DD3175328855D7D9E3F77509EAF2BC881A11C1C88AA5F0CEB3F89E6",
+      "expected_path": "rejected",
+      "key_metrics": {"gate_valid_trade": true, "gate_ret20": true},
+      "failure_conditions": ["close_ma10_ma20"]
+    }
+  ]
+}

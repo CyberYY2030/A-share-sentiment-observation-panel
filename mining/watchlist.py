@@ -11,6 +11,7 @@ from typing import Any, Iterable
 import pandas as pd
 
 from .capabilities import SCREENING_DEFINITION_VERSION
+from .data_quality import usable_stock_trade_dates
 from .selection_batches import selection_batch_schema_state
 from .db import list_stock_trade_dates, now_str
 from .features import board_kind, moving_average, volume_shrink_ratio
@@ -571,6 +572,71 @@ PULLBACK_SUPPORT_STATES = frozenset(
     }
 )
 PULLBACK_STATE_HISTORY_TABLE = "pullback_state_history"
+A_HISTORY_TARGET_SESSIONS = 60
+
+
+def a_history_coverage(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    target_sessions: int = A_HISTORY_TARGET_SESSIONS,
+    usable_dates: Sequence[str] | None = None,
+) -> dict[str, object]:
+    """Report finalized A-history coverage without creating or recalculating a batch."""
+    target = int(target_sessions)
+    if usable_dates is None:
+        resolved_dates, _ = usable_stock_trade_dates(conn, end_date=str(trade_date))
+    else:
+        resolved_dates = sorted({str(day) for day in usable_dates if str(day) <= str(trade_date)})
+    window_dates = resolved_dates[-target:]
+    result: dict[str, object] = {
+        "covered_sessions": 0,
+        "target_sessions": target,
+        "covered_dates": [],
+        "status": "unfinalized",
+        "error_msg": None,
+    }
+    schema = selection_batch_schema_state(conn)
+    if not schema.ready:
+        result.update(status=schema.code, error_msg=schema.error_msg)
+        return result
+    if not window_dates:
+        return result
+    marks = ",".join("?" for _ in window_dates)
+    try:
+        rows = conn.execute(
+            f"""
+            WITH ranked_batches AS (
+                SELECT b.batch_id, b.trade_date,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY b.trade_date
+                           ORDER BY b.completed_at DESC, b.batch_id DESC
+                       ) AS row_rank
+                FROM selection_batches b
+                WHERE b.definition_version=? AND b.mode='close_final' AND b.status='complete'
+                  AND b.trade_date IN ({marks})
+            )
+            SELECT DISTINCT b.trade_date
+            FROM ranked_batches b
+            JOIN strategy_runs r ON r.batch_id=b.batch_id
+            WHERE b.row_rank=1 AND r.strategy_id='strong_trend'
+              AND r.version=? AND r.mode='close_final' AND r.status IN ('ok', 'empty')
+            ORDER BY b.trade_date
+            """,
+            [SCREENING_DEFINITION_VERSION, *window_dates, SCREENING_DEFINITION_VERSION],
+        ).fetchall()
+    except sqlite3.DatabaseError as exc:
+        result.update(status="schema_error", error_msg=f"A history coverage: {type(exc).__name__}: {exc}")
+        return result
+    covered_dates = [str(row[0]) for row in rows]
+    result.update(
+        covered_sessions=len(covered_dates),
+        covered_dates=covered_dates,
+        status="complete",
+    )
+    return result
+
+
 @dataclass
 class PullbackSupportEvaluation:
     """Single C-capability result shared by the phase view and second_launch."""
@@ -829,15 +895,25 @@ def _load_a_qualified_pool(
     try:
         rows = conn.execute(
             f"""
+            WITH ranked_batches AS (
+                SELECT b.batch_id, b.trade_date,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY b.trade_date
+                           ORDER BY b.completed_at DESC, b.batch_id DESC
+                       ) AS row_rank
+                FROM selection_batches b
+                WHERE b.definition_version=? AND b.mode='close_final' AND b.status='complete'
+                  AND b.trade_date IN ({marks})
+            )
             SELECT c.sec_code, c.trade_date, c.features_json
             FROM candidates c
             JOIN strategy_runs r ON r.run_id=c.run_id
-            JOIN selection_batches b ON b.batch_id=r.batch_id
+            JOIN ranked_batches b ON b.batch_id=r.batch_id
             WHERE c.strategy_id='strong_trend' AND c.version=? AND c.sec_type='stock'
               AND c.trade_date IN ({marks}) AND r.mode='close_final'
-              AND b.definition_version=? AND b.mode='close_final' AND b.status='complete'
+              AND b.row_rank=1
             """,
-            [SCREENING_DEFINITION_VERSION, *clean_dates, SCREENING_DEFINITION_VERSION],
+            [SCREENING_DEFINITION_VERSION, *clean_dates, SCREENING_DEFINITION_VERSION, *clean_dates],
         ).fetchall()
     except sqlite3.DatabaseError:
         return {}, {}

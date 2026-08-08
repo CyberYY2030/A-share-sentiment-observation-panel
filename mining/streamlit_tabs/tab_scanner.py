@@ -55,6 +55,7 @@ from ..watchlist import (
     STATE_EXTEND,
     STATE_READY,
     STATE_RETRIGGER,
+    a_history_coverage,
     build_watchlist,
     build_pullback_support,
     split_actionable_watchlist,
@@ -803,8 +804,15 @@ def _formal_capability_view(
         snapshot_coverage=result.snapshot_coverage,
         quote_result=quote_result,
     )
+    c_history = a_history_coverage(
+        conn,
+        trade_date,
+        usable_dates=context.diagnostics.get("usable_dates"),
+    )
     if result.mode == MODE_CLOSE_FINAL:
-        return _load_formal_capability_candidates(conn, trade_date), _capability_run_status(conn, trade_date), evidence
+        status = _capability_run_status(conn, trade_date)
+        status.attrs["a_history_coverage"] = c_history
+        return _load_formal_capability_candidates(conn, trade_date), status, evidence
     if result.mode == MODE_DATA_UNAVAILABLE:
         status = pd.DataFrame(
             [
@@ -820,8 +828,10 @@ def _formal_capability_view(
                 for definition in formal_definitions()
             ]
         )
+        status.attrs["a_history_coverage"] = c_history
         return pd.DataFrame(), status, evidence
     rows, status = _live_formal_capability_rows(conn, context)
+    status.attrs["a_history_coverage"] = c_history
     return rows, status, evidence
 
 
@@ -1632,6 +1642,7 @@ def render_scanner_tab(
                 snapshot_loader=shared_snapshot_loader,
                 runtime=st.session_state[runtime_key],
             )
+            c_history = capability_status_df.attrs.get("a_history_coverage") or a_history_coverage(status_conn, today_date)
         finally:
             status_conn.close()
     except Exception:
@@ -1639,6 +1650,12 @@ def render_scanner_tab(
         run_status_df = pd.DataFrame(columns=["strategy_id", "status", "n_candidates", "universe_size", "run_at"])
         formal_today_df = pd.DataFrame()
         capability_status_df = pd.DataFrame()
+        c_history = {
+            "covered_sessions": 0,
+            "target_sessions": 60,
+            "status": "schema_error",
+            "error_msg": "unable to read A history coverage",
+        }
         selection_evidence = {
             "mode": "data_unavailable",
             "as_of": None,
@@ -1662,7 +1679,13 @@ def render_scanner_tab(
 
     st.markdown("**正式筛选 A–E**")
     if not capability_status_df.empty:
-        st.dataframe(capability_status_df, width="stretch", hide_index=True)
+        display_status = capability_status_df.copy()
+        if "capability" in display_status.columns:
+            c_mask = display_status["capability"].eq("C")
+            display_status.loc[c_mask, "a_history_coverage"] = (
+                f"{c_history['covered_sessions']}/{c_history['target_sessions']}"
+            )
+        st.dataframe(display_status, width="stretch", hide_index=True)
     for capability in ("A", "B", "C", "D", "E"):
         definitions = formal_definitions(capability)
         label = definitions[0].label if definitions else capability
@@ -1677,6 +1700,15 @@ def render_scanner_tab(
             else pd.DataFrame()
         )
         st.markdown(f"**{capability} · {label}**")
+        if capability == "C":
+            coverage_label = f"a_history_coverage={c_history['covered_sessions']}/{c_history['target_sessions']}"
+            if c_history["status"] == "complete":
+                if int(c_history["covered_sessions"]) < int(c_history["target_sessions"]):
+                    st.warning(f"{coverage_label}；bootstrapping/partial recall，已有候选保持展示。")
+                else:
+                    st.caption(coverage_label)
+            else:
+                st.warning(f"{coverage_label}；A 历史状态={c_history['status']}。")
         if not capability_status.empty:
             summaries = []
             for item in capability_status.itertuples(index=False):
