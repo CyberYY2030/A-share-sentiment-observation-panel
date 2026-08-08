@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from .capabilities import formal_definitions
+from .capabilities import SCREENING_DEFINITION_VERSION, formal_definitions, formal_strategy_ids
 
 
 def _load_candidates(
@@ -39,16 +39,41 @@ def load_formal_capability_candidates(conn: sqlite3.Connection, trade_date: str)
     if not definitions:
         return pd.DataFrame()
     marks = ",".join("?" for _ in definitions)
-    frame = pd.read_sql_query(
-        f"""
-        SELECT strategy_id, version, trade_date, sec_code, sec_name, entry_price, rank, features_json
-        FROM candidates
-        WHERE sec_type='stock' AND trade_date=? AND strategy_id IN ({marks})
-        ORDER BY strategy_id, rank, sec_code
-        """,
-        conn,
-        params=[str(trade_date), *(definition.strategy_id for definition in definitions)],
-    )
+    try:
+        batch = conn.execute(
+            """
+            SELECT batch_id FROM selection_batches
+            WHERE trade_date=? AND definition_version=? AND mode='close_final' AND status='complete'
+            ORDER BY completed_at DESC, batch_id DESC LIMIT 1
+            """,
+            (str(trade_date), SCREENING_DEFINITION_VERSION),
+        ).fetchone()
+        if batch is None:
+            return pd.DataFrame()
+        frame = pd.read_sql_query(
+            f"""
+            SELECT c.strategy_id, c.version, c.trade_date, c.sec_code, c.sec_name,
+                   c.entry_price, c.rank, c.features_json
+            FROM candidates c
+            JOIN strategy_runs r ON r.run_id=c.run_id
+            WHERE r.batch_id=? AND r.mode='close_final' AND c.sec_type='stock'
+              AND c.version=? AND c.trade_date=? AND c.strategy_id IN ({marks})
+            ORDER BY c.strategy_id, c.rank, c.sec_code
+            """,
+            conn,
+            params=[int(batch[0]), SCREENING_DEFINITION_VERSION, str(trade_date), *(definition.strategy_id for definition in definitions)],
+        )
+    except sqlite3.OperationalError:
+        frame = pd.read_sql_query(
+            f"""
+            SELECT strategy_id, version, trade_date, sec_code, sec_name, entry_price, rank, features_json
+            FROM candidates
+            WHERE sec_type='stock' AND trade_date=? AND strategy_id IN ({marks})
+            ORDER BY strategy_id, rank, sec_code
+            """,
+            conn,
+            params=[str(trade_date), *(definition.strategy_id for definition in definitions)],
+        )
     if frame.empty:
         return frame
     features = pd.json_normalize(frame["features_json"].map(lambda value: json.loads(value or "{}")))
@@ -121,16 +146,18 @@ def _markdown_table(df: pd.DataFrame, columns: list[str]) -> str:
 def get_review_summary(
     conn: sqlite3.Connection, trade_date: str, lookback: int = 30
 ) -> dict[str, dict[str, float | int | None]]:
+    formal_ids = formal_strategy_ids()
+    marks = ",".join("?" for _ in formal_ids)
     dates = pd.read_sql_query(
-        """
+        f"""
         SELECT DISTINCT trade_date
         FROM candidates
-        WHERE trade_date <= ?
+        WHERE trade_date <= ? AND strategy_id NOT IN ({marks})
         ORDER BY trade_date DESC
         LIMIT ?
         """,
         conn,
-        params=[trade_date, lookback],
+        params=[trade_date, *formal_ids, lookback],
     )["trade_date"].tolist()
     if not dates:
         return {}
@@ -147,10 +174,11 @@ def get_review_summary(
         FROM candidates c
         LEFT JOIN outcomes o ON o.candidate_id = c.candidate_id
         WHERE c.trade_date IN ({",".join("?" for _ in dates)})
+          AND c.strategy_id NOT IN ({marks})
         GROUP BY c.strategy_id
         """,
         conn,
-        params=dates,
+        params=[*dates, *formal_ids],
     )
     result: dict[str, dict[str, float | int | None]] = {}
     for row in summary.to_dict(orient="records"):
@@ -284,10 +312,12 @@ def get_forward_summary(
     if lookback <= 0:
         return _forward_rows_summary(pd.DataFrame(), "candidate", "strategy_id", {})
 
+    formal_ids = formal_strategy_ids()
+    marks = ",".join("?" for _ in formal_ids)
     candidate_dates = pd.read_sql_query(
-        "SELECT DISTINCT trade_date FROM candidates WHERE trade_date <= ?",
+        f"SELECT DISTINCT trade_date FROM candidates WHERE trade_date <= ? AND strategy_id NOT IN ({marks})",
         conn,
-        params=[trade_date],
+        params=[trade_date, *formal_ids],
     )["trade_date"].astype(str).tolist()
     snapshot_dates = pd.read_sql_query(
         "SELECT DISTINCT snapshot_date FROM watchlist_snapshots WHERE snapshot_date <= ?",
@@ -308,9 +338,10 @@ def get_forward_summary(
         JOIN outcomes o ON o.candidate_id=c.candidate_id
         WHERE c.sec_type='stock'
           AND c.trade_date IN ({placeholders})
+          AND c.strategy_id NOT IN ({marks})
         """,
         conn,
-        params=dates,
+        params=[*dates, *formal_ids],
     )
     watchlist = pd.read_sql_query(
         f"""
@@ -351,9 +382,11 @@ def generate_markdown_report(
     launch_burst = _load_candidates(conn, trade_date, "launch_burst")
     rps_stock = _load_candidates(conn, trade_date, "rps_stock_top20")
     rps_concept = _load_candidates(conn, trade_date, "rps_concept_top20")
+    formal_ids = formal_strategy_ids()
+    marks = ",".join("?" for _ in formal_ids)
     previous_trade_date = conn.execute(
-        "SELECT MAX(trade_date) FROM candidates WHERE trade_date < ?",
-        (trade_date,),
+        f"SELECT MAX(trade_date) FROM candidates WHERE trade_date < ? AND strategy_id NOT IN ({marks})",
+        (trade_date, *formal_ids),
     ).fetchone()[0]
     review = pd.DataFrame()
     if previous_trade_date:
@@ -371,11 +404,11 @@ def generate_markdown_report(
               o.is_win
             FROM candidates c
             LEFT JOIN outcomes o ON o.candidate_id = c.candidate_id
-            WHERE c.trade_date=? AND c.sec_type='stock'
+            WHERE c.trade_date=? AND c.sec_type='stock' AND c.strategy_id NOT IN ({marks})
             ORDER BY c.strategy_id, c.rank, c.sec_code
             """,
             conn,
-            params=[previous_trade_date],
+            params=[previous_trade_date, *formal_ids],
         )
     summary = get_review_summary(conn, trade_date, lookback=30)
     forward_summary = get_forward_summary(conn, trade_date, lookback=30)

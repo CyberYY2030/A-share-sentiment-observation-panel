@@ -10,6 +10,7 @@ from typing import Any, Iterable
 
 import pandas as pd
 
+from .capabilities import SCREENING_DEFINITION_VERSION
 from .db import list_stock_trade_dates, now_str
 from .features import board_kind, moving_average, volume_shrink_ratio
 from .selection_context import SelectionContext, build_selection_context
@@ -569,9 +570,6 @@ PULLBACK_SUPPORT_STATES = frozenset(
     }
 )
 PULLBACK_STATE_HISTORY_TABLE = "pullback_state_history"
-FORMAL_A_DEFINITION_VERSION = "v2.5"
-
-
 @dataclass
 class PullbackSupportEvaluation:
     """Single C-capability result shared by the phase view and second_launch."""
@@ -828,14 +826,25 @@ def _load_a_qualified_pool(
     try:
         rows = conn.execute(
             f"""
+            SELECT c.sec_code, c.trade_date, c.features_json
+            FROM candidates c
+            JOIN strategy_runs r ON r.run_id=c.run_id
+            JOIN selection_batches b ON b.batch_id=r.batch_id
+            WHERE c.strategy_id='strong_trend' AND c.version=? AND c.sec_type='stock'
+              AND c.trade_date IN ({marks}) AND r.mode='close_final'
+              AND b.definition_version=? AND b.mode='close_final' AND b.status='complete'
+            """,
+            [SCREENING_DEFINITION_VERSION, *clean_dates, SCREENING_DEFINITION_VERSION],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        rows = conn.execute(
+            f"""
             SELECT sec_code, trade_date, features_json
             FROM candidates
             WHERE strategy_id='strong_trend' AND version=? AND sec_type='stock' AND trade_date IN ({marks})
             """,
-            [FORMAL_A_DEFINITION_VERSION, *clean_dates],
+            [SCREENING_DEFINITION_VERSION, *clean_dates],
         ).fetchall()
-    except sqlite3.OperationalError:
-        return {}, {}
     qualified: dict[str, set[str]] = {}
     tiers: dict[str, str] = {}
     for sec_code, trade_date, features_json in rows:

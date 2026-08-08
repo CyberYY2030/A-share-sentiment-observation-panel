@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import json
+import sqlite3
 import datetime as dt
 from dataclasses import replace
 from pathlib import Path
@@ -11,7 +12,12 @@ import pandas as pd
 import streamlit as st
 
 from ..db import connect, list_stock_trade_dates
-from ..capabilities import LEGACY_STRATEGY_IDS, formal_definitions, visible_strategy_ids
+from ..capabilities import (
+    LEGACY_STRATEGY_IDS,
+    SCREENING_DEFINITION_VERSION,
+    formal_definitions,
+    visible_strategy_ids,
+)
 from ..data_quality import STATUS_CLEAN, inspect_stock_session
 from ..features import (
     board_kind,
@@ -414,45 +420,112 @@ def _load_close_opportunities(conn, trade_date: str) -> pd.DataFrame:
 
 
 def _persisted_candidate_dates(conn) -> list[str]:
-    strategy_ids = visible_strategy_ids()
-    marks = ",".join("?" for _ in strategy_ids)
-    rows = conn.execute(
-        f"""
-        SELECT DISTINCT trade_date
-        FROM candidates
-        WHERE sec_type='stock'
-          AND strategy_id IN ({marks})
-        ORDER BY trade_date
-        """,
-        strategy_ids,
-    ).fetchall()
+    try:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT trade_date
+            FROM selection_batches
+            WHERE definition_version=? AND mode='close_final' AND status='complete'
+            ORDER BY trade_date
+            """,
+            (SCREENING_DEFINITION_VERSION,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Before explicit R3 migration, preserve the legacy history workflow.
+        # Once the batch schema exists, legacy rows can no longer make a formal day complete.
+        strategy_ids = visible_strategy_ids()
+        marks = ",".join("?" for _ in strategy_ids)
+        rows = conn.execute(
+            f"""
+            SELECT DISTINCT trade_date FROM candidates
+            WHERE sec_type='stock' AND strategy_id IN ({marks})
+            ORDER BY trade_date
+            """,
+            strategy_ids,
+        ).fetchall()
     return [str(row[0]) for row in rows]
 
 
-def _load_persisted_candidates(conn, trade_date: str) -> pd.DataFrame:
-    strategy_ids = visible_strategy_ids()
-    marks = ",".join("?" for _ in strategy_ids)
-    df = pd.read_sql_query(
-        f"""
-        SELECT strategy_id, trade_date, sec_type, sec_code, sec_name, entry_price, rank, features_json
-        FROM candidates
-        WHERE sec_type='stock'
-          AND strategy_id IN ({marks})
-          AND trade_date=?
-        ORDER BY strategy_id, rank, sec_code
-        """,
-        conn,
-        params=[*strategy_ids, trade_date],
-    )
+def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
+    """Read one complete current-version batch; never combine old versions or batches."""
+    definitions = formal_definitions()
+    marks = ",".join("?" for _ in definitions)
+    try:
+        batch = conn.execute(
+            """
+            SELECT batch_id
+            FROM selection_batches
+            WHERE trade_date=? AND definition_version=?
+              AND mode='close_final' AND status='complete'
+            ORDER BY completed_at DESC, batch_id DESC
+            LIMIT 1
+            """,
+            (str(trade_date), SCREENING_DEFINITION_VERSION),
+        ).fetchone()
+        if batch is None:
+            return pd.DataFrame()
+        df = pd.read_sql_query(
+            f"""
+            SELECT c.strategy_id, c.version, c.trade_date, c.sec_type, c.sec_code,
+                   c.sec_name, c.entry_price, c.rank, c.features_json
+            FROM candidates c
+            JOIN strategy_runs r ON r.run_id=c.run_id
+            WHERE r.batch_id=? AND r.mode='close_final'
+              AND c.sec_type='stock' AND c.version=?
+              AND c.strategy_id IN ({marks}) AND c.trade_date=?
+            ORDER BY c.strategy_id, c.rank, c.sec_code
+            """,
+            conn,
+            params=[int(batch[0]), SCREENING_DEFINITION_VERSION, *(definition.strategy_id for definition in definitions), str(trade_date)],
+        )
+    except sqlite3.OperationalError:
+        # Production migration is explicitly authorized later.  Before that point,
+        # preserve the legacy formal view rather than treating an old schema as a
+        # partially written R3 batch.
+        df = pd.read_sql_query(
+            f"""
+            SELECT strategy_id, version, trade_date, sec_type, sec_code,
+                   sec_name, entry_price, rank, features_json
+            FROM candidates
+            WHERE sec_type='stock' AND strategy_id IN ({marks}) AND trade_date=?
+            ORDER BY strategy_id, rank, sec_code
+            """,
+            conn,
+            params=[*(definition.strategy_id for definition in definitions), str(trade_date)],
+        )
     if df.empty:
         return df
     features = pd.json_normalize(df["features_json"].map(lambda text: json.loads(text or "{}")))
-    return pd.concat([df.drop(columns=["features_json"]), features], axis=1)
+    return _annotate_formal_capability_candidates(
+        pd.concat([df.drop(columns=["features_json"]), features], axis=1)
+    )
 
 
-def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
-    """Panel consumer for the same A–E registry used by close-final reports."""
-    rows = _load_persisted_candidates(conn, trade_date)
+def _load_persisted_candidates(conn, trade_date: str) -> pd.DataFrame:
+    """Legacy display rows plus the single formal batch selected above."""
+    formal_rows = _load_formal_capability_candidates(conn, trade_date)
+    visible_ids = visible_strategy_ids()
+    visible_marks = ",".join("?" for _ in visible_ids)
+    formal_ids = tuple(definition.strategy_id for definition in formal_definitions())
+    formal_marks = ",".join("?" for _ in formal_ids)
+    legacy_rows = pd.read_sql_query(
+        f"""
+        SELECT strategy_id, version, trade_date, sec_type, sec_code, sec_name, entry_price, rank, features_json
+        FROM candidates
+        WHERE sec_type='stock' AND strategy_id IN ({visible_marks}) AND trade_date=?
+          AND (strategy_id NOT IN ({formal_marks}) OR version != ?)
+        ORDER BY strategy_id, rank, sec_code
+        """,
+        conn,
+        params=[*visible_ids, str(trade_date), *formal_ids, SCREENING_DEFINITION_VERSION],
+    )
+    if not legacy_rows.empty:
+        features = pd.json_normalize(legacy_rows["features_json"].map(lambda text: json.loads(text or "{}")))
+        legacy_rows = pd.concat([legacy_rows.drop(columns=["features_json"]), features], axis=1)
+    return pd.concat([formal_rows, legacy_rows], ignore_index=True, sort=False)
+
+
+def _annotate_formal_capability_candidates(rows: pd.DataFrame) -> pd.DataFrame:
     if rows.empty:
         return rows
     definitions = {definition.strategy_id: definition for definition in formal_definitions()}
@@ -468,40 +541,43 @@ def _load_formal_capability_candidates(conn, trade_date: str) -> pd.DataFrame:
 
 def _capability_run_status(conn, trade_date: str) -> pd.DataFrame:
     """Return one explicit availability state per formal capability strategy."""
-    base = _load_strategy_run_status(conn, trade_date)
+    pre_migration = False
+    try:
+        batch = conn.execute(
+            """
+            SELECT batch_id FROM selection_batches
+            WHERE trade_date=? AND definition_version=? AND mode='close_final' AND status='complete'
+            ORDER BY completed_at DESC, batch_id DESC LIMIT 1
+            """,
+            (str(trade_date), SCREENING_DEFINITION_VERSION),
+        ).fetchone()
+        base = pd.read_sql_query(
+            """
+            SELECT strategy_id, status, n_candidates, universe_size, run_at
+            FROM strategy_runs WHERE batch_id=? AND mode='close_final'
+            """,
+            conn,
+            params=[int(batch[0])],
+        ) if batch is not None else pd.DataFrame()
+    except sqlite3.OperationalError:
+        pre_migration = True
+        base = _load_strategy_run_status(conn, trade_date)
     rows: list[dict[str, object]] = []
     for definition in formal_definitions():
         matched = base[base["strategy_id"].eq(definition.strategy_id)] if not base.empty else pd.DataFrame()
         if matched.empty:
-            availability = "未运行"
-            latest_nonempty = conn.execute(
-                """
-                SELECT MAX(trade_date) FROM strategy_runs
-                WHERE strategy_id=? AND version='v2.0' AND status='ok' AND n_candidates>0
-                """,
-                (definition.strategy_id,),
-            ).fetchone()[0]
-            rows.append({"strategy_id": definition.strategy_id, "capability": definition.capability, "availability": availability, "last_nonempty": latest_nonempty})
+            rows.append({"strategy_id": definition.strategy_id, "capability": definition.capability, "availability": "未运行" if pre_migration else "未定版", "last_nonempty": None})
             continue
         item = matched.iloc[0]
         status = str(item["status"])
         availability = "成功但 0 条" if status == "empty" else ("运行失败" if status not in {"ok", "empty"} else "成功")
-        latest_nonempty = None
-        if availability == "成功但 0 条":
-            latest_nonempty = conn.execute(
-                """
-                SELECT MAX(trade_date) FROM strategy_runs
-                WHERE strategy_id=? AND version='v2.0' AND status='ok' AND n_candidates>0
-                """,
-                (definition.strategy_id,),
-            ).fetchone()[0]
         rows.append({
             "strategy_id": definition.strategy_id,
             "capability": definition.capability,
             "availability": availability,
             "n_candidates": int(item["n_candidates"] or 0),
             "run_at": item["run_at"],
-            "last_nonempty": latest_nonempty,
+            "last_nonempty": None,
         })
     return pd.DataFrame(rows)
 
@@ -554,13 +630,13 @@ def _annotate_formal_rows(rows: pd.DataFrame, strategy_id: str, *, reference_col
     result = result[result["reference_price"].gt(0)].copy()
     if result.empty:
         return result
+    definition = next(item for item in formal_definitions() if item.strategy_id == strategy_id)
     result["strategy_id"] = strategy_id
-    result["version"] = "v2.0"
+    result["version"] = definition.version
     result["trade_date"] = result.get("trade_date", pd.Series(pd.NA, index=result.index))
     result["sec_type"] = "stock"
     result["entry_price"] = result["reference_price"]
     result["rank"] = range(1, len(result) + 1)
-    definition = next(item for item in formal_definitions() if item.strategy_id == strategy_id)
     result["capability"] = definition.capability
     result["capability_label"] = definition.label
     result["subtype"] = definition.subtype
@@ -643,7 +719,7 @@ def _live_formal_capability_rows(conn, context) -> tuple[pd.DataFrame, pd.DataFr
             pullback,
             trade_date=context.trade_date,
             strategy_id="second_launch",
-            version="v2.0",
+            version=next(item for item in formal_definitions() if item.strategy_id == "second_launch").version,
             top_n=20,
         )
         pullback_rows = _annotate_serialized_formal_rows(_serialize_candidates(pullback_candidates))

@@ -5,6 +5,7 @@ import math
 import sqlite3
 from pathlib import Path
 
+from .capabilities import SCREENING_DEFINITION_VERSION, formal_strategy_ids
 from .db import connect, list_stock_trade_dates, now_str
 
 
@@ -85,28 +86,32 @@ def _forward_outcome_values(entry_price: float, bars: dict[str, object]) -> dict
 def backfill_outcomes(
     conn: sqlite3.Connection, trade_date: str | None = None, force: bool = False
 ) -> dict[str, int]:
+    formal_ids = formal_strategy_ids()
+    formal_marks = ",".join("?" for _ in formal_ids)
     if force:
         rows = conn.execute(
-            """
+            f"""
             SELECT candidate_id, trade_date, sec_code, entry_price
-            FROM candidates
-            WHERE sec_type='stock' AND (? IS NULL OR trade_date=?)
+            FROM candidates c
+            WHERE c.sec_type='stock' AND (? IS NULL OR c.trade_date=?)
+              AND NOT (c.version=? AND c.strategy_id IN ({formal_marks}))
             ORDER BY trade_date, candidate_id
             """,
-            (trade_date, trade_date),
+            (trade_date, trade_date, SCREENING_DEFINITION_VERSION, *formal_ids),
         ).fetchall()
     else:
         rows = conn.execute(
-            """
+            f"""
             SELECT c.candidate_id, c.trade_date, c.sec_code, c.entry_price
             FROM candidates c
             LEFT JOIN outcomes o ON o.candidate_id = c.candidate_id
             WHERE c.sec_type='stock'
               AND (? IS NULL OR c.trade_date=?)
+              AND NOT (c.version=? AND c.strategy_id IN ({formal_marks}))
               AND (o.candidate_id IS NULL OR o.status='partial')
             ORDER BY c.trade_date, c.candidate_id
             """,
-            (trade_date, trade_date),
+            (trade_date, trade_date, SCREENING_DEFINITION_VERSION, *formal_ids),
         ).fetchall()
 
     processed = 0

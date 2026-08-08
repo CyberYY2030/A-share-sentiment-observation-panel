@@ -6,6 +6,12 @@ from pathlib import Path
 from typing import Any
 
 from mining.backtest import backfill_outcomes, backfill_snapshot_outcomes
+from mining.capabilities import formal_definitions, formal_strategy_ids
+from mining.candidate_persistence import (
+    evaluate_formal_capabilities,
+    persist_close_final_batch,
+    selection_batch_schema_ready,
+)
 from mining.db import (
     connect,
     create_strategy_run,
@@ -18,6 +24,7 @@ from mining.intraday import scan_intraday
 from mining.refresh_basics import refresh_basics
 from mining.reports import generate_excel_report, generate_markdown_report
 from mining.scanners import get_registered_scanners
+from mining.selection_context import build_selection_context
 from mining.scanners.momentum_breakout import (
     MomentumBreakoutScanner,
     select_candidates_from_universe as select_momentum_candidates,
@@ -30,9 +37,19 @@ from mining.universe import build_universe
 from mining.watchlist import persist_watchlist_snapshot
 
 
-def _run_scanners(conn: Any, trade_date: str) -> list[dict[str, Any]]:
+def _run_legacy_scanners(
+    conn: Any,
+    trade_date: str,
+    *,
+    include_formal: bool = False,
+) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
-    scanners = [scanner_cls() for scanner_cls in get_registered_scanners()]
+    formal_ids = set(formal_strategy_ids())
+    scanners = [
+        scanner_cls()
+        for scanner_cls in get_registered_scanners()
+        if include_formal or scanner_cls.strategy_id not in formal_ids
+    ]
     stock_universe = None
     rps_stock_candidates = None
     rps_exclusion_codes: set[str] | None = None
@@ -98,6 +115,41 @@ def _run_scanners(conn: Any, trade_date: str) -> list[dict[str, Any]]:
     return results
 
 
+# Compatibility seam for legacy callers and tests.  The daily production path below
+# invokes _run_legacy_scanners after the formal batch path has completed.
+def _run_scanners(conn: Any, trade_date: str) -> list[dict[str, Any]]:
+    return _run_legacy_scanners(conn, trade_date, include_formal=True)
+
+
+def _run_formal_capabilities(conn: Any, trade_date: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Evaluate A-E once from a shared close-final context and persist one batch."""
+    if not selection_batch_schema_ready(conn):
+        return (
+            [
+                {"strategy_id": definition.strategy_id, "status": "migration_required", "count": 0}
+                for definition in formal_definitions()
+            ],
+            {"status": "migration_required", "batch_id": None},
+        )
+    context = build_selection_context(conn, trade_date, mode="close_final")
+    capability_results = evaluate_formal_capabilities(conn, context)
+    persisted = persist_close_final_batch(conn, context, capability_results)
+    summary = [
+        {
+            "strategy_id": result.strategy_id,
+            "status": result.status,
+            "count": len(result.candidates),
+        }
+        for result in capability_results
+    ]
+    return summary, {
+        "status": persisted.status,
+        "batch_id": persisted.batch_id,
+        "reused": persisted.reused,
+        "error": persisted.error_msg,
+    }
+
+
 def execute_daily_pipeline(
     base_dir: str | Path = ".",
     trade_date: str | None = None,
@@ -114,7 +166,12 @@ def execute_daily_pipeline(
         refresh_result = None
         if refresh:
             refresh_result = refresh_basics(conn, trade_date=resolved_trade_date)
-        scanner_results = _run_scanners(conn, resolved_trade_date)
+        formal_results, formal_batch = _run_formal_capabilities(conn, resolved_trade_date)
+        if formal_batch["status"] == "migration_required":
+            scanner_results = _run_scanners(conn, resolved_trade_date)
+        else:
+            legacy_results = _run_legacy_scanners(conn, resolved_trade_date)
+            scanner_results = [*formal_results, *legacy_results]
         backfill_result = backfill_outcomes(conn, trade_date=resolved_trade_date)
         watchlist_validation = None
         try:
@@ -138,6 +195,7 @@ def execute_daily_pipeline(
             "trade_date": resolved_trade_date,
             "refresh": refresh_result,
             "scanners": scanner_results,
+            "formal_batch": formal_batch,
             "backfill": backfill_result,
             "watchlist_validation": watchlist_validation,
             "markdown": markdown_path,

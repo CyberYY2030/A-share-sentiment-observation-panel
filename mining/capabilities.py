@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+SCREENING_DEFINITION_VERSION = "v2.5"
+
+
 @dataclass(frozen=True)
 class CapabilityDefinition:
     strategy_id: str
@@ -14,6 +17,7 @@ class CapabilityDefinition:
     supports_intraday: bool
     required_dependencies: tuple[str, ...] = ("price", "metadata")
     optional_dependencies: tuple[str, ...] = ()
+    version: str = SCREENING_DEFINITION_VERSION
 
 
 CAPABILITY_REGISTRY: tuple[CapabilityDefinition, ...] = (
@@ -68,6 +72,13 @@ def formal_definitions(capability: str | None = None) -> tuple[CapabilityDefinit
 
 def formal_strategy_ids() -> tuple[str, ...]:
     return tuple(definition.strategy_id for definition in CAPABILITY_REGISTRY)
+
+
+def formal_definition(strategy_id: str) -> CapabilityDefinition:
+    for definition in CAPABILITY_REGISTRY:
+        if definition.strategy_id == str(strategy_id):
+            return definition
+    raise KeyError(f"Unknown formal screening strategy: {strategy_id}")
 
 
 def visible_strategy_ids() -> tuple[str, ...]:

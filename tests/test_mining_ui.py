@@ -532,6 +532,78 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertIn("二次启动低吸", set(display["来源"]))
         self.assertIn("主升启动", set(display["来源"]))
 
+    def test_formal_loader_reads_only_current_complete_batch(self) -> None:
+        from types import SimpleNamespace
+
+        from mining.capabilities import formal_definitions
+        from mining.candidate_persistence import (
+            CapabilityResult,
+            migrate_selection_batch_schema,
+            persist_close_final_batch,
+        )
+        from mining.db import connect
+        from mining.scanners import Candidate
+        from mining.streamlit_tabs.tab_scanner import (
+            _load_formal_capability_candidates,
+            _persisted_candidate_dates,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            create_sample_market_dbs(base)
+            trade_date = "2026-08-05"
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+                context = SimpleNamespace(
+                    trade_date=trade_date,
+                    mode="close_final",
+                    as_of="2026-08-05 15:10:00",
+                    price_as_of=trade_date,
+                    input_fingerprint="formal-ui-test",
+                )
+                results = []
+                for index, definition in enumerate(formal_definitions(), start=1):
+                    candidate = Candidate(
+                        definition.strategy_id,
+                        definition.version,
+                        trade_date,
+                        "stock",
+                        f"{600000 + index:06d}",
+                        f"正式{index}",
+                        10.0,
+                        {"reference_price": 10.0},
+                        1,
+                    )
+                    results.append(CapabilityResult(definition.strategy_id, (candidate,), 6))
+                persist_close_final_batch(conn, context, results)
+                legacy_run = conn.execute(
+                    """
+                    INSERT INTO strategy_runs (
+                      strategy_id, version, trade_date, run_at, universe_size, n_candidates, status, error_msg
+                    ) VALUES ('strong_trend', 'v2.0', ?, '2026-08-05 15:01:00', 1, 1, 'ok', NULL)
+                    """,
+                    (trade_date,),
+                ).lastrowid
+                conn.execute(
+                    """
+                    INSERT INTO candidates (
+                      run_id, strategy_id, version, trade_date, sec_type, sec_code,
+                      sec_name, entry_price, features_json, rank
+                    ) VALUES (?, 'strong_trend', 'v2.0', ?, 'stock', '000001', '旧版本', 10.0, '{}', 1)
+                    """,
+                    (legacy_run, trade_date),
+                )
+                conn.commit()
+                loaded = _load_formal_capability_candidates(conn, trade_date)
+                persisted_dates = _persisted_candidate_dates(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual({"v2.5"}, set(loaded["version"]))
+        self.assertNotIn("000001", set(loaded["sec_code"]))
+        self.assertEqual([trade_date], persisted_dates)
+
     def test_launch_burst_display_exposes_decision_features(self) -> None:
         from mining.streamlit_tabs.tab_scanner import _prepare_launch_display
 
