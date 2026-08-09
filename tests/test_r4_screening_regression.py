@@ -5,6 +5,7 @@ import json
 import os
 import datetime as dt
 import numbers
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -209,6 +210,55 @@ class R4FixtureRegressionTests(unittest.TestCase):
 
 
 class R4HistoryAndIsolationTests(unittest.TestCase):
+    def test_expected_snapshot_codes_skip_known_bad_partial_latest_day(self) -> None:
+        from mining.streamlit_tabs.tab_scanner import _expected_snapshot_codes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            stock_db = base / "a_share_mvp.db"
+            conn = sqlite3.connect(stock_db)
+            try:
+                conn.executescript(
+                    """
+                    CREATE TABLE kline_daily (
+                        sec_type TEXT, sec_code TEXT, trade_date TEXT,
+                        open REAL, high REAL, low REAL, close REAL, pre_close REAL,
+                        volume REAL, amount REAL
+                    );
+                    CREATE TABLE selection_session_diagnostics (
+                        trade_date TEXT PRIMARY KEY, status TEXT NOT NULL,
+                        reason TEXT, source_errors TEXT, updated_at TEXT NOT NULL
+                    );
+                    """
+                )
+                full_codes = [f"{600000 + index:06d}" for index in range(5_203)]
+                full_dates = (
+                    "2026-07-30", "2026-07-31", "2026-08-03",
+                    "2026-08-04", "2026-08-05", "2026-08-06",
+                )
+                clean_rows = [
+                    ("stock", code, trade_date, 10.0, 10.2, 9.8, 10.1, 10.0, 1_000_000, 10_100_000)
+                    for trade_date in full_dates
+                    for code in full_codes
+                ]
+                bad_rows = [
+                    ("stock", code, "2026-08-07", 10.0, 10.2, 9.8, 10.1, 10.0, 1_000_000, 10_100_000)
+                    for code in full_codes[:397]
+                ]
+                conn.executemany("INSERT INTO kline_daily VALUES (?,?,?,?,?,?,?,?,?,?)", clean_rows + bad_rows)
+                conn.execute(
+                    "INSERT INTO selection_session_diagnostics VALUES (?,?,?,?,?)",
+                    ("2026-08-07", "known_bad_session", "partial provider day", "fixture", "2026-08-07T18:00:00"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            expected = _expected_snapshot_codes(base, "2026-08-09")
+
+        self.assertEqual(len(expected), 5_203)
+        self.assertEqual(expected, set(full_codes))
+
     @staticmethod
     def _insert_a_batch(conn, trade_date: str, *, status: str, include_candidate: bool, completed_at: str) -> None:
         batch = conn.execute(

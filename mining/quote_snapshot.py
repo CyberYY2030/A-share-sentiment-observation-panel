@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import datetime as dt
+import inspect
 import json
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Iterable
 
 import pandas as pd
 
-from .intraday import _call_endpoint_with_timeout, normalize_spot_frame
+from .intraday import _call_endpoint_with_timeout, _call_tencent_quotes_with_timeout, normalize_spot_frame
 from .selection_context import BENCHMARK_CODES
 
 
-DEFAULT_PROVIDERS = ("stock_zh_a_spot_em", "stock_zh_a_spot")
-DEFAULT_BENCHMARK_PROVIDERS = ("stock_zh_index_spot_em", "stock_zh_index_spot_sina")
+DEFAULT_PROVIDERS = ("tencent_batch", "stock_zh_a_spot_em")
+DEFAULT_BENCHMARK_PROVIDERS = ("tencent_index", "stock_zh_index_spot_em")
 PRIMARY_BENCHMARK = "000852"
+TENCENT_BENCHMARK_CODES = ("sh000852", "sh000300", "sh000001", "sz399001")
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -39,7 +41,7 @@ class QuoteSnapshotResult:
     benchmark_observed_at: str | None = None
 
 
-ProviderFetcher = Callable[[str, float], pd.DataFrame]
+ProviderFetcher = Callable[..., pd.DataFrame]
 BenchmarkFetcher = Callable[[str, float], pd.DataFrame]
 
 
@@ -47,7 +49,19 @@ def _as_china_time(value: dt.datetime) -> dt.datetime:
     return value.replace(tzinfo=CHINA_TZ) if value.tzinfo is None else value.astimezone(CHINA_TZ)
 
 
-def _default_provider_fetcher(provider: str, timeout_seconds: float) -> pd.DataFrame:
+def _default_provider_fetcher(
+    provider: str,
+    timeout_seconds: float,
+    expected_codes: set[str],
+) -> pd.DataFrame:
+    if provider == "tencent_batch":
+        return _call_tencent_quotes_with_timeout(tuple(sorted(expected_codes)), timeout_seconds)
+    return _call_endpoint_with_timeout(provider, timeout_seconds)
+
+
+def _default_benchmark_fetcher(provider: str, timeout_seconds: float) -> pd.DataFrame:
+    if provider == "tencent_index":
+        return _call_tencent_quotes_with_timeout(TENCENT_BENCHMARK_CODES, timeout_seconds, prefix=True)
     return _call_endpoint_with_timeout(provider, timeout_seconds)
 
 
@@ -116,6 +130,7 @@ class QuoteSnapshotAdapter:
         cooldown_seconds: float = 60.0,
         max_age_minutes: int = 10,
         min_coverage_ratio: float = 0.80,
+        minimum_expected_codes: int = 1,
     ) -> None:
         if not provider_names:
             raise ValueError("provider_names must not be empty")
@@ -126,7 +141,7 @@ class QuoteSnapshotAdapter:
         self.provider_fetcher = provider_fetcher
         self.benchmark_provider_names = tuple(benchmark_provider_names)
         self.benchmark_fetcher = (
-            _default_provider_fetcher
+            _default_benchmark_fetcher
             if benchmark_fetcher is None and provider_fetcher is _default_provider_fetcher
             else benchmark_fetcher
         )
@@ -134,7 +149,20 @@ class QuoteSnapshotAdapter:
         self.cooldown_seconds = float(cooldown_seconds)
         self.max_age_minutes = int(max_age_minutes)
         self.min_coverage_ratio = float(min_coverage_ratio)
+        self.minimum_expected_codes = int(minimum_expected_codes)
+        if self.minimum_expected_codes <= 0:
+            raise ValueError("minimum_expected_codes must be positive")
+        try:
+            inspect.signature(provider_fetcher).bind("provider", 5.0, set())
+            self._provider_fetcher_accepts_expected_codes = True
+        except (TypeError, ValueError):
+            self._provider_fetcher_accepts_expected_codes = False
         self._failed_until: dict[tuple[str, tuple[str, ...]], dt.datetime] = {}
+
+    def _fetch_stock_provider(self, provider: str, expected_codes: set[str]) -> pd.DataFrame:
+        if self._provider_fetcher_accepts_expected_codes:
+            return pd.DataFrame(self.provider_fetcher(provider, self.timeout_seconds, expected_codes))
+        return pd.DataFrame(self.provider_fetcher(provider, self.timeout_seconds))
 
     def _cache_paths(self, trade_date: str) -> tuple[Path, Path]:
         root = self.cache_dir / str(trade_date)
@@ -328,6 +356,15 @@ class QuoteSnapshotAdapter:
     ) -> QuoteSnapshotResult:
         current = _as_china_time(now)
         expected = _canonical_codes(expected_codes)
+        if len(expected) < self.minimum_expected_codes:
+            return self._failure_result(
+                status="invalid_coverage_denominator",
+                errors=[
+                    f"expected_codes_count={len(expected)} below minimum={self.minimum_expected_codes}"
+                ],
+                attempts=0,
+                now=current,
+            )
         if cache_only:
             cached = self._cached_result(str(trade_date), expected, current, close_final=close_final)
             if cached is not None:
@@ -356,20 +393,29 @@ class QuoteSnapshotAdapter:
         saw_normalization_empty = False
         saw_low_coverage = False
         raw_rows = 0
+        normalized_rows = 0
+        reported_raw_rows = 0
+        reported_normalized_rows = 0
+        best_coverage = 0.0
         for attempt, provider in enumerate(self.provider_names, start=1):
             try:
-                raw = pd.DataFrame(self.provider_fetcher(provider, self.timeout_seconds))
+                raw = self._fetch_stock_provider(provider, expected)
                 raw_rows = len(raw)
                 if raw.empty:
                     saw_empty = True
                     errors.append(f"{provider}:empty_payload")
                     continue
                 normalized = normalize_spot_frame(raw)
+                normalized_rows = len(normalized)
                 if normalized.empty:
                     saw_normalization_empty = True
                     errors.append(f"{provider}:normalization_empty")
                     continue
                 coverage = self._coverage(normalized, expected)
+                if coverage >= best_coverage:
+                    best_coverage = coverage
+                    reported_raw_rows = raw_rows
+                    reported_normalized_rows = normalized_rows
                 if coverage < self.min_coverage_ratio:
                     saw_low_coverage = True
                     errors.append(f"{provider}:coverage_below_threshold:{coverage:.3f}")
@@ -414,4 +460,10 @@ class QuoteSnapshotAdapter:
             if saw_low_coverage
             else "provider_failed"
         )
-        return self._failure_result(status=status, errors=errors, attempts=len(self.provider_names), now=current)
+        failed = self._failure_result(status=status, errors=errors, attempts=len(self.provider_names), now=current)
+        return replace(
+            failed,
+            raw_rows=reported_raw_rows,
+            normalized_rows=reported_normalized_rows,
+            coverage=best_coverage,
+        )

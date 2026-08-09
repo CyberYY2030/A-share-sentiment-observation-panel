@@ -8,7 +8,7 @@ import queue
 import re
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 
@@ -142,7 +142,7 @@ def normalize_spot_frame(frame: pd.DataFrame) -> pd.DataFrame:
         "high": _pick_column(frame, ("最高", "high")),
         "low": _pick_column(frame, ("最低", "low")),
         "volume": _pick_column(frame, ("成交量", "volume", "vol", "成交量(手)")),
-        "amount": _pick_column(frame, ("成交额", "成交额(元)", "成交额(万元)", "成交额(万)", "amount", "turnover", "成交金额")),
+        "amount": _pick_column(frame, ("amount_yuan", "成交额", "成交额(元)", "成交额(万元)", "成交额(万)", "amount", "turnover", "成交金额")),
     }
     required = ("sec_code", "close", "open", "high", "low", "volume", "amount")
     missing = [name for name in required if columns[name] is None]
@@ -162,7 +162,11 @@ def normalize_spot_frame(frame: pd.DataFrame) -> pd.DataFrame:
             if columns[name] is not None
             else math.nan
         )
-    result["amount"] = _scale_amount_to_yuan(frame[columns["amount"]])
+    result["amount"] = (
+        pd.to_numeric(frame[columns["amount"]], errors="coerce")
+        if columns["amount"] == "amount_yuan"
+        else _scale_amount_to_yuan(frame[columns["amount"]])
+    )
     result = result[result["sec_code"].map(lambda code: bool(A_SHARE_CODE.match(str(code))))]
     result = result.dropna(subset=["close", "open", "high", "low", "volume", "amount"])
     result = result[
@@ -177,6 +181,26 @@ def normalize_spot_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return result.drop_duplicates("sec_code", keep="last").reset_index(drop=True)
 
 
+def _tencent_quotes_to_frame(payload: dict[str, dict[str, Any]]) -> pd.DataFrame:
+    """Map pqquotation's Tencent fields to the existing raw spot contract."""
+    rows = []
+    for key, record in (payload or {}).items():
+        rows.append(
+            {
+                "sec_code": record.get("code") or key,
+                "sec_name": record.get("name"),
+                "close": record.get("now"),
+                "pre_close": record.get("close"),
+                "open": record.get("open"),
+                "high": record.get("high"),
+                "low": record.get("low"),
+                "volume": record.get("volume"),
+                "amount_yuan": record.get("amount", record.get("成交额(万)")),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _spot_worker(result_queue: Any, endpoint_name: str) -> None:
     try:
         import akshare as ak
@@ -187,10 +211,35 @@ def _spot_worker(result_queue: Any, endpoint_name: str) -> None:
         result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
 
-def _call_endpoint_with_timeout(endpoint_name: str, timeout_seconds: float) -> pd.DataFrame:
+def _tencent_worker(
+    result_queue: Any,
+    stock_codes: tuple[str, ...],
+    timeout_seconds: float,
+    prefix: bool,
+) -> None:
+    try:
+        import pqquotation
+
+        quotation = pqquotation.use("tencent")
+        quotation.timeout = float(timeout_seconds)
+        payload = quotation.real(
+            list(stock_codes),
+            return_format="prefix" if prefix else "digit",
+        )
+        result_queue.put(("ok", _tencent_quotes_to_frame(payload)))
+    except Exception as exc:
+        result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
+
+
+def _call_frame_worker_with_timeout(
+    worker: Callable[..., None],
+    worker_args: tuple[Any, ...],
+    label: str,
+    timeout_seconds: float,
+) -> pd.DataFrame:
     context = multiprocessing.get_context("spawn")
     result_queue = context.Queue(maxsize=1)
-    process = context.Process(target=_spot_worker, args=(result_queue, endpoint_name))
+    process = context.Process(target=worker, args=(result_queue, *worker_args))
     process.start()
     deadline = time.monotonic() + timeout_seconds
     status = None
@@ -206,17 +255,42 @@ def _call_endpoint_with_timeout(endpoint_name: str, timeout_seconds: float) -> p
         if status is None:
             if process.is_alive():
                 process.terminate()
-            raise TimeoutError(f"{endpoint_name} timed out after {timeout_seconds:.1f}s")
+            raise TimeoutError(f"{label} timed out after {timeout_seconds:.1f}s")
         if status != "ok":
-            raise RuntimeError(f"{endpoint_name} failed: {payload}")
+            raise RuntimeError(f"{label} failed: {payload}")
         if not isinstance(payload, pd.DataFrame):
-            raise RuntimeError(f"{endpoint_name} returned an invalid payload")
+            raise RuntimeError(f"{label} returned an invalid payload")
         return payload
     finally:
         if process.is_alive():
             process.terminate()
         process.join(timeout=1.0)
         result_queue.close()
+
+
+def _call_endpoint_with_timeout(endpoint_name: str, timeout_seconds: float) -> pd.DataFrame:
+    return _call_frame_worker_with_timeout(
+        _spot_worker,
+        (endpoint_name,),
+        endpoint_name,
+        timeout_seconds,
+    )
+
+
+def _call_tencent_quotes_with_timeout(
+    stock_codes: tuple[str, ...],
+    timeout_seconds: float,
+    *,
+    prefix: bool = False,
+) -> pd.DataFrame:
+    if not stock_codes:
+        raise ValueError("Tencent quote request requires explicit stock codes")
+    return _call_frame_worker_with_timeout(
+        _tencent_worker,
+        (tuple(stock_codes), float(timeout_seconds), bool(prefix)),
+        "tencent_batch",
+        timeout_seconds,
+    )
 
 
 def fetch_spot_frame(

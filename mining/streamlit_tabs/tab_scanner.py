@@ -18,7 +18,7 @@ from ..capabilities import (
     formal_definitions,
     visible_strategy_ids,
 )
-from ..data_quality import STATUS_CLEAN, inspect_stock_session
+from ..data_quality import STATUS_CLEAN, inspect_stock_session, usable_stock_trade_dates
 from ..features import (
     board_kind,
     change_pct,
@@ -62,6 +62,7 @@ from ..watchlist import (
 )
 from ..playbook import lookup_playbook
 from run_daily import execute_daily_pipeline
+from runtime_paths import build_runtime_paths
 
 
 SnapshotLoader = Callable[[], QuoteSnapshotResult | pd.DataFrame]
@@ -188,17 +189,28 @@ def _build_cached_snapshot_loader(snapshot_loader: SnapshotLoader | None = None)
 
 
 def _expected_snapshot_codes(base_dir: str | Path, trade_date: str) -> set[str]:
-    conn = connect(base_dir=base_dir)
+    runtime_paths = build_runtime_paths(str(Path(base_dir).resolve()))
+    stock_db = Path(runtime_paths.stock_db).resolve()
+    conn = sqlite3.connect(f"{stock_db.as_uri()}?mode=ro&immutable=1", uri=True)
+    conn.row_factory = sqlite3.Row
     try:
-        reference_dates = list_stock_trade_dates(conn, end_date=str(trade_date), limit=1, include_end=False)
-        reference_date = reference_dates[-1] if reference_dates else _resolve_close_trade_date(conn, str(trade_date))
-        if reference_date is None:
+        usable_dates, _ = usable_stock_trade_dates(
+            conn,
+            end_date=str(trade_date),
+            include_end=False,
+        )
+        if not usable_dates:
             return set()
+        reference_date = usable_dates[-1]
         rows = conn.execute(
-            "SELECT DISTINCT sec_code FROM ash.kline_daily WHERE sec_type='stock' AND trade_date=?",
+            "SELECT DISTINCT sec_code FROM kline_daily WHERE sec_type='stock' AND trade_date=?",
             (str(reference_date),),
         ).fetchall()
-        return {str(row[0]).zfill(6) for row in rows}
+        return {
+            str(row[0]).zfill(6)
+            for row in rows
+            if str(row[0]).zfill(6).startswith(("0", "3", "6"))
+        }
     finally:
         conn.close()
 
@@ -213,7 +225,8 @@ def _build_quote_snapshot_loader(
 ) -> SnapshotLoader:
     expected_codes = _expected_snapshot_codes(base_dir, trade_date)
     resolved_adapter = adapter or QuoteSnapshotAdapter(
-        cache_dir=Path(base_dir) / "output" / "screening-v2-work" / "cache"
+        cache_dir=Path(base_dir) / "output" / "screening-v2-work" / "cache",
+        minimum_expected_codes=5_000,
     )
     current = now or dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
 

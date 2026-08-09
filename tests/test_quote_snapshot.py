@@ -42,8 +42,9 @@ class QuoteSnapshotTests(unittest.TestCase):
 
         calls: list[str] = []
 
-        def fetcher(provider: str, _timeout_seconds: float) -> pd.DataFrame:
+        def fetcher(provider: str, _timeout_seconds: float, expected_codes: set[str]) -> pd.DataFrame:
             calls.append(provider)
+            self.assertEqual(expected_codes, self.codes)
             response = responses[provider]
             if isinstance(response, BaseException):
                 raise response
@@ -51,52 +52,128 @@ class QuoteSnapshotTests(unittest.TestCase):
 
         return QuoteSnapshotAdapter(
             cache_dir=self.cache_dir,
-            provider_names=("first", "second"),
+            provider_names=("tencent_batch", "stock_zh_a_spot_em"),
             provider_fetcher=fetcher,
             timeout_seconds=5.0,
         ), calls
 
+    def test_invalid_full_market_denominator_stops_before_any_provider(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter
+
+        calls: list[str] = []
+
+        def fetcher(provider: str, _timeout_seconds: float, _expected_codes: set[str]) -> pd.DataFrame:
+            calls.append(provider)
+            return _raw_quotes()
+
+        adapter = QuoteSnapshotAdapter(
+            cache_dir=self.cache_dir,
+            provider_fetcher=fetcher,
+            minimum_expected_codes=5_000,
+        )
+        result = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
+
+        self.assertEqual(result.status, "invalid_coverage_denominator")
+        self.assertEqual(calls, [])
+        self.assertIn("expected_codes_count=3", result.errors[0])
+
+    def test_tencent_payload_uses_now_as_close_and_excludes_beijing(self) -> None:
+        from mining.intraday import _tencent_quotes_to_frame, normalize_spot_frame
+
+        payload = {
+            "600001": {
+                "code": "600001", "name": "Shanghai", "now": 11.0, "close": 10.0,
+                "open": 10.2, "high": 11.2, "low": 10.1, "volume": 1_000_000,
+                "成交额(万)": 10_800_000,
+            },
+            "000001": {
+                "code": "000001", "name": "Shenzhen", "now": 9.5, "close": 9.0,
+                "open": 9.1, "high": 9.6, "low": 9.0, "volume": 2_000_000,
+                "成交额(万)": 18_800_000,
+            },
+            "920001": {
+                "code": "920001", "name": "Beijing", "now": 6.0, "close": 5.9,
+                "open": 5.9, "high": 6.1, "low": 5.8, "volume": 500_000,
+                "成交额(万)": 3_000_000,
+            },
+        }
+
+        normalized = normalize_spot_frame(_tencent_quotes_to_frame(payload))
+
+        self.assertEqual(set(normalized["sec_code"]), {"600001", "000001"})
+        shanghai = normalized.set_index("sec_code").loc["600001"]
+        self.assertEqual(float(shanghai["close"]), 11.0)
+        self.assertEqual(float(shanghai["pre_close"]), 10.0)
+        self.assertEqual(float(shanghai["volume"]), 1_000_000)
+        self.assertEqual(float(shanghai["amount"]), 10_800_000)
+
+    def test_default_provider_order_excludes_paginated_sina(self) -> None:
+        from mining.quote_snapshot import DEFAULT_BENCHMARK_PROVIDERS, DEFAULT_PROVIDERS
+
+        self.assertEqual(DEFAULT_PROVIDERS, ("tencent_batch", "stock_zh_a_spot_em"))
+        self.assertNotIn("stock_zh_a_spot", DEFAULT_PROVIDERS)
+        self.assertEqual(DEFAULT_BENCHMARK_PROVIDERS, ("tencent_index", "stock_zh_index_spot_em"))
+
     def test_first_provider_failure_uses_second_provider_once(self) -> None:
-        adapter, calls = self._adapter({"first": RuntimeError("first down"), "second": _raw_quotes()})
+        adapter, calls = self._adapter(
+            {"tencent_batch": RuntimeError("Tencent down"), "stock_zh_a_spot_em": _raw_quotes()}
+        )
 
         result = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
 
-        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(calls, ["tencent_batch", "stock_zh_a_spot_em"])
         self.assertEqual(result.status, "snapshot_usable")
-        self.assertEqual(result.provider, "second")
+        self.assertEqual(result.provider, "stock_zh_a_spot_em")
         self.assertEqual(result.raw_rows, 3)
         self.assertEqual(result.normalized_rows, 3)
         self.assertEqual(result.coverage, 1.0)
         self.assertFalse(result.from_cache)
         self.assertEqual(len(result.errors), 1)
+        self.assertIn("tencent_batch:RuntimeError:Tencent down", result.errors[0])
 
     def test_all_failures_are_structured_and_cool_down_without_refetch(self) -> None:
-        adapter, calls = self._adapter({"first": TimeoutError("slow"), "second": RuntimeError("down")})
+        adapter, calls = self._adapter(
+            {"tencent_batch": TimeoutError("slow"), "stock_zh_a_spot_em": RuntimeError("down")}
+        )
 
         first = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
         repeated = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now + dt.timedelta(seconds=30))
 
         self.assertEqual(first.status, "provider_failed")
         self.assertEqual(repeated.status, "provider_failed")
-        self.assertEqual(calls, ["first", "second"])
+        self.assertEqual(calls, ["tencent_batch", "stock_zh_a_spot_em"])
         self.assertIsNotNone(repeated.retry_at)
 
     def test_empty_normalized_and_low_coverage_have_distinct_statuses(self) -> None:
-        empty_adapter, _ = self._adapter({"first": pd.DataFrame(), "second": pd.DataFrame()})
+        empty_adapter, _ = self._adapter(
+            {"tencent_batch": pd.DataFrame(), "stock_zh_a_spot_em": pd.DataFrame()}
+        )
         empty = empty_adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
 
-        low_adapter, _ = self._adapter({"first": _raw_quotes(("600001",)), "second": _raw_quotes(("600001",))})
+        low_adapter, _ = self._adapter(
+            {
+                "tencent_batch": _raw_quotes(("600001",)),
+                "stock_zh_a_spot_em": _raw_quotes(("600001",)),
+            }
+        )
         low = low_adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
 
         self.assertEqual(empty.status, "empty_payload")
         self.assertEqual(low.status, "coverage_below_threshold")
+        self.assertEqual(low.raw_rows, 1)
+        self.assertEqual(low.normalized_rows, 1)
+        self.assertAlmostEqual(low.coverage, 1 / 3)
 
     def test_same_day_cache_is_only_a_fresh_nonfinal_fallback(self) -> None:
-        successful, _ = self._adapter({"first": _raw_quotes(), "second": _raw_quotes()})
+        successful, _ = self._adapter(
+            {"tencent_batch": _raw_quotes(), "stock_zh_a_spot_em": _raw_quotes()}
+        )
         usable = successful.load("2026-08-07", expected_codes=self.codes, now=self.now)
         self.assertEqual(usable.status, "snapshot_usable")
 
-        failing, _ = self._adapter({"first": RuntimeError("down"), "second": RuntimeError("down")})
+        failing, _ = self._adapter(
+            {"tencent_batch": RuntimeError("down"), "stock_zh_a_spot_em": RuntimeError("down")}
+        )
         fallback = failing.load("2026-08-07", expected_codes=self.codes, now=self.now + dt.timedelta(minutes=9))
         stale = failing.load("2026-08-07", expected_codes=self.codes, now=self.now + dt.timedelta(minutes=11))
         next_day = failing.load("2026-08-10", expected_codes=self.codes, now=self.now + dt.timedelta(days=3))
@@ -109,16 +186,19 @@ class QuoteSnapshotTests(unittest.TestCase):
         self.assertEqual(final.status, "provider_failed")
 
     def test_successful_snapshot_refreshes_and_only_falls_back_after_a_failure(self) -> None:
-        responses: dict[str, object] = {"first": _raw_quotes(), "second": _raw_quotes()}
+        responses: dict[str, object] = {
+            "tencent_batch": _raw_quotes(),
+            "stock_zh_a_spot_em": _raw_quotes(),
+        }
         adapter, calls = self._adapter(responses)
 
         first = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now)
-        responses["first"] = RuntimeError("first down")
-        responses["second"] = RuntimeError("second down")
+        responses["tencent_batch"] = RuntimeError("Tencent down")
+        responses["stock_zh_a_spot_em"] = RuntimeError("EM down")
         fallback = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now + dt.timedelta(minutes=1))
         refreshed_quotes = _raw_quotes()
         refreshed_quotes.iloc[0, 2] = 11.0
-        responses["first"] = refreshed_quotes
+        responses["tencent_batch"] = refreshed_quotes
         refreshed = adapter.load("2026-08-07", expected_codes=self.codes, now=self.now + dt.timedelta(minutes=3))
 
         self.assertEqual(first.status, "snapshot_usable")
@@ -127,7 +207,10 @@ class QuoteSnapshotTests(unittest.TestCase):
         self.assertEqual(refreshed.status, "snapshot_usable")
         self.assertFalse(refreshed.from_cache)
         self.assertEqual(float(refreshed.frame.iloc[0]["close"]), 11.0)
-        self.assertEqual(calls, ["first", "first", "second", "first"])
+        self.assertEqual(
+            calls,
+            ["tencent_batch", "tencent_batch", "stock_zh_a_spot_em", "tencent_batch"],
+        )
 
 
 if __name__ == "__main__":

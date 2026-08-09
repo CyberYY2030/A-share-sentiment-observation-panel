@@ -608,3 +608,27 @@
 - history JSON 使用显式 `evidence_schema_version`，并记录生成时的 Git HEAD、`history_bootstrap.py` 路径和 SHA-256。
 - `daily` 是唯一逐日明细；不再复制整份明细到 `fingerprints`，从而保证 first/reuse 由同一最终代码生成且字段一致。
 - `output/` 下的 history、浏览器截图、YAML、console 和报告是本地验收物，不进入 Git；代码提交只保留代码、测试、策略文档以及停止跟踪 generated output 的删除记录。
+
+---
+
+## 17. 2026-08-09 R4.3.1 实时 provider 修订
+
+本节是对 16.1 的日期修订；保留此前 R4.3/CDP 记录作为历史证据。
+
+### 17.1 coverage 分母
+
+- 实时股票快照的 expected universe 必须取当前日期之前、数据质量层认定为 usable/full 的最近股票交易日；`known_bad_session` 不得作为 coverage 分母。
+- 当前生产只读证据中，`2026-08-07` 的 397 只属于 `known_bad_session`，最近可用分母是 `2026-08-06` 的 5203 只。
+- runtime live gate 在 `expected_codes_count < 5000` 时于任何 provider 调用前返回 `invalid_coverage_denominator`；0.80 coverage 阈值保持不变。
+
+### 17.2 同步 provider 与 benchmark
+
+- 股票主 provider 是 `pqquotation` Tencent 批量接口，按调用方传入的 expected codes 分批；AkShare `stock_zh_a_spot_em` 只作一次 fallback。
+- `stock_zh_a_spot` 不再位于同步链。每个 provider 有独立、进程级有界 timeout，同一 provider 每个刷新周期最多调用一次；失败保留结构化 provider、status、errors、raw_rows、normalized_rows 与 coverage。
+- benchmark 在股票快照可用后独立刷新，优先 Tencent 指数批量路径，再使用一次 AkShare EM fallback；`000852` 必须是有限正数。benchmark 失败只使 E fail closed，不禁用 A-D。
+
+### 17.3 2026-08-09 非交易时段证据边界
+
+- Tencent 20 只样本返回 20/20，coverage 1.0；随后 5203 只全市场返回 raw 5203、normalized 5199、coverage 0.999231。
+- 同刷新周期独立 benchmark 返回 `000852=7679.53`；样本、全市场和 benchmark 三次调用合计约 2.001 秒，单次 timeout 均为 8 秒。
+- 该证据发生于周日，只证明实现与传输能力。公共 `QuoteSnapshotAdapter.load()` 的真实交易时段端到端及同日重启 cache 恢复尚未执行，状态为 `locally-verified + trading-window environment-blocked`，不得标记 `real-env-verified`。
