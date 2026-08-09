@@ -388,6 +388,158 @@ class R4HistoryAndIsolationTests(unittest.TestCase):
         self.assertEqual(cached.benchmark_closes, {"000852": 6123.45, "399006": 2456.78})
         self.assertEqual(calls, [])
 
+    def test_public_snapshot_load_produces_and_restores_same_cycle_benchmarks(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter
+        from mining.selection_context import BENCHMARK_CODES
+
+        trade_date = "2026-08-07"
+        now = dt.datetime(2026, 8, 7, 10, 30, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        stock_codes = ("600001", "600002", "600003")
+        stock_frame = pd.DataFrame(
+            [
+                {
+                    "sec_code": code,
+                    "sec_name": code,
+                    "close": 10.0,
+                    "pre_close": 9.8,
+                    "open": 9.9,
+                    "high": 10.1,
+                    "low": 9.7,
+                    "volume": 12_000_000,
+                    "amount": 120_000_000,
+                }
+                for code in stock_codes
+            ]
+        )
+        benchmark_values = {code: 5_000.0 + index for index, code in enumerate(BENCHMARK_CODES)}
+        benchmark_frame = pd.DataFrame(
+            [{"sec_code": code, "close": value} for code, value in benchmark_values.items()]
+        )
+        benchmark_calls: list[str] = []
+
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter = QuoteSnapshotAdapter(
+                cache_dir=Path(tmp),
+                provider_names=("stocks",),
+                provider_fetcher=lambda _provider, _timeout: stock_frame,
+                benchmark_provider_names=("indices",),
+                benchmark_fetcher=lambda provider, _timeout: benchmark_calls.append(provider) or benchmark_frame,
+            )
+            live = adapter.load(trade_date, expected_codes=stock_codes, now=now)
+
+            restarted = QuoteSnapshotAdapter(
+                cache_dir=Path(tmp),
+                provider_names=("offline-stocks",),
+                provider_fetcher=mock.Mock(side_effect=AssertionError("cache-only must not fetch stocks")),
+                benchmark_provider_names=("offline-indices",),
+                benchmark_fetcher=mock.Mock(side_effect=AssertionError("cache-only must not fetch benchmarks")),
+            )
+            cached = restarted.load(
+                trade_date,
+                expected_codes=stock_codes,
+                now=now + dt.timedelta(minutes=1),
+                cache_only=True,
+            )
+            fallback_benchmark = mock.Mock(side_effect=AssertionError("stock failure must not fetch benchmarks"))
+            failing = QuoteSnapshotAdapter(
+                cache_dir=Path(tmp),
+                provider_names=("offline-stocks",),
+                provider_fetcher=mock.Mock(side_effect=RuntimeError("stocks unavailable")),
+                benchmark_provider_names=("offline-indices",),
+                benchmark_fetcher=fallback_benchmark,
+            )
+            fallback = failing.load(
+                trade_date,
+                expected_codes=stock_codes,
+                now=now + dt.timedelta(minutes=2),
+            )
+            cross_day = failing.load(
+                "2026-08-08",
+                expected_codes=stock_codes,
+                now=now + dt.timedelta(days=1),
+            )
+
+        self.assertEqual(live.status, "snapshot_usable")
+        self.assertEqual(live.benchmark_status, "ready")
+        self.assertEqual(live.benchmark_provider, "indices")
+        self.assertEqual(live.benchmark_observed_at, now.isoformat())
+        self.assertEqual(live.benchmark_closes, benchmark_values)
+        self.assertEqual(benchmark_calls, ["indices"])
+        self.assertTrue(cached.from_cache)
+        self.assertEqual(cached.benchmark_status, "ready")
+        self.assertEqual(cached.benchmark_closes, benchmark_values)
+        self.assertEqual(cached.benchmark_observed_at, live.benchmark_observed_at)
+        self.assertTrue(fallback.from_cache)
+        self.assertEqual(fallback.benchmark_closes, benchmark_values)
+        self.assertEqual(cross_day.status, "provider_failed")
+        fallback_benchmark.assert_not_called()
+
+    def test_benchmark_failures_leave_stocks_usable_and_do_not_mix_cycles(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter
+
+        trade_date = "2026-08-07"
+        now = dt.datetime(2026, 8, 7, 10, 30, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        stock_codes = ("600001", "600002", "600003")
+        stock_frame = pd.DataFrame(
+            [
+                {
+                    "sec_code": code,
+                    "sec_name": code,
+                    "close": 10.0,
+                    "pre_close": 9.8,
+                    "open": 9.9,
+                    "high": 10.1,
+                    "low": 9.7,
+                    "volume": 12_000_000,
+                    "amount": 120_000_000,
+                }
+                for code in stock_codes
+            ]
+        )
+        cases = {
+            "timeout": TimeoutError("slow index source"),
+            "missing_primary": pd.DataFrame([{"sec_code": "000300", "close": 4_800.0}]),
+            "invalid_primary": pd.DataFrame([{"sec_code": "000852", "close": float("nan")}]),
+        }
+        for label, response in cases.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                benchmark_calls: list[str] = []
+
+                def fetch_benchmark(provider: str, _timeout: float) -> pd.DataFrame:
+                    benchmark_calls.append(provider)
+                    if isinstance(response, BaseException):
+                        raise response
+                    return pd.DataFrame(response)
+
+                adapter = QuoteSnapshotAdapter(
+                    cache_dir=Path(tmp),
+                    provider_names=("stocks",),
+                    provider_fetcher=lambda _provider, _timeout: stock_frame,
+                    benchmark_provider_names=("indices",),
+                    benchmark_fetcher=fetch_benchmark,
+                )
+                result = adapter.load(trade_date, expected_codes=stock_codes, now=now)
+                cached = QuoteSnapshotAdapter(
+                    cache_dir=Path(tmp),
+                    provider_fetcher=mock.Mock(side_effect=AssertionError("cache-only must not fetch stocks")),
+                    benchmark_fetcher=mock.Mock(side_effect=AssertionError("cache-only must not fetch benchmarks")),
+                ).load(
+                    trade_date,
+                    expected_codes=stock_codes,
+                    now=now + dt.timedelta(minutes=1),
+                    cache_only=True,
+                )
+
+                self.assertEqual(result.status, "snapshot_usable")
+                self.assertEqual(result.benchmark_status, "unavailable")
+                self.assertNotIn("000852", result.benchmark_closes)
+                self.assertTrue(result.benchmark_errors)
+                self.assertEqual(benchmark_calls, ["indices"])
+                self.assertTrue(cached.from_cache)
+                self.assertEqual(cached.benchmark_status, "unavailable")
+                self.assertEqual(cached.benchmark_closes, result.benchmark_closes)
+                self.assertEqual(cached.benchmark_observed_at, result.benchmark_observed_at)
+
     def test_snapshot_cache_fail_closed_matrix_never_requires_a_provider(self) -> None:
         from mining.quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
 

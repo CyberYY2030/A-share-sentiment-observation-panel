@@ -585,3 +585,26 @@
 - JSON 报告记录失败、各策略 empty、逐日 C 状态、自然 `再启动`、表增量和源库前后哈希；持久化失败仍写报告并非零退出。
 - 浏览器的 selected/effective/formal 日期按 formal 目标日展示；六态分别保留 intraday、pending、final、unavailable、not_run、failed 证据。
 - 盘中和 pending 只展示临时结果，不写正式候选或状态历史；final 只读正式 complete batch。
+
+---
+
+## 16. 2026-08-09 Screening v2.5 R4.3 生产前证据门
+
+### 16.1 股票快照与 benchmark 属于同一刷新周期
+
+- 默认 `QuoteSnapshotAdapter.load()` 在股票快照通过 normalization 与 coverage 后，使用同一有界刷新周期获取 `selection_context.BENCHMARK_CODES`。
+- E 的 primary benchmark `000852` 必须是有限正数；timeout、缺少 primary 或非法值不会影响 A–D 使用股票快照，但 E 明确为 unavailable。
+- v2 bundle 原子保存本周期实际取得的股票 frame、benchmark map、各自 provider/status/errors 与同一 as-of。股票 provider 失败时只允许整体回退到同日、同周期旧 bundle，不会另取新 benchmark 与旧股票拼接。
+- 测试可注入股票和 benchmark DataFrame；核心验收仍从公开 `load()` 进入，不直接调用 cache writer。
+
+### 16.2 selected、effective、formal 日期独立取证
+
+- `selected_trade_date` 来自 UI query；`effective_trade_date` 来自 `SelectionRuntime.context.trade_date`；`formal_trade_date` 在 close-final 模式来自实际 complete batch，在临时模式来自 evaluation context。
+- 三值进入结构化 evidence。任一缺失或不相等时标记 `date_mismatch`，显示三值、将 A–E 状态改为阻断，并隐藏所有候选表。
+- 页面不得通过把 effective/formal 重新赋值为 selected 来制造日期一致。
+
+### 16.3 history 与 generated evidence 的版本边界
+
+- history JSON 使用显式 `evidence_schema_version`，并记录生成时的 Git HEAD、`history_bootstrap.py` 路径和 SHA-256。
+- `daily` 是唯一逐日明细；不再复制整份明细到 `fingerprints`，从而保证 first/reuse 由同一最终代码生成且字段一致。
+- `output/` 下的 history、浏览器截图、YAML、console 和报告是本地验收物，不进入 Git；代码提交只保留代码、测试、策略文档以及停止跟踪 generated output 的删除记录。

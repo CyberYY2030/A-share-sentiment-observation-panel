@@ -661,6 +661,84 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertNotIn("000001", set(loaded["sec_code"]))
         self.assertEqual([trade_date], persisted_dates)
 
+    def test_formal_view_uses_independent_dates_and_hides_rows_on_mismatch(self) -> None:
+        from types import SimpleNamespace
+
+        from mining.capabilities import formal_definitions
+        from mining.candidate_persistence import (
+            CapabilityResult,
+            PullbackStateRow,
+            migrate_selection_batch_schema,
+            persist_close_final_batch,
+        )
+        from mining.db import connect
+        from mining.scanners import Candidate
+        from mining.streamlit_tabs.tab_scanner import _formal_capability_view
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            trade_date = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+                context = SimpleNamespace(
+                    trade_date=trade_date,
+                    mode="close_final",
+                    as_of=f"{trade_date}T15:10:00+08:00",
+                    price_as_of=trade_date,
+                    input_fingerprint="date-evidence-test",
+                )
+                results = []
+                for index, definition in enumerate(formal_definitions(), start=1):
+                    candidate = Candidate(
+                        definition.strategy_id,
+                        definition.version,
+                        trade_date,
+                        "stock",
+                        f"{600000 + index:06d}",
+                        f"Formal {index}",
+                        10.0,
+                        {"reference_price": 10.0},
+                        1,
+                    )
+                    states = (
+                        (PullbackStateRow(candidate.sec_code, "再启动", "P60"),)
+                        if definition.strategy_id == "second_launch"
+                        else ()
+                    )
+                    results.append(CapabilityResult(definition.strategy_id, (candidate,), 6, state_rows=states))
+                persist_close_final_batch(conn, context, results)
+                now = dt.datetime.fromisoformat(f"{trade_date}T18:00:00+08:00")
+
+                aligned_rows, aligned_status, aligned = _formal_capability_view(
+                    conn,
+                    trade_date,
+                    selected_trade_date=trade_date,
+                    now=now,
+                )
+                mismatched_rows, mismatched_status, mismatched = _formal_capability_view(
+                    conn,
+                    trade_date,
+                    selected_trade_date="2099-01-01",
+                    now=now,
+                )
+            finally:
+                conn.close()
+
+        self.assertFalse(aligned_rows.empty)
+        self.assertFalse(aligned_status.empty)
+        self.assertEqual(aligned["date_status"], "aligned")
+        self.assertEqual(aligned["selected_trade_date"], trade_date)
+        self.assertEqual(aligned["effective_trade_date"], trade_date)
+        self.assertEqual(aligned["formal_trade_date"], trade_date)
+        self.assertTrue(mismatched_rows.empty)
+        self.assertEqual(mismatched["date_status"], "date_mismatch")
+        self.assertEqual(mismatched["selected_trade_date"], "2099-01-01")
+        self.assertEqual(mismatched["effective_trade_date"], trade_date)
+        self.assertEqual(mismatched["formal_trade_date"], trade_date)
+        self.assertEqual(set(mismatched_status["availability"]), {"date_mismatch"})
+
     def test_launch_burst_display_exposes_decision_features(self) -> None:
         from mining.streamlit_tabs.tab_scanner import _prepare_launch_display
 

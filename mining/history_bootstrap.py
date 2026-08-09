@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import sqlite3
+import subprocess
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ from .watchlist import a_history_coverage
 
 
 SOURCE_DB_NAMES = ("a_share_mvp.db", "etf_mvp.db", "mining_mvp.db", "ths_concept.db")
+EVIDENCE_SCHEMA_VERSION = 2
 
 
 def _sha256(path: Path) -> str:
@@ -32,6 +34,24 @@ def _sha256(path: Path) -> str:
         for block in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest().upper()
+
+
+def _generator_provenance() -> dict[str, str]:
+    source_path = Path(__file__).resolve()
+    repository = source_path.parents[1]
+    completed = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return {
+        "git_commit": completed.stdout.strip().lower(),
+        "source_path": source_path.relative_to(repository).as_posix(),
+        "source_sha256": _sha256(source_path),
+    }
 
 
 def _isolated_base_dir(base_dir: str | Path) -> Path:
@@ -351,6 +371,8 @@ def run_history_bootstrap_dry_run(
             {"trade_date": "source", "status": "source_hash_changed", "error": "one or more source databases changed"}
         )
     return {
+        "evidence_schema_version": EVIDENCE_SCHEMA_VERSION,
+        "generator": _generator_provenance(),
         "mode": "history_bootstrap_dry_run",
         "base_dir": str(base),
         "target_date": str(target_date),
@@ -371,7 +393,6 @@ def run_history_bootstrap_dry_run(
         "empty_by_strategy": empty_by_strategy,
         "candidate_counts": total_candidates,
         "daily": daily,
-        "fingerprints": daily,
         "increments": _increments(counts_before, counts_after),
         "a_history_coverage_before": coverage_before,
         "a_history_coverage_after": coverage_after,

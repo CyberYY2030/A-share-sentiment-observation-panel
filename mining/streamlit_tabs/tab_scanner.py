@@ -218,31 +218,11 @@ def _build_quote_snapshot_loader(
     current = now or dt.datetime.now(dt.timezone(dt.timedelta(hours=8)))
 
     def _loader() -> QuoteSnapshotResult:
-        if cache_only:
-            cached = resolved_adapter._cached_result(
-                str(trade_date),
-                expected_codes,
-                current,
-                close_final=False,
-            )
-            if cached is not None:
-                return cached
-            return QuoteSnapshotResult(
-                frame=pd.DataFrame(),
-                provider=None,
-                observed_at=current.isoformat(),
-                raw_rows=0,
-                normalized_rows=0,
-                coverage=0.0,
-                attempts=0,
-                errors=("isolated acceptance requires a cached snapshot",),
-                status="provider_failed",
-                from_cache=False,
-            )
         return resolved_adapter.load(
             str(trade_date),
             expected_codes=expected_codes,
             now=current,
+            cache_only=cache_only,
         )
 
     return _build_cached_snapshot_loader(_loader)
@@ -651,6 +631,57 @@ def _selection_evidence(
     }
 
 
+def _date_alignment_evidence(
+    context,
+    *,
+    selected_trade_date: str | None,
+    formal_trade_date: str | None,
+) -> dict[str, object]:
+    dates = {
+        "selected_trade_date": str(selected_trade_date) if selected_trade_date is not None else None,
+        "effective_trade_date": str(context.trade_date) if context.trade_date is not None else None,
+        "formal_trade_date": str(formal_trade_date) if formal_trade_date is not None else None,
+    }
+    comparable = [value for value in dates.values() if value is not None]
+    return {
+        **dates,
+        "date_status": "aligned" if len(comparable) == 3 and len(set(comparable)) == 1 else "date_mismatch",
+    }
+
+
+def _formal_batch_trade_date(conn, trade_date: str) -> str | None:
+    batch = latest_complete_batch(conn, trade_date)
+    if batch.code != "complete" or batch.batch_id is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT trade_date FROM selection_batches WHERE batch_id=?",
+            (batch.batch_id,),
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return None
+    return str(row[0]) if row is not None else None
+
+
+def _apply_date_evidence_gate(
+    rows: pd.DataFrame,
+    status: pd.DataFrame,
+    evidence: dict[str, object],
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+    if evidence.get("date_status") != "date_mismatch":
+        return rows, status, evidence
+    blocked = status.copy()
+    if not blocked.empty:
+        blocked["availability"] = "date_mismatch"
+        blocked["n_candidates"] = 0
+        blocked["error_msg"] = (
+            f"selected={evidence.get('selected_trade_date')}; "
+            f"effective={evidence.get('effective_trade_date')}; "
+            f"formal={evidence.get('formal_trade_date')}"
+        )
+    return pd.DataFrame(), blocked, evidence
+
+
 def _annotate_formal_rows(rows: pd.DataFrame, strategy_id: str, *, reference_column: str = "reference_price") -> pd.DataFrame:
     """Turn one v2 evaluator's ordered rows into the common A–E display contract."""
     if rows.empty:
@@ -792,6 +823,7 @@ def _formal_capability_view(
     conn,
     trade_date: str,
     *,
+    selected_trade_date: str | None = None,
     snapshot_loader: SnapshotLoader | None = None,
     now: dt.datetime | None = None,
     runtime: SelectionRuntime | None = None,
@@ -823,12 +855,32 @@ def _formal_capability_view(
     context = result.context
     if context is None:
         return pd.DataFrame(), pd.DataFrame(), {}
+    formal_trade_date = (
+        _formal_batch_trade_date(conn, trade_date)
+        if result.mode == MODE_CLOSE_FINAL
+        else str(context.trade_date)
+    )
     evidence = _selection_evidence(
         context,
         mode=result.mode,
         snapshot_source=result.snapshot_source,
         snapshot_coverage=result.snapshot_coverage,
         quote_result=quote_result,
+    )
+    evidence.update(
+        _date_alignment_evidence(
+            context,
+            selected_trade_date=selected_trade_date or trade_date,
+            formal_trade_date=formal_trade_date,
+        )
+    )
+    evidence.update(
+        {
+            "benchmark_status": quote_result.benchmark_status if quote_result is not None else context.benchmark_status,
+            "benchmark_provider": quote_result.benchmark_provider if quote_result is not None else None,
+            "benchmark_observed_at": quote_result.benchmark_observed_at if quote_result is not None else None,
+            "benchmark_errors": list(quote_result.benchmark_errors) if quote_result is not None else [],
+        }
     )
     c_history = a_history_coverage(
         conn,
@@ -838,7 +890,9 @@ def _formal_capability_view(
     if result.mode == MODE_CLOSE_FINAL:
         status = _capability_run_status(conn, trade_date)
         status.attrs["a_history_coverage"] = c_history
-        return _load_formal_capability_candidates(conn, trade_date), status, evidence
+        return _apply_date_evidence_gate(
+            _load_formal_capability_candidates(conn, trade_date), status, evidence
+        )
     if result.mode == MODE_DATA_UNAVAILABLE:
         status = pd.DataFrame(
             [
@@ -855,10 +909,10 @@ def _formal_capability_view(
             ]
         )
         status.attrs["a_history_coverage"] = c_history
-        return pd.DataFrame(), status, evidence
+        return _apply_date_evidence_gate(pd.DataFrame(), status, evidence)
     rows, status = _live_formal_capability_rows(conn, context)
     status.attrs["a_history_coverage"] = c_history
-    return rows, status, evidence
+    return _apply_date_evidence_gate(rows, status, evidence)
 
 
 def ensure_close_history_persisted(
@@ -1662,8 +1716,13 @@ def render_scanner_tab(
                 st.session_state[runtime_key] = SelectionRuntime()
             formal_today_df, capability_status_df, selection_evidence = _formal_capability_view(
                 status_conn,
-                query_trade_date or today_date,
-                snapshot_loader=shared_snapshot_loader,
+                today_date,
+                selected_trade_date=query_trade_date or today_date,
+                snapshot_loader=(
+                    shared_snapshot_loader
+                    if str(today_date) == str(query_trade_date or today_date)
+                    else None
+                ),
                 now=now,
                 runtime=st.session_state[runtime_key],
             )
@@ -1682,6 +1741,10 @@ def render_scanner_tab(
             "error_msg": "unable to read A history coverage",
         }
         selection_evidence = {
+            "selected_trade_date": query_trade_date,
+            "effective_trade_date": today_date,
+            "formal_trade_date": None,
+            "date_status": "date_mismatch",
             "mode": "data_unavailable",
             "as_of": None,
             "price_as_of": None,
@@ -1695,15 +1758,16 @@ def render_scanner_tab(
     st.markdown("**当时市场背景**")
     st.caption(_format_market_regime(market_summary))
 
-    formal_trade_date = query_trade_date or today_date
-    effective_trade_date = formal_trade_date
     st.markdown("**筛选证据**")
     st.dataframe(pd.DataFrame([selection_evidence]), width="stretch", hide_index=True)
     st.caption(
         "日期对齐："
-        f"selected={query_trade_date or 'N/A'} ｜ effective={effective_trade_date or 'N/A'} ｜ "
-        f"formal trade_date={formal_trade_date or 'N/A'}"
+        f"selected={selection_evidence.get('selected_trade_date') or 'N/A'} ｜ "
+        f"effective={selection_evidence.get('effective_trade_date') or 'N/A'} ｜ "
+        f"formal trade_date={selection_evidence.get('formal_trade_date') or 'N/A'}"
     )
+    if selection_evidence.get("date_status") == "date_mismatch":
+        st.error("date_mismatch：选择日期、实际评估日期与正式批次日期不一致，候选表已隐藏。")
     if selection_evidence["mode"] == "intraday_snapshot":
         st.warning("盘中临时结果：不会写入正式收盘候选或状态历史。")
     elif selection_evidence["mode"] == "close_pending":

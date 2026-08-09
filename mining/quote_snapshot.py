@@ -10,9 +10,12 @@ from typing import Callable, Iterable
 import pandas as pd
 
 from .intraday import _call_endpoint_with_timeout, normalize_spot_frame
+from .selection_context import BENCHMARK_CODES
 
 
 DEFAULT_PROVIDERS = ("stock_zh_a_spot_em", "stock_zh_a_spot")
+DEFAULT_BENCHMARK_PROVIDERS = ("stock_zh_index_spot_em", "stock_zh_index_spot_sina")
+PRIMARY_BENCHMARK = "000852"
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -30,9 +33,14 @@ class QuoteSnapshotResult:
     from_cache: bool
     retry_at: str | None = None
     benchmark_closes: dict[str, float] = field(default_factory=dict)
+    benchmark_status: str = "unavailable"
+    benchmark_provider: str | None = None
+    benchmark_errors: tuple[str, ...] = ()
+    benchmark_observed_at: str | None = None
 
 
 ProviderFetcher = Callable[[str, float], pd.DataFrame]
+BenchmarkFetcher = Callable[[str, float], pd.DataFrame]
 
 
 def _as_china_time(value: dt.datetime) -> dt.datetime:
@@ -59,6 +67,40 @@ def _finite_positive_benchmarks(values: dict[str, float] | None) -> dict[str, fl
     return dict(sorted(normalized.items()))
 
 
+def _benchmark_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
+    lowered = {str(column).strip().lower(): str(column) for column in frame.columns}
+    for name in names:
+        if name in frame.columns:
+            return name
+        matched = lowered.get(name.lower())
+        if matched is not None:
+            return matched
+    return None
+
+
+def _normalize_benchmark_frame(frame: pd.DataFrame) -> dict[str, float]:
+    if frame is None or frame.empty:
+        return {}
+    code_column = _benchmark_column(frame, ("代码", "指数代码", "code", "symbol", "sec_code"))
+    close_column = _benchmark_column(frame, ("最新价", "最新", "现价", "close", "收盘"))
+    if code_column is None or close_column is None:
+        return {}
+    required = set(BENCHMARK_CODES)
+    values: dict[str, float] = {}
+    for raw_code, raw_close in zip(frame[code_column], frame[close_column]):
+        digits = "".join(character for character in str(raw_code or "") if character.isdigit())
+        code = digits[-6:].zfill(6) if digits else ""
+        if code not in required:
+            continue
+        try:
+            close = float(raw_close)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(close) and close > 0:
+            values[code] = close
+    return dict(sorted(values.items()))
+
+
 class QuoteSnapshotAdapter:
     """One bounded quote path with explicit failover, cooling, and restart cache rules."""
 
@@ -68,6 +110,8 @@ class QuoteSnapshotAdapter:
         cache_dir: str | Path,
         provider_names: tuple[str, ...] = DEFAULT_PROVIDERS,
         provider_fetcher: ProviderFetcher = _default_provider_fetcher,
+        benchmark_provider_names: tuple[str, ...] = DEFAULT_BENCHMARK_PROVIDERS,
+        benchmark_fetcher: BenchmarkFetcher | None = None,
         timeout_seconds: float = 8.0,
         cooldown_seconds: float = 60.0,
         max_age_minutes: int = 10,
@@ -80,6 +124,12 @@ class QuoteSnapshotAdapter:
         self.cache_dir = Path(cache_dir)
         self.provider_names = tuple(provider_names)
         self.provider_fetcher = provider_fetcher
+        self.benchmark_provider_names = tuple(benchmark_provider_names)
+        self.benchmark_fetcher = (
+            _default_provider_fetcher
+            if benchmark_fetcher is None and provider_fetcher is _default_provider_fetcher
+            else benchmark_fetcher
+        )
         self.timeout_seconds = float(timeout_seconds)
         self.cooldown_seconds = float(cooldown_seconds)
         self.max_age_minutes = int(max_age_minutes)
@@ -113,6 +163,10 @@ class QuoteSnapshotAdapter:
                 "normalized_rows": result.normalized_rows,
                 "coverage": result.coverage,
                 "benchmark_closes": _finite_positive_benchmarks(result.benchmark_closes),
+                "benchmark_status": result.benchmark_status,
+                "benchmark_provider": result.benchmark_provider,
+                "benchmark_errors": list(result.benchmark_errors),
+                "benchmark_observed_at": result.benchmark_observed_at,
                 "frame": result.frame.copy(),
             },
             temporary,
@@ -147,6 +201,8 @@ class QuoteSnapshotAdapter:
                 frame = pd.read_pickle(frame_path)
                 benchmark_closes = _finite_positive_benchmarks(metadata.get("benchmark_closes"))
                 cache_errors = ("legacy cache has no benchmark_closes",) if not benchmark_closes else ()
+            benchmark_status = "ready" if PRIMARY_BENCHMARK in benchmark_closes else "unavailable"
+            benchmark_errors = tuple(str(item) for item in (metadata.get("benchmark_errors") or ()))
             if str(metadata.get("trade_date")) != str(trade_date):
                 return None
             observed_at = dt.datetime.fromisoformat(str(metadata["observed_at"]))
@@ -191,6 +247,10 @@ class QuoteSnapshotAdapter:
                 status="snapshot_cache_fallback",
                 from_cache=True,
                 benchmark_closes=benchmark_closes,
+                benchmark_status=benchmark_status,
+                benchmark_provider=metadata.get("benchmark_provider"),
+                benchmark_errors=benchmark_errors,
+                benchmark_observed_at=metadata.get("benchmark_observed_at") or metadata.get("observed_at"),
             )
         except Exception as exc:
             return QuoteSnapshotResult(
@@ -229,6 +289,34 @@ class QuoteSnapshotAdapter:
             retry_at=retry_at.isoformat(),
         )
 
+    def _fetch_benchmarks(
+        self,
+        now: dt.datetime,
+    ) -> tuple[dict[str, float], str, str | None, tuple[str, ...], str]:
+        observed_at = now.isoformat()
+        if self.benchmark_fetcher is None:
+            return {}, "unavailable", None, ("benchmark_fetcher_not_configured",), observed_at
+        errors: list[str] = []
+        partial: tuple[dict[str, float], str] | None = None
+        for provider in self.benchmark_provider_names:
+            try:
+                frame = pd.DataFrame(self.benchmark_fetcher(provider, self.timeout_seconds))
+                closes = _normalize_benchmark_frame(frame)
+                if closes and partial is None:
+                    partial = (closes, provider)
+                if PRIMARY_BENCHMARK not in closes:
+                    errors.append(f"{provider}:missing_or_invalid_primary:{PRIMARY_BENCHMARK}")
+                    continue
+                missing = sorted(set(BENCHMARK_CODES).difference(closes))
+                if missing:
+                    errors.append(f"{provider}:missing_required:{','.join(missing)}")
+                return closes, "ready", provider, tuple(errors), observed_at
+            except Exception as exc:
+                errors.append(f"{provider}:{type(exc).__name__}:{exc}")
+        if partial is not None:
+            return partial[0], "unavailable", partial[1], tuple(errors), observed_at
+        return {}, "unavailable", None, tuple(errors), observed_at
+
     def load(
         self,
         trade_date: str,
@@ -236,9 +324,20 @@ class QuoteSnapshotAdapter:
         expected_codes: Iterable[object],
         now: dt.datetime,
         close_final: bool = False,
+        cache_only: bool = False,
     ) -> QuoteSnapshotResult:
         current = _as_china_time(now)
         expected = _canonical_codes(expected_codes)
+        if cache_only:
+            cached = self._cached_result(str(trade_date), expected, current, close_final=close_final)
+            if cached is not None:
+                return cached
+            return self._failure_result(
+                status="provider_failed",
+                errors=["cache_only snapshot unavailable"],
+                attempts=0,
+                now=current,
+            )
         fingerprint = (str(trade_date), tuple(sorted(expected)))
         cooldown_until = self._failed_until.get(fingerprint)
         if cooldown_until is not None and current < cooldown_until:
@@ -275,6 +374,9 @@ class QuoteSnapshotAdapter:
                     saw_low_coverage = True
                     errors.append(f"{provider}:coverage_below_threshold:{coverage:.3f}")
                     continue
+                benchmark_closes, benchmark_status, benchmark_provider, benchmark_errors, benchmark_observed_at = (
+                    self._fetch_benchmarks(current)
+                )
                 result = QuoteSnapshotResult(
                     frame=normalized.copy(),
                     provider=provider,
@@ -286,6 +388,11 @@ class QuoteSnapshotAdapter:
                     errors=tuple(errors),
                     status="snapshot_usable",
                     from_cache=False,
+                    benchmark_closes=benchmark_closes,
+                    benchmark_status=benchmark_status,
+                    benchmark_provider=benchmark_provider,
+                    benchmark_errors=benchmark_errors,
+                    benchmark_observed_at=benchmark_observed_at,
                 )
                 self._failed_until.pop(fingerprint, None)
                 self._save_success(str(trade_date), result)
