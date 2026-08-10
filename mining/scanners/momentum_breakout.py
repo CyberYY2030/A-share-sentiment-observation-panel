@@ -249,7 +249,9 @@ def evaluate_momentum_anomaly(
     if len(dates) < 6:
         diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
         return pd.DataFrame(), diagnostics
-    activity: EventActivityResult = build_event_activity(context)
+    activity: EventActivityResult = build_event_activity(
+        context, baseline_days=20, required_window_days=21
+    )
     activity_by_code = activity.rows.set_index("sec_code") if not activity.rows.empty else pd.DataFrame()
     paths = build_v2_path_context(context).set_index("sec_code")
     universe = context.universe.copy()

@@ -362,7 +362,9 @@ def evaluate_compression_launch(
     if len(dates) < 46:
         diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
         return pd.DataFrame(), diagnostics
-    activity: EventActivityResult = build_event_activity(context)
+    activity: EventActivityResult = build_event_activity(
+        context, baseline_days=20, required_window_days=46
+    )
     activity_by_code = activity.rows.set_index("sec_code") if not activity.rows.empty else pd.DataFrame()
     paths = build_v2_path_context(context).set_index("sec_code")
     names = (
@@ -387,9 +389,6 @@ def evaluate_compression_launch(
             continue
         source = str(activity_by_code.at[code, "activity_source"])
         activity_series = pd.to_numeric(indexed.get(source), errors="coerce")
-        if not activity_series.iloc[-46:].notna().all():
-            skipped["activity_window_missing"] += 1
-            continue
         returns = close.pct_change(fill_method=None)
         sigma = float(returns.iloc[-21:-1].std())
         if not math.isfinite(sigma):

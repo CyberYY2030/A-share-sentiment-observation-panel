@@ -97,7 +97,7 @@ class EventActivityV2Tests(unittest.TestCase):
         self.assertEqual(set(activity.index), {"600001", "300001"})
         self.assertTrue(activity["activity_ratio"].notna().all())
 
-    def test_batch_source_falls_back_without_mixing_amount_and_turnover(self) -> None:
+    def test_source_falls_back_per_stock_without_mixing_amount_and_turnover(self) -> None:
         context = _event_context()
         context.bars.loc[
             (context.bars["sec_code"].eq("300001"))
@@ -107,4 +107,5 @@ class EventActivityV2Tests(unittest.TestCase):
 
         activity = build_event_activity(context).rows
 
-        self.assertEqual(set(activity["activity_source"]), {"turnover_ratio"})
+        sources = activity.set_index("sec_code")["activity_source"].to_dict()
+        self.assertEqual(sources, {"300001": "turnover_ratio", "600001": "amount"})

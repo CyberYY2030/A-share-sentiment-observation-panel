@@ -35,7 +35,9 @@ def evaluate_base_breakout(context: SelectionContext) -> tuple[pd.DataFrame, dic
     if len(dates) < required:
         diagnostics["skipped_reason_counts"] = {"insufficient_clean_history": len(context.universe)}
         return pd.DataFrame(), diagnostics
-    activity = build_event_activity(context)
+    activity = build_event_activity(
+        context, baseline_days=20, required_window_days=21
+    )
     activity_by_code = activity.rows.set_index("sec_code") if not activity.rows.empty else pd.DataFrame()
     names = (
         context.universe.assign(sec_code=context.universe["sec_code"].astype(str).str.zfill(6))

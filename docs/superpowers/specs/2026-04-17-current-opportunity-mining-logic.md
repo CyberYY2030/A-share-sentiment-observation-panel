@@ -656,3 +656,27 @@
 - batch latency p50 0.078 秒、p95 0.234 秒、max 2.110 秒；provider timestamp 范围为 13:41:57–13:43:02。
 - Tencent benchmark 返回 `000852=7670.07`。新 Python 进程 `cache_only` 的 attempts=0、from_cache=true，frame/benchmark/as-of 与 bundle SHA-256 完全一致。
 - 四个生产数据库 SHA-256 前后相同；没有 migration 或生产数据库写入。本证据状态为 `real-env-verified`，但不构成生产 migration 授权。
+
+---
+
+## 19. 2026-08-10 R4.4 B/D 逐股 activity 可用性修订
+
+### 19.1 source 与完整窗口按股票判定
+
+- activity builder 按 `sec_code` 独立检查完整交易日窗口；窗口内每个值都必须有限且大于 0。单只停牌、新股或缺行只使该股票 fail closed，不再令全市场 activity 一起不可用。
+- 每只股票优先使用完整窗口内全部可用的 `amount`；仅当 `amount` 不完整时，才整体改用同样完整的 `turnover_ratio`。同一股票不得混用两个 source。
+- `momentum_anomaly` 与 `base_breakout` 要求 T 加 T-20…T-1 共 21 日；`compression_launch` 按 T 加 T-45…T-1 共 46 日选择 source。
+- `compression_launch` 的 `activity_ratio` baseline 仍严格只取 T-20…T-1 的中位数，T 仅作为当前值；46 日窗口不会扩大或改变 ratio baseline。
+- activity cache key 同时包含 `baseline_days` 与 `required_window_days`；返回值保持副本隔离，盘中结果继续标记 provisional。
+
+### 19.2 缺失诊断的唯一所有者
+
+- builder 是 activity 缺失计数的唯一所有者，scanner 只消费可用行，不重复累计同一股票。
+- 对 46 日消费者，连 21 日完整 source 都不存在时记 `activity_missing`；21 日可用但 46 日不完整时记 `activity_window_missing`。两个原因互斥。
+- activity percentile 只在当前消费者实际可用的股票横截面内计算。B/D 的 gate、rank、阈值与 A/C/E 均未修改。
+
+### 19.3 真实只读 sandbox 证据
+
+- `2026-08-06` universe=5036：21 日 eligible=4981、`activity_missing=55`；46 日 eligible=4950、`activity_missing=55`、`activity_window_missing=31`。
+- B momentum 候选 191、compression 候选 3；D 候选 0 是真实策略 gate 结果。三个漏斗均逐股核算到 5036，不再出现 `activity_missing=5036`。
+- 四个 sandbox source SHA-256 前后相同，生产四库未写入；没有 outcomes、schema 或 migration 变更。
