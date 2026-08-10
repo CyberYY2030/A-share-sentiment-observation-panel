@@ -27,6 +27,27 @@ def _raw_quotes(codes: tuple[str, ...] = ("600001", "600002", "600003")) -> pd.D
     )
 
 
+def _quotes_with_batch_diagnostics(codes: tuple[str, ...], *, missing: int) -> pd.DataFrame:
+    frame = _raw_quotes(codes)
+    frame.attrs["tencent_batch_diagnostics"] = {
+        "total_batches": 2,
+        "success_batches": 1,
+        "timeout_batches": 1,
+        "error_batches": 0,
+        "received_codes": len(codes),
+        "missing_codes": missing,
+        "max_concurrency": 2,
+        "latency_p50_seconds": 0.1,
+        "latency_p95_seconds": 2.0,
+        "latency_max_seconds": 2.0,
+        "provider_timestamp_min": "2026-08-10T10:00:00",
+        "provider_timestamp_max": "2026-08-10T10:00:01",
+        "provider_date_counts": {"2026-08-10": len(codes)},
+        "batches": [],
+    }
+    return frame
+
+
 class QuoteSnapshotTests(unittest.TestCase):
     def setUp(self) -> None:
         self.now = dt.datetime(2026, 8, 7, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
@@ -48,7 +69,7 @@ class QuoteSnapshotTests(unittest.TestCase):
             response = responses[provider]
             if isinstance(response, BaseException):
                 raise response
-            return pd.DataFrame(response)
+            return response.copy() if isinstance(response, pd.DataFrame) else pd.DataFrame(response)
 
         return QuoteSnapshotAdapter(
             cache_dir=self.cache_dir,
@@ -113,6 +134,55 @@ class QuoteSnapshotTests(unittest.TestCase):
         self.assertEqual(DEFAULT_PROVIDERS, ("tencent_batch", "stock_zh_a_spot_em"))
         self.assertNotIn("stock_zh_a_spot", DEFAULT_PROVIDERS)
         self.assertEqual(DEFAULT_BENCHMARK_PROVIDERS, ("tencent_index", "stock_zh_index_spot_em"))
+
+    def test_partial_tencent_above_threshold_is_usable_without_em(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter
+
+        expected = {f"{600_000 + index:06d}" for index in range(100)}
+        received = tuple(sorted(expected)[:85])
+        calls: list[str] = []
+
+        def fetcher(provider: str, _timeout_seconds: float, _expected_codes: set[str]) -> pd.DataFrame:
+            calls.append(provider)
+            if provider != "tencent_batch":
+                raise AssertionError("EM must not run for usable Tencent coverage")
+            return _quotes_with_batch_diagnostics(received, missing=15)
+
+        adapter = QuoteSnapshotAdapter(cache_dir=self.cache_dir, provider_fetcher=fetcher)
+        result = adapter.load("2026-08-10", expected_codes=expected, now=self.now)
+
+        self.assertEqual(result.status, "snapshot_usable")
+        self.assertEqual(result.provider, "tencent_batch")
+        self.assertEqual(result.raw_rows, 85)
+        self.assertEqual(result.normalized_rows, 85)
+        self.assertEqual(result.coverage, 0.85)
+        self.assertEqual(calls, ["tencent_batch"])
+        self.assertEqual(result.frame.attrs["tencent_batch_diagnostics"]["timeout_batches"], 1)
+
+    def test_partial_tencent_below_threshold_preserves_diagnostics_then_falls_back(self) -> None:
+        from mining.quote_snapshot import QuoteSnapshotAdapter
+
+        expected = {f"{600_000 + index:06d}" for index in range(100)}
+        received = tuple(sorted(expected)[:70])
+        calls: list[str] = []
+
+        def fetcher(provider: str, _timeout_seconds: float, _expected_codes: set[str]) -> pd.DataFrame:
+            calls.append(provider)
+            if provider == "tencent_batch":
+                return _quotes_with_batch_diagnostics(received, missing=30)
+            raise RuntimeError("EM unavailable")
+
+        adapter = QuoteSnapshotAdapter(cache_dir=self.cache_dir, provider_fetcher=fetcher)
+        result = adapter.load("2026-08-10", expected_codes=expected, now=self.now)
+
+        self.assertEqual(result.status, "coverage_below_threshold")
+        self.assertEqual(result.raw_rows, 70)
+        self.assertEqual(result.normalized_rows, 70)
+        self.assertEqual(result.coverage, 0.70)
+        self.assertEqual(calls, ["tencent_batch", "stock_zh_a_spot_em"])
+        summary = next(error for error in result.errors if "batch_diagnostics" in error)
+        self.assertIn('"received_codes": 70', summary)
+        self.assertIn('"missing_codes": 30', summary)
 
     def test_first_provider_failure_uses_second_provider_once(self) -> None:
         adapter, calls = self._adapter(

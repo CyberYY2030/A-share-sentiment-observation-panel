@@ -6,7 +6,10 @@ import multiprocessing
 import os
 import queue
 import re
+import statistics
+import threading
 import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any, Callable
 
@@ -132,6 +135,7 @@ def _reject_frozen_snapshot(history: pd.DataFrame, spot: pd.DataFrame, baseline_
 def normalize_spot_frame(frame: pd.DataFrame) -> pd.DataFrame:
     if frame is None or frame.empty:
         raise RuntimeError("A-share spot snapshot is empty.")
+    source_attrs = dict(frame.attrs)
 
     columns = {
         "sec_code": _pick_column(frame, ("代码", "证券代码", "股票代码", "code", "symbol", "sec_code")),
@@ -178,7 +182,9 @@ def normalize_spot_frame(frame: pd.DataFrame) -> pd.DataFrame:
     ]
     result = _normalize_volume_unit(result)
     result["sec_type"] = "stock"
-    return result.drop_duplicates("sec_code", keep="last").reset_index(drop=True)
+    normalized = result.drop_duplicates("sec_code", keep="last").reset_index(drop=True)
+    normalized.attrs.update(source_attrs)
+    return normalized
 
 
 def _tencent_quotes_to_frame(payload: dict[str, dict[str, Any]]) -> pd.DataFrame:
@@ -196,9 +202,200 @@ def _tencent_quotes_to_frame(payload: dict[str, dict[str, Any]]) -> pd.DataFrame
                 "low": record.get("low"),
                 "volume": record.get("volume"),
                 "amount_yuan": record.get("amount", record.get("成交额(万)")),
+                "provider_timestamp": record.get("datetime"),
             }
         )
     return pd.DataFrame(rows)
+
+
+def _percentile(values: list[float], fraction: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(values)
+    index = (len(ordered) - 1) * fraction
+    lower = math.floor(index)
+    upper = math.ceil(index)
+    if lower == upper:
+        return ordered[lower]
+    return ordered[lower] + (ordered[upper] - ordered[lower]) * (index - lower)
+
+
+def _pq_tencent_batch_fetcher(
+    stock_codes: tuple[str, ...],
+    timeout_seconds: float,
+    prefix: bool,
+) -> dict[str, dict[str, Any]]:
+    import pqquotation
+
+    quotation = pqquotation.use("tencent")
+    quotation.timeout = float(timeout_seconds)
+    return quotation.real(
+        list(stock_codes),
+        return_format="prefix" if prefix else "digit",
+    )
+
+
+def _fetch_tencent_batches(
+    stock_codes: tuple[str, ...],
+    *,
+    batch_fetcher: Callable[[tuple[str, ...], float, bool], object] = _pq_tencent_batch_fetcher,
+    max_workers: int = 8,
+    request_timeout_seconds: float = 2.0,
+    collection_budget_seconds: float = 6.5,
+    prefix: bool = False,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Fetch explicit Tencent batches while retaining completed partial results."""
+    if max_workers <= 0 or request_timeout_seconds <= 0 or collection_budget_seconds <= 0:
+        raise ValueError("Tencent batch limits must be positive")
+    requested = tuple(sorted({str(code).strip() for code in stock_codes if str(code).strip()}))
+    batches = [requested[index : index + 60] for index in range(0, len(requested), 60)]
+    if not batches:
+        raise ValueError("Tencent quote request requires explicit stock codes")
+
+    collection_started = time.monotonic()
+    deadline = collection_started + float(collection_budget_seconds)
+    lock = threading.Lock()
+    active = 0
+    max_concurrency = 0
+
+    def run_batch(batch_index: int, batch: tuple[str, ...]) -> tuple[dict[str, Any], pd.DataFrame]:
+        nonlocal active, max_concurrency
+        started = time.monotonic()
+        with lock:
+            active += 1
+            max_concurrency = max(max_concurrency, active)
+        try:
+            payload = batch_fetcher(batch, float(request_timeout_seconds), bool(prefix))
+            frame = pd.DataFrame(payload) if isinstance(payload, pd.DataFrame) else _tencent_quotes_to_frame(payload)
+            record = {
+                "batch": batch_index,
+                "requested": len(batch),
+                "status": "success",
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "rows": len(frame),
+                "error": None,
+            }
+            return record, frame
+        except TimeoutError as exc:
+            return {
+                "batch": batch_index,
+                "requested": len(batch),
+                "status": "timeout",
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "rows": 0,
+                "error": f"{type(exc).__name__}:{exc}",
+            }, pd.DataFrame()
+        except Exception as exc:
+            return {
+                "batch": batch_index,
+                "requested": len(batch),
+                "status": "error",
+                "elapsed_seconds": round(time.monotonic() - started, 6),
+                "rows": 0,
+                "error": f"{type(exc).__name__}:{exc}",
+            }, pd.DataFrame()
+        finally:
+            with lock:
+                active -= 1
+
+    executor = ThreadPoolExecutor(max_workers=min(int(max_workers), len(batches)))
+    pending: dict[object, tuple[int, tuple[str, ...]]] = {}
+    next_batch = 0
+    records: dict[int, dict[str, Any]] = {}
+    frames: list[pd.DataFrame] = []
+
+    def submit_available(*, initial: bool = False) -> None:
+        nonlocal next_batch
+        while next_batch < len(batches) and len(pending) < max_workers:
+            if not initial and time.monotonic() + request_timeout_seconds > deadline:
+                break
+            batch_index = next_batch
+            batch = batches[batch_index]
+            pending[executor.submit(run_batch, batch_index, batch)] = (batch_index, batch)
+            next_batch += 1
+
+    submit_available(initial=True)
+    try:
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            completed, _ = wait(tuple(pending), timeout=remaining, return_when=FIRST_COMPLETED)
+            if not completed:
+                break
+            for future in completed:
+                batch_index, _ = pending.pop(future)
+                record, frame = future.result()
+                records[batch_index] = record
+                if not frame.empty:
+                    frames.append(frame)
+            submit_available()
+    finally:
+        timed_out = list(pending.values()) + [
+            (batch_index, batches[batch_index])
+            for batch_index in range(next_batch, len(batches))
+        ]
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=False, cancel_futures=True)
+        for batch_index, batch in timed_out:
+            records.setdefault(
+                batch_index,
+                {
+                    "batch": batch_index,
+                    "requested": len(batch),
+                    "status": "timeout",
+                    "elapsed_seconds": round(float(collection_budget_seconds), 6),
+                    "rows": 0,
+                    "error": "collection_deadline",
+                },
+            )
+
+    merged = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if not merged.empty and "sec_code" in merged.columns:
+        merged["sec_code"] = merged["sec_code"].map(_canonical_code)
+        if not prefix:
+            merged = merged[merged["sec_code"].map(lambda code: bool(A_SHARE_CODE.match(str(code))))]
+        merged = merged.drop_duplicates("sec_code", keep="last").sort_values("sec_code").reset_index(drop=True)
+
+    requested_canonical = {_canonical_code(code) for code in requested}
+    received = set(merged["sec_code"].astype(str)) if "sec_code" in merged.columns else set()
+    timestamps = (
+        pd.to_datetime(merged["provider_timestamp"], errors="coerce").dropna()
+        if "provider_timestamp" in merged.columns
+        else pd.Series(dtype="datetime64[ns]")
+    )
+    ordered_records = [records[index] for index in range(len(batches))]
+    latencies = [float(record["elapsed_seconds"]) for record in ordered_records]
+    date_counts = (
+        {
+            str(day): int(count)
+            for day, count in timestamps.dt.strftime("%Y-%m-%d").value_counts().sort_index().items()
+        }
+        if not timestamps.empty
+        else {}
+    )
+    diagnostics = {
+        "collection_elapsed_seconds": round(time.monotonic() - collection_started, 6),
+        "total_batches": len(batches),
+        "success_batches": sum(record["status"] == "success" for record in ordered_records),
+        "timeout_batches": sum(record["status"] == "timeout" for record in ordered_records),
+        "error_batches": sum(record["status"] == "error" for record in ordered_records),
+        "requested_codes": len(requested_canonical),
+        "received_codes": len(received.intersection(requested_canonical)),
+        "missing_codes": len(requested_canonical.difference(received)),
+        "max_workers": int(max_workers),
+        "max_concurrency": max_concurrency,
+        "latency_p50_seconds": round(statistics.median(latencies), 6) if latencies else 0.0,
+        "latency_p95_seconds": round(_percentile(latencies, 0.95), 6),
+        "latency_max_seconds": round(max(latencies), 6) if latencies else 0.0,
+        "provider_timestamp_min": timestamps.min().isoformat() if not timestamps.empty else None,
+        "provider_timestamp_max": timestamps.max().isoformat() if not timestamps.empty else None,
+        "provider_date_counts": date_counts,
+        "batches": ordered_records,
+    }
+    merged.attrs["tencent_batch_diagnostics"] = diagnostics
+    return merged, diagnostics
 
 
 def _spot_worker(result_queue: Any, endpoint_name: str) -> None:
@@ -214,19 +411,20 @@ def _spot_worker(result_queue: Any, endpoint_name: str) -> None:
 def _tencent_worker(
     result_queue: Any,
     stock_codes: tuple[str, ...],
-    timeout_seconds: float,
     prefix: bool,
+    max_workers: int,
+    request_timeout_seconds: float,
+    collection_budget_seconds: float,
 ) -> None:
     try:
-        import pqquotation
-
-        quotation = pqquotation.use("tencent")
-        quotation.timeout = float(timeout_seconds)
-        payload = quotation.real(
-            list(stock_codes),
-            return_format="prefix" if prefix else "digit",
+        frame, _ = _fetch_tencent_batches(
+            stock_codes,
+            max_workers=max_workers,
+            request_timeout_seconds=request_timeout_seconds,
+            collection_budget_seconds=collection_budget_seconds,
+            prefix=prefix,
         )
-        result_queue.put(("ok", _tencent_quotes_to_frame(payload)))
+        result_queue.put(("ok", frame))
     except Exception as exc:
         result_queue.put(("error", f"{type(exc).__name__}: {exc}"))
 
@@ -282,12 +480,23 @@ def _call_tencent_quotes_with_timeout(
     timeout_seconds: float,
     *,
     prefix: bool = False,
+    max_workers: int = 8,
+    request_timeout_seconds: float = 2.0,
+    collection_budget_seconds: float = 6.5,
 ) -> pd.DataFrame:
     if not stock_codes:
         raise ValueError("Tencent quote request requires explicit stock codes")
+    if collection_budget_seconds > timeout_seconds - 1.0:
+        raise ValueError("Tencent collection budget must leave at least 1 second for the parent process")
     return _call_frame_worker_with_timeout(
         _tencent_worker,
-        (tuple(stock_codes), float(timeout_seconds), bool(prefix)),
+        (
+            tuple(stock_codes),
+            bool(prefix),
+            int(max_workers),
+            float(request_timeout_seconds),
+            float(collection_budget_seconds),
+        ),
         "tencent_batch",
         timeout_seconds,
     )

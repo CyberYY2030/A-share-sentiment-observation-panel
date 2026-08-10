@@ -19,6 +19,7 @@ DEFAULT_BENCHMARK_PROVIDERS = ("tencent_index", "stock_zh_index_spot_em")
 PRIMARY_BENCHMARK = "000852"
 TENCENT_BENCHMARK_CODES = ("sh000852", "sh000300", "sh000001", "sz399001")
 CHINA_TZ = dt.timezone(dt.timedelta(hours=8))
+TENCENT_DIAGNOSTICS_ATTR = "tencent_batch_diagnostics"
 
 
 @dataclass(frozen=True)
@@ -79,6 +80,21 @@ def _finite_positive_benchmarks(values: dict[str, float] | None) -> dict[str, fl
         if math.isfinite(close) and close > 0:
             normalized[str(raw_code).zfill(6)] = close
     return dict(sorted(normalized.items()))
+
+
+def _batch_diagnostics_error(provider: str, frame: pd.DataFrame) -> str | None:
+    diagnostics = frame.attrs.get(TENCENT_DIAGNOSTICS_ATTR)
+    if provider != "tencent_batch" or not isinstance(diagnostics, dict):
+        return None
+    fields = (
+        "collection_elapsed_seconds",
+        "total_batches", "success_batches", "timeout_batches", "error_batches",
+        "received_codes", "missing_codes", "max_concurrency",
+        "latency_p50_seconds", "latency_p95_seconds", "latency_max_seconds",
+        "provider_timestamp_min", "provider_timestamp_max", "provider_date_counts",
+    )
+    summary = {field: diagnostics.get(field) for field in fields}
+    return f"{provider}:batch_diagnostics:{json.dumps(summary, ensure_ascii=False, sort_keys=True)}"
 
 
 def _benchmark_column(frame: pd.DataFrame, names: tuple[str, ...]) -> str | None:
@@ -161,8 +177,10 @@ class QuoteSnapshotAdapter:
 
     def _fetch_stock_provider(self, provider: str, expected_codes: set[str]) -> pd.DataFrame:
         if self._provider_fetcher_accepts_expected_codes:
-            return pd.DataFrame(self.provider_fetcher(provider, self.timeout_seconds, expected_codes))
-        return pd.DataFrame(self.provider_fetcher(provider, self.timeout_seconds))
+            fetched = self.provider_fetcher(provider, self.timeout_seconds, expected_codes)
+        else:
+            fetched = self.provider_fetcher(provider, self.timeout_seconds)
+        return fetched.copy() if isinstance(fetched, pd.DataFrame) else pd.DataFrame(fetched)
 
     def _cache_paths(self, trade_date: str) -> tuple[Path, Path]:
         root = self.cache_dir / str(trade_date)
@@ -401,15 +419,20 @@ class QuoteSnapshotAdapter:
             try:
                 raw = self._fetch_stock_provider(provider, expected)
                 raw_rows = len(raw)
+                batch_diagnostics_error = _batch_diagnostics_error(provider, raw)
                 if raw.empty:
                     saw_empty = True
                     errors.append(f"{provider}:empty_payload")
+                    if batch_diagnostics_error is not None:
+                        errors.append(batch_diagnostics_error)
                     continue
                 normalized = normalize_spot_frame(raw)
                 normalized_rows = len(normalized)
                 if normalized.empty:
                     saw_normalization_empty = True
                     errors.append(f"{provider}:normalization_empty")
+                    if batch_diagnostics_error is not None:
+                        errors.append(batch_diagnostics_error)
                     continue
                 coverage = self._coverage(normalized, expected)
                 if coverage >= best_coverage:
@@ -419,6 +442,8 @@ class QuoteSnapshotAdapter:
                 if coverage < self.min_coverage_ratio:
                     saw_low_coverage = True
                     errors.append(f"{provider}:coverage_below_threshold:{coverage:.3f}")
+                    if batch_diagnostics_error is not None:
+                        errors.append(batch_diagnostics_error)
                     continue
                 benchmark_closes, benchmark_status, benchmark_provider, benchmark_errors, benchmark_observed_at = (
                     self._fetch_benchmarks(current)

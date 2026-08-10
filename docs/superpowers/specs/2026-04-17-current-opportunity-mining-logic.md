@@ -632,3 +632,27 @@
 - Tencent 20 只样本返回 20/20，coverage 1.0；随后 5203 只全市场返回 raw 5203、normalized 5199、coverage 0.999231。
 - 同刷新周期独立 benchmark 返回 `000852=7679.53`；样本、全市场和 benchmark 三次调用合计约 2.001 秒，单次 timeout 均为 8 秒。
 - 该证据发生于周日，只证明实现与传输能力。公共 `QuoteSnapshotAdapter.load()` 的真实交易时段端到端及同日重启 cache 恢复尚未执行，状态为 `locally-verified + trading-window environment-blocked`，不得标记 `real-env-verified`。
+
+---
+
+## 18. 2026-08-10 R4.3.2 Tencent 交易时段批次收敛
+
+### 18.1 有界批次与部分成功
+
+- Tencent 股票请求按排序、去重后的 caller-supplied codes 固定每批最多 60 只；同步刷新最多 8 个在途请求，不再把 5200+ codes 交给 `pqquotation.real()` 形成 87 并发。
+- 每批 HTTP timeout 为 2.0 秒，worker 收集预算为 6.5 秒，父进程预算为 8.0 秒。刷新不重试失败批次；内部 deadline 到达后取消未启动批次并返回已经完成的行。
+- 每批保留 status、elapsed、rows、error；汇总保留成功/timeout/error 批次数、received/missing codes、最大并发、p50/p95/max latency 与 provider timestamp/date 分布。
+- 合并只在同一 Tencent provider 内进行，按 `sec_code` 去重并排除北交所；不同 provider 的股票行不会拼成一个快照。
+
+### 18.2 adapter 与 cache 合同不变
+
+- Tencent 部分结果继续进入原有 normalization 与 coverage：coverage >=0.80 时直接 `snapshot_usable` 且不调用 EM；低于 0.80 时保留真实 raw/normalized/coverage 与批次摘要，再进入原有一次 EM fallback 或同日 cache。
+- `QuoteSnapshotResult` 字段、v2 cache bundle schema、0.80 阈值、benchmark/E、跨日与 close-final 规则不变。内部批次诊断随 frame attrs 传递，不扩展公开 DTO。
+
+### 18.3 真实交易时段证据
+
+- 2026-08-10 13:42 +08 的唯一公共 `QuoteSnapshotAdapter.load()` 使用 2026-08-06 clean/full 的 5203-code 分母。
+- 87/87 批成功，最大并发 8，股票收集 2.953 秒，公共入口 3.860 秒；raw 5203、normalized 5202、coverage 0.999808，provider 当日比例 1.0。
+- batch latency p50 0.078 秒、p95 0.234 秒、max 2.110 秒；provider timestamp 范围为 13:41:57–13:43:02。
+- Tencent benchmark 返回 `000852=7670.07`。新 Python 进程 `cache_only` 的 attempts=0、from_cache=true，frame/benchmark/as-of 与 bundle SHA-256 完全一致。
+- 四个生产数据库 SHA-256 前后相同；没有 migration 或生产数据库写入。本证据状态为 `real-env-verified`，但不构成生产 migration 授权。

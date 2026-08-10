@@ -3,6 +3,8 @@ from __future__ import annotations
 import datetime as dt
 import os
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -41,7 +43,143 @@ def _intraday_history(code: str = "601999", target_date: str = "2026-06-18") -> 
     )
 
 
+def _tencent_test_codes(count: int = 5_203) -> tuple[str, ...]:
+    return tuple(
+        [f"{index:06d}" for index in range(min(count, 4_000))]
+        + [f"{300_000 + index:06d}" for index in range(max(0, count - 4_000))]
+    )
+
+
+def _tencent_test_payload(codes: tuple[str, ...]) -> dict[str, dict[str, object]]:
+    observed = dt.datetime(2026, 8, 10, 10, 15)
+    return {
+        code: {
+            "code": code,
+            "name": f"Stock {code}",
+            "now": 10.0,
+            "close": 9.8,
+            "open": 9.9,
+            "high": 10.1,
+            "low": 9.7,
+            "volume": 12_000_000,
+            "成交额(万)": 120_000_000,
+            "datetime": observed,
+        }
+        for code in codes
+    }
+
+
+def _structured_frame_worker(result_queue) -> None:
+    frame = pd.DataFrame([{"sec_code": "600001"}])
+    frame.attrs["tencent_batch_diagnostics"] = {"success_batches": 1, "timeout_batches": 1}
+    result_queue.put(("ok", frame))
+
+
 class IntradayLaunchTests(unittest.TestCase):
+    def test_parent_process_receives_structured_partial_frame(self) -> None:
+        from mining.intraday import _call_frame_worker_with_timeout
+
+        frame = _call_frame_worker_with_timeout(
+            _structured_frame_worker,
+            (),
+            "structured_partial",
+            3.0,
+        )
+
+        self.assertEqual(list(frame["sec_code"]), ["600001"])
+        self.assertEqual(frame.attrs["tencent_batch_diagnostics"]["success_batches"], 1)
+        self.assertEqual(frame.attrs["tencent_batch_diagnostics"]["timeout_batches"], 1)
+
+    def test_tencent_87_batch_executor_limits_concurrency_and_keeps_partial_results(self) -> None:
+        from mining.intraday import _fetch_tencent_batches
+
+        codes = _tencent_test_codes()
+        lock = threading.Lock()
+        active = 0
+        observed_max = 0
+        failed_batch_first = codes[10 * 60]
+
+        def fetch(batch: tuple[str, ...], _timeout: float, _prefix: bool):
+            nonlocal active, observed_max
+            with lock:
+                active += 1
+                observed_max = max(observed_max, active)
+            try:
+                time.sleep(0.002)
+                if batch[0] == failed_batch_first:
+                    raise TimeoutError("one slow batch")
+                return _tencent_test_payload(batch)
+            finally:
+                with lock:
+                    active -= 1
+
+        frame, diagnostics = _fetch_tencent_batches(
+            codes,
+            batch_fetcher=fetch,
+            max_workers=8,
+            request_timeout_seconds=0.05,
+            collection_budget_seconds=0.5,
+        )
+
+        self.assertEqual(diagnostics["total_batches"], 87)
+        self.assertEqual(diagnostics["success_batches"], 86)
+        self.assertEqual(diagnostics["timeout_batches"], 1)
+        self.assertEqual(diagnostics["error_batches"], 0)
+        self.assertLessEqual(observed_max, 8)
+        self.assertLessEqual(diagnostics["max_concurrency"], 8)
+        self.assertEqual(len(frame), len(codes) - 60)
+        self.assertGreater(diagnostics["received_codes"], 0.80 * len(codes))
+        self.assertEqual(diagnostics["missing_codes"], 60)
+
+    def test_tencent_batch_deadline_returns_completed_rows_before_parent_budget(self) -> None:
+        from mining.intraday import _fetch_tencent_batches
+
+        codes = _tencent_test_codes(600)
+
+        def fetch(batch: tuple[str, ...], _timeout: float, _prefix: bool):
+            if batch[0] == codes[60]:
+                time.sleep(0.25)
+            else:
+                time.sleep(0.002)
+            return _tencent_test_payload(batch)
+
+        started = time.monotonic()
+        frame, diagnostics = _fetch_tencent_batches(
+            codes,
+            batch_fetcher=fetch,
+            max_workers=2,
+            request_timeout_seconds=0.2,
+            collection_budget_seconds=0.06,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.20)
+        self.assertGreater(len(frame), 0)
+        self.assertGreaterEqual(diagnostics["timeout_batches"], 1)
+        self.assertEqual(diagnostics["success_batches"] + diagnostics["timeout_batches"] + diagnostics["error_batches"], 10)
+
+    def test_tencent_batch_merge_deduplicates_and_excludes_beijing_codes(self) -> None:
+        from mining.intraday import _fetch_tencent_batches
+
+        requested = ("600001", "600001", "000001", "920001")
+
+        def fetch(batch: tuple[str, ...], _timeout: float, _prefix: bool):
+            return _tencent_test_payload(batch)
+
+        frame, diagnostics = _fetch_tencent_batches(
+            requested,
+            batch_fetcher=fetch,
+            max_workers=4,
+            request_timeout_seconds=0.2,
+            collection_budget_seconds=0.5,
+        )
+
+        self.assertEqual(list(frame["sec_code"]), ["000001", "600001"])
+        self.assertEqual(diagnostics["requested_codes"], 3)
+        self.assertEqual(diagnostics["received_codes"], 2)
+        self.assertEqual(diagnostics["missing_codes"], 1)
+        self.assertEqual(diagnostics["provider_timestamp_min"], "2026-08-10T10:15:00")
+        self.assertEqual(diagnostics["provider_timestamp_max"], "2026-08-10T10:15:00")
     def test_intraday_matches_eod_when_synthetic_bar_matches_eod_bar(self) -> None:
         from mining.db import connect
         from mining.intraday import scan_intraday
