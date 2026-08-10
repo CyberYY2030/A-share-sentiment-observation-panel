@@ -235,6 +235,35 @@ def _insert_source_candidate(conn: sqlite3.Connection, strategy_id: str, trade_d
     )
 
 
+def _insert_stock_bar(conn: sqlite3.Connection, code: str, trade_date: str, close: float) -> None:
+    pre_close = round(close * 0.99, 2)
+    conn.execute(
+        """
+        INSERT OR REPLACE INTO ash.kline_daily (
+          sec_type, sec_code, trade_date, open, high, low, close, pre_close,
+          change, change_pct, volume, amount, turnover_ratio, source, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            "stock",
+            code,
+            trade_date,
+            pre_close,
+            round(close * 1.02, 2),
+            round(close * 0.98, 2),
+            close,
+            pre_close,
+            round(close - pre_close, 2),
+            round((close / pre_close - 1.0) * 100.0, 2),
+            10_000_000,
+            10_000_000 * close,
+            3.0,
+            "unit-test",
+            "2026-04-10 00:00:00",
+        ),
+    )
+
+
 def _seed_second_launch_path(conn: sqlite3.Connection, target_day: str, shrink: bool = True) -> str:
     trade_days = trading_days("2026-02-20", 40)
     target_index = trade_days.index(target_day)
@@ -1511,6 +1540,163 @@ class MiningPipelineTests(unittest.TestCase):
         self.assertEqual(result["partial"], 1)
         self.assertEqual(row["status"], "partial")
         self.assertIsNone(row["r5"])
+
+    def test_backfill_snapshot_outcomes_progresses_as_future_bars_arrive(self) -> None:
+        from mining.backtest import backfill_snapshot_outcomes
+        from mining.db import connect
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            future_days = trading_days("2026-02-20", 45)
+            latest_day = dates["t_plus_5"]
+            conn = connect(base_dir=base)
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO watchlist_snapshots (
+                      snapshot_date, sec_code, sec_name, state, triage, entry_price,
+                      created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (latest_day, "600001", "Alpha", "回踩到位", 1.0, 10.0, "2026-04-10 00:00:00"),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO watchlist_outcomes (
+                      snapshot_date, sec_code, state, backfilled_at, status
+                    ) VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (latest_day, "600001", "回踩到位", "2026-04-10 00:00:00", "delisted"),
+                )
+                conn.commit()
+
+                skipped = backfill_snapshot_outcomes(conn, snapshot_date=latest_day, force=True)
+                stale = conn.execute(
+                    """
+                    SELECT status FROM watchlist_outcomes
+                    WHERE snapshot_date=? AND sec_code='600001' AND state='回踩到位'
+                    """,
+                    (latest_day,),
+                ).fetchone()
+
+                _insert_stock_bar(conn, "600001", future_days[40], 18.2)
+                _insert_stock_bar(conn, "600001", future_days[41], 18.4)
+                conn.commit()
+                partial = backfill_snapshot_outcomes(conn, snapshot_date=latest_day)
+                partial_row = conn.execute(
+                    """
+                    SELECT status, close_t2, close_t5
+                    FROM watchlist_outcomes
+                    WHERE snapshot_date=? AND sec_code='600001' AND state='回踩到位'
+                    """,
+                    (latest_day,),
+                ).fetchone()
+
+                for idx, close in [(42, 18.6), (43, 18.8), (44, 19.0)]:
+                    _insert_stock_bar(conn, "600001", future_days[idx], close)
+                conn.commit()
+                complete = backfill_snapshot_outcomes(conn, snapshot_date=latest_day)
+                complete_row = conn.execute(
+                    """
+                    SELECT status, close_t5
+                    FROM watchlist_outcomes
+                    WHERE snapshot_date=? AND sec_code='600001' AND state='回踩到位'
+                    """,
+                    (latest_day,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(skipped["processed"], 1)
+        self.assertEqual(skipped["skipped"], 1)
+        self.assertIsNone(stale)
+        self.assertEqual(partial["processed"], 1)
+        self.assertEqual(partial["partial"], 1)
+        self.assertEqual(partial_row["status"], "partial")
+        self.assertIsNotNone(partial_row["close_t2"])
+        self.assertIsNone(partial_row["close_t5"])
+        self.assertEqual(complete["processed"], 1)
+        self.assertEqual(complete["complete"], 1)
+        self.assertEqual(complete_row["status"], "complete")
+        self.assertAlmostEqual(complete_row["close_t5"], 19.0)
+
+    def test_backfill_outcomes_heals_existing_delisted_status_incrementally(self) -> None:
+        from mining.backtest import backfill_outcomes
+        from mining.db import connect
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _insert_source_candidate(conn, "unit_heal", dates["target_trade_date"], "600001", "Alpha")
+                candidate_id = conn.execute(
+                    "SELECT candidate_id FROM candidates WHERE strategy_id='unit_heal'"
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO outcomes (candidate_id, backfilled_at, status) VALUES (?, ?, ?)",
+                    (candidate_id, "2026-04-10 00:00:00", "delisted"),
+                )
+                conn.commit()
+
+                result = backfill_outcomes(conn, trade_date=dates["target_trade_date"])
+                row = conn.execute(
+                    "SELECT status, close_t5 FROM outcomes WHERE candidate_id=?",
+                    (candidate_id,),
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual(result["complete"], 1)
+        self.assertEqual(row["status"], "complete")
+        self.assertIsNotNone(row["close_t5"])
+
+    def test_execute_daily_pipeline_heals_older_partial_outcomes(self) -> None:
+        from mining.db import connect
+        from run_daily import execute_daily_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                _insert_source_candidate(conn, "unit_history", dates["target_trade_date"], "600001", "Alpha")
+                candidate_id = conn.execute(
+                    "SELECT candidate_id FROM candidates WHERE strategy_id='unit_history'"
+                ).fetchone()[0]
+                conn.execute(
+                    "INSERT INTO outcomes (candidate_id, close_t1, backfilled_at, status) VALUES (?, ?, ?, ?)",
+                    (candidate_id, 18.0, "2026-04-10 00:00:00", "partial"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            execute_daily_pipeline(
+                base_dir=base,
+                trade_date=dates["t_plus_5"],
+                refresh=False,
+                out_dir=base / "output",
+                emit_reports=False,
+            )
+
+            conn = sqlite3.connect(base / "mining_mvp.db")
+            try:
+                row = conn.execute(
+                    """
+                    SELECT o.status, o.close_t5
+                    FROM outcomes o
+                    JOIN candidates c ON c.candidate_id=o.candidate_id
+                    WHERE c.strategy_id='unit_history'
+                    """
+                ).fetchone()
+            finally:
+                conn.close()
+
+        self.assertEqual(row[0], "complete")
+        self.assertIsNotNone(row[1])
 
 if __name__ == "__main__":
     unittest.main()

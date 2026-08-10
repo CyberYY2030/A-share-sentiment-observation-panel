@@ -1,4 +1,4 @@
-"""Backfill & Update Equity ETF shares (份额) into a dedicated SQLite DB.
+﻿"""Backfill & Update Equity ETF shares (份额) into a dedicated SQLite DB.
 
 Goal
 ----
@@ -37,6 +37,8 @@ import re
 import sqlite3
 import sys
 import time
+from contextlib import contextmanager
+from io import BytesIO
 from typing import Iterable, List, Optional, Tuple
 
 import pandas as pd
@@ -243,12 +245,29 @@ def ref_dates_cover_asof(dates: List[str], asof: Optional[str]) -> bool:
         return False
 
 
+@contextmanager
+def _read_excel_accepts_bytes():
+    original = pd.read_excel
+
+    def wrapped(io, *args, **kwargs):
+        if isinstance(io, (bytes, bytearray)):
+            io = BytesIO(io)
+        return original(io, *args, **kwargs)
+
+    pd.read_excel = wrapped
+    try:
+        yield
+    finally:
+        pd.read_excel = original
+
+
 def _safe_call(fn, *args, **kwargs):
     # basic retries for transient network issues
     last = None
     for i in range(3):
         try:
-            return fn(*args, **kwargs)
+            with _read_excel_accepts_bytes():
+                return fn(*args, **kwargs)
         except Exception as e:
             last = e
             time.sleep(1.2 * (i + 1))
@@ -486,3 +505,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+

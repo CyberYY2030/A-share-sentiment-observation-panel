@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import sqlite3
 import subprocess
 import sys
@@ -682,6 +683,296 @@ def _flush_akshare_rows(con: sqlite3.Connection, rows: list[dict[str, Any]]) -> 
     return written
 
 
+
+def _max_date_from_table(
+    db_path: str | Path,
+    table: str,
+    date_column: str,
+    where_sql: str = "",
+    params: tuple[Any, ...] = (),
+) -> str | None:
+    if not Path(db_path).exists():
+        return None
+    con = _connect(db_path)
+    try:
+        if not _table_exists(con, table):
+            return None
+        where = f"WHERE {where_sql}" if where_sql else ""
+        value = _scalar(
+            con,
+            f"SELECT MAX(substr(replace({date_column}, '/', '-'), 1, 10)) FROM {table} {where}",
+            params,
+        )
+        return normalize_day(value)
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def _stock_trade_calendar_for_health(stock_db: str | Path) -> list[str]:
+    if not Path(stock_db).exists():
+        return []
+    con = _connect(stock_db)
+    try:
+        if not _table_exists(con, "kline_daily"):
+            return []
+        rows = con.execute(
+            """
+            SELECT DISTINCT substr(replace(trade_date, '/', '-'), 1, 10) AS trade_date
+            FROM kline_daily
+            WHERE sec_type='stock'
+            ORDER BY trade_date
+            """
+        ).fetchall()
+        return [day for day in (normalize_day(row[0]) for row in rows) if day]
+    except Exception:
+        return []
+    finally:
+        con.close()
+
+
+def _lag_vs_stock(calendar: list[str], stock_max_date: str | None, domain_date: str | None) -> int | None:
+    if not calendar or not stock_max_date or not domain_date:
+        return None
+    if domain_date >= stock_max_date:
+        return 0
+    return sum(1 for day in calendar if domain_date < day <= stock_max_date)
+
+
+def _etf_effective_max_date(etf_db: str | Path) -> str | None:
+    scale = _max_date_from_table(etf_db, "etf_scale", "trade_date")
+    total = _max_date_from_table(etf_db, "etf_total", "trade_date")
+    dates = [day for day in (scale, total) if day]
+    if len(dates) == 2:
+        return min(dates)
+    return dates[0] if dates else None
+
+
+def _status_distribution(db_path: str | Path, table: str) -> tuple[dict[str, int], int]:
+    if not Path(db_path).exists():
+        return {}, 0
+    con = _connect(db_path)
+    try:
+        if not _table_exists(con, table):
+            return {}, 0
+        rows = con.execute(
+            f"SELECT COALESCE(status, 'n/a') AS status, COUNT(*) FROM {table} GROUP BY COALESCE(status, 'n/a')"
+        ).fetchall()
+        distribution = {str(row[0]): int(row[1]) for row in rows}
+        return distribution, int(distribution.get("complete", 0))
+    except Exception:
+        return {}, 0
+    finally:
+        con.close()
+
+
+def _count_rows_for_day(db_path: str | Path, table: str, date_column: str, target_date: str | None) -> int | None:
+    if not target_date or not Path(db_path).exists():
+        return None
+    con = _connect(db_path)
+    try:
+        if not _table_exists(con, table):
+            return None
+        return int(
+            _scalar(
+                con,
+                f"SELECT COUNT(*) FROM {table} WHERE substr(replace({date_column}, '/', '-'), 1, 10)=?",
+                (target_date,),
+            )
+            or 0
+        )
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def _health_errors(update_result: dict[str, Any] | None) -> list[str]:
+    if not update_result:
+        return []
+    errors: list[str] = []
+    for command in update_result.get("commands", []) or []:
+        rc = int(command.get("returncode") or 0)
+        if rc != 0:
+            output = str(command.get("output") or "").strip().splitlines()
+            detail = output[-1] if output else "no output"
+            errors.append(f"{command.get('domain', 'unknown')} rc={rc}: {detail[:300]}")
+        output_text = str(command.get("output") or "")
+        for line in output_text.splitlines():
+            if "watchlist_validation" in line and "error" in line:
+                errors.append(f"watchlist_validation.error: {line[:300]}")
+    for line in update_result.get("logs", []) or []:
+        text = str(line)
+        if " not found" in text or " error=" in text and not text.endswith("error=None"):
+            errors.append(text[:300])
+    return errors
+
+
+def write_health_summary(base_dir: str | Path, update_result: dict[str, Any] | None = None) -> dict[str, Any]:
+    paths = build_runtime_paths(str(base_dir))
+    base = Path(paths.base_dir)
+    output_dir = base / "output"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    state_path = output_dir / "health_state.json"
+    health_path = output_dir / "health_latest.md"
+    mining_db = base / "mining_mvp.db"
+
+    calendar = _stock_trade_calendar_for_health(paths.stock_db)
+    stock_max = calendar[-1] if calendar else _max_date_from_table(paths.stock_db, "kline_daily", "trade_date", "sec_type='stock'")
+    plan_dates = ((update_result or {}).get("plan") or {}).get("expected_dates") or []
+    target_date = normalize_day(plan_dates[-1]) if plan_dates else stock_max
+
+    domain_dates = {
+        "stock": stock_max,
+        "index": _max_date_from_table(paths.stock_db, "kline_daily", "trade_date", "sec_type='index'"),
+        "concept": _max_date_from_table(paths.concept_db, "concept_kline", "trade_date")
+        or _max_date_from_table(paths.concept_db, "concept_kline_ths", "trade_date"),
+        "etf": _etf_effective_max_date(paths.etf_db),
+        "mining candidates": _max_date_from_table(mining_db, "candidates", "trade_date"),
+        "watchlist_snapshots": _max_date_from_table(mining_db, "watchlist_snapshots", "snapshot_date"),
+    }
+    freshness = {
+        domain: {
+            "max_date": day,
+            "lag_vs_stock_days": _lag_vs_stock(calendar, stock_max, day),
+        }
+        for domain, day in domain_dates.items()
+    }
+
+    today_rows = {
+        "candidates": _count_rows_for_day(mining_db, "candidates", "trade_date", target_date),
+        "watchlist_snapshots": _count_rows_for_day(mining_db, "watchlist_snapshots", "snapshot_date", target_date),
+    }
+    outcome_status, outcome_complete = _status_distribution(mining_db, "outcomes")
+    snapshot_status, snapshot_complete = _status_distribution(mining_db, "watchlist_outcomes")
+
+    previous: dict[str, Any] = {}
+    if state_path.exists():
+        try:
+            previous = json.loads(state_path.read_text(encoding="utf-8"))
+        except Exception:
+            previous = {}
+    previous_complete = previous.get("complete_counts") or {}
+    previous_streaks = previous.get("zero_complete_delta_streaks") or {}
+    complete_counts = {"outcomes": outcome_complete, "watchlist_outcomes": snapshot_complete}
+    complete_delta = {
+        table: int(count) - int(previous_complete.get(table, 0))
+        for table, count in complete_counts.items()
+    }
+    zero_streaks = {
+        table: (int(previous_streaks.get(table, 0)) + 1 if delta == 0 else 0)
+        for table, delta in complete_delta.items()
+    }
+
+    errors = _health_errors(update_result)
+    alerts: list[str] = []
+    for domain, info in freshness.items():
+        lag = info.get("lag_vs_stock_days")
+        if lag is not None and lag > 2:
+            alerts.append(f"[ALERT] {domain} lag_vs_stock_days={lag} max_date={info.get('max_date') or 'n/a'}")
+    for table, streak in zero_streaks.items():
+        if streak >= 3:
+            alerts.append(f"[ALERT] {table} complete_delta_zero_streak={streak}")
+    if errors:
+        alerts.append(f"[ALERT] domain_errors={len(errors)}")
+
+    generated_at = dt.datetime.now().isoformat(timespec="seconds")
+    lines = [
+        "# Daily Health",
+        "",
+        f"generated_at: {generated_at}",
+        f"target_date: {target_date or 'n/a'}",
+        f"update_ok: {bool((update_result or {}).get('ok')) if update_result is not None else 'n/a'}",
+        "",
+        "## Data Freshness",
+        "",
+        "| domain | max_date | lag_vs_stock_days |",
+        "| --- | --- | ---: |",
+    ]
+    for domain, info in freshness.items():
+        lag = info.get("lag_vs_stock_days")
+        lines.append(f"| {domain} | {info.get('max_date') or 'n/a'} | {lag if lag is not None else 'n/a'} |")
+    lines.extend(
+        [
+            "",
+            "## Today Writes",
+            "",
+            f"- candidates: {today_rows['candidates'] if today_rows['candidates'] is not None else 'n/a'}",
+            f"- watchlist_snapshots: {today_rows['watchlist_snapshots'] if today_rows['watchlist_snapshots'] is not None else 'n/a'}",
+            "",
+            "## Outcome Status",
+            "",
+            f"- outcomes: {outcome_status or 'n/a'}; complete_delta={complete_delta['outcomes']}",
+            f"- watchlist_outcomes: {snapshot_status or 'n/a'}; complete_delta={complete_delta['watchlist_outcomes']}",
+            "",
+            "## Errors",
+            "",
+        ]
+    )
+    lines.extend([f"- {error}" for error in errors] or ["- none"])
+    lines.extend(["", "## Alerts", ""])
+    lines.extend(alerts or ["- none"])
+    health_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    state = {
+        "generated_at": generated_at,
+        "target_date": target_date,
+        "complete_counts": complete_counts,
+        "zero_complete_delta_streaks": zero_streaks,
+        "health_path": str(health_path),
+    }
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True), encoding="utf-8")
+    return {
+        "path": str(health_path),
+        "state_path": str(state_path),
+        "target_date": target_date,
+        "freshness": freshness,
+        "today_rows": today_rows,
+        "outcome_status": {"outcomes": outcome_status, "watchlist_outcomes": snapshot_status},
+        "complete_delta": complete_delta,
+        "alerts": alerts,
+        "errors": errors,
+    }
+
+
+def _append_push_status(health_path: str | Path | None, push_result: dict[str, Any]) -> None:
+    if not health_path:
+        return
+    path = Path(health_path)
+    if not path.exists():
+        return
+    status = str(push_result.get("status") or "unknown")
+    reason = push_result.get("reason") or push_result.get("error")
+    detail = f"{status}: {reason}" if reason else status
+    body = path.read_text(encoding="utf-8").rstrip()
+    marker = "\n## Push\n"
+    if marker in body:
+        body = body.split(marker, 1)[0].rstrip()
+    path.write_text(f"{body}\n\n## Push\n\n- push: {detail}\n", encoding="utf-8")
+
+
+def _send_daily_push(base_dir: str | Path, health: dict[str, Any]) -> dict[str, Any]:
+    trade_date = health.get("target_date")
+    if not trade_date:
+        result = {"status": "skipped", "reason": "no target_date"}
+        _append_push_status(health.get("path"), result)
+        return result
+    try:
+        from mining.db import connect
+        from mining.notify import send_daily_digest
+
+        conn = connect(base_dir=base_dir)
+        try:
+            result = send_daily_digest(conn, str(trade_date))
+        finally:
+            conn.close()
+    except Exception as exc:
+        result = {"status": "failed", "error": str(exc)}
+    _append_push_status(health.get("path"), result)
+    return result
+
+
 def akshare_stock_index_backfill(
     stock_db: str | Path,
     day: str,
@@ -861,7 +1152,10 @@ def run_offline_update(
     _emit(logs, f"missing_by_day={plan.get('missing_by_day')}")
     _emit(logs, f"missing_by_domain={plan.get('missing_by_domain')}")
     if dry_run or plan.get("ok"):
-        return {"ok": bool(plan.get("ok")), "plan": plan, "logs": logs, "commands": []}
+        result = {"ok": bool(plan.get("ok")), "plan": plan, "logs": logs, "commands": []}
+        result["health"] = write_health_summary(paths.base_dir, result)
+        result["push"] = _send_daily_push(paths.base_dir, result["health"])
+        return result
 
     commands: list[dict[str, Any]] = []
 
@@ -1017,7 +1311,10 @@ def run_offline_update(
     if marked_bad_days:
         _emit(logs, f"known_bad_sessions={marked_bad_days}")
         final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
-    return {"ok": bool(final_plan.get("ok")), "plan": final_plan, "initial_plan": plan, "logs": logs, "commands": commands}
+    result = {"ok": bool(final_plan.get("ok")), "plan": final_plan, "initial_plan": plan, "logs": logs, "commands": commands}
+    result["health"] = write_health_summary(paths.base_dir, result)
+    result["push"] = _send_daily_push(paths.base_dir, result["health"])
+    return result
 
 
 def main() -> int:
@@ -1045,6 +1342,9 @@ def main() -> int:
         output = command.get("output")
         if output:
             print(output)
+    health = result.get("health") or {}
+    if health.get("path"):
+        print(f"health={health.get('path')}")
     print(f"ok={bool(result.get('ok'))}")
     return 0 if result.get("ok") or args.dry_run else 1
 

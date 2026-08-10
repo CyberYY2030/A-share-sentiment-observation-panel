@@ -20,7 +20,7 @@ Then read only the files listed for that slice.
 - `app.py` is the Streamlit entrypoint. It only imports and calls `app_panel.main()`.
 - `app_panel.py` is the current main dashboard implementation. It contains auto-backfill checks, SQLite access, market sentiment calculations, intraday snapshot handling, and Streamlit rendering in one large module.
 - `backfill_orchestrator.py` starts long-running backfill scripts outside the Streamlit render thread and writes their output to `output/backfill_jobs/`.
-- `offline_daily_update.py` is the offline daily updater. It detects missing dates/domains across stock, index, concept, ETF, and mining outputs, then runs the needed backfill scripts with bounded retries.
+- `offline_daily_update.py` is the offline daily updater. It detects missing dates/domains across stock, index, concept, ETF, and mining outputs, then runs the needed backfill scripts with bounded retries. `daily_job.ps1` is the schedulable wrapper; it writes logs under `output/backfill_jobs/`, the latest health summary to `output/health_latest.md`, and an optional Telegram digest when `TG_BOT_TOKEN`/`TG_CHAT_ID` or ignored `data/notify_config.json` is configured.
 - `repair_market_day_akshare.py` repairs one market day of stock/index daily rows through AkShare fallback sources when the BaoStock path cannot fill a date.
 - `runtime_paths.py` centralizes local path resolution for `data/`, root-level legacy DBs, metrics CSVs, and runtime directories.
 - `run_daily.py` is the CLI entrypoint for the mining pipeline. It refreshes basics, runs scanners, persists candidates/outcomes, and emits reports.
@@ -170,6 +170,12 @@ For syntax-only sanity:
 
 ```powershell
 python -m py_compile app.py app_panel.py runtime_paths.py backfill_orchestrator.py offline_daily_update.py repair_market_day_akshare.py run_daily.py
+```
+
+For the schedulable daily update wrapper:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\daily_job.ps1 --dry-run --asof 2026-04-22 --days 1 --timeout-sec 30
 ```
 
 ## Communication

@@ -91,6 +91,16 @@ Run recent missing-data repair:
 python offline_daily_update.py --base-dir . --asof 2026-04-22 --days 10
 ```
 
+Run the schedulable daily job entrypoint and write health/log outputs:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\daily_job.ps1
+```
+
+Latest health summary: `output/health_latest.md`; state for complete-delta alerts: `output/health_state.json`; job logs: `output/backfill_jobs/`.
+
+Daily Telegram push is optional. Credentials are read from `TG_BOT_TOKEN`/`TG_CHAT_ID` or ignored `data/notify_config.json`; never write tokens or chat IDs into code, docs, logs, or commits.
+
 Run opportunity-mining pipeline for a date range:
 
 ```powershell

@@ -86,6 +86,7 @@ class BaseBreakoutTests(unittest.TestCase):
         extra = context.bars[context.bars["sec_code"].eq("600001")].copy()
         extra["sec_code"] = "600003"
         extra.loc[extra.index[-1], "turnover_ratio"] = 5.0
+        extra.loc[extra.index[-1], "amount"] = 500_000_000.0
         context.bars = pd.concat([context.bars, extra], ignore_index=True)
         context.universe = pd.concat(
             [context.universe, pd.DataFrame([{"sec_code": "600003", "sec_name": "Second", "board": "main"}])],

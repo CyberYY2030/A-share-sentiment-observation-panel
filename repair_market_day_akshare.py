@@ -29,6 +29,7 @@ KLINE_COLS = [
 ]
 
 REQUIRED_INDEX_CODES = ("000001", "399001", "000300", "000852")
+MAX_FALLBACK_CLOSE_JUMP = 0.30
 
 
 def now_iso() -> str:
@@ -36,10 +37,21 @@ def now_iso() -> str:
 
 
 def market_prefix(code: str) -> str:
-    code = str(code).zfill(6)
-    if code.startswith(("600", "601", "603", "605", "688", "000001", "000300", "000852")):
+    code = "".join(ch for ch in str(code) if ch.isdigit())[-6:].zfill(6)
+    if code.startswith(("000", "001", "002", "003", "300", "301")):
+        return "sz"
+    if code.startswith(("60", "68")):
         return "sh"
+    if code.startswith(("8", "4", "9")):
+        return "bj"
     return "sz"
+
+
+def index_market_prefix(code: str) -> str:
+    code = "".join(ch for ch in str(code) if ch.isdigit())[-6:].zfill(6)
+    if code.startswith("399"):
+        return "sz"
+    return "sh"
 
 
 def normalize_day(value: str) -> tuple[str, str]:
@@ -252,20 +264,119 @@ def fetch_stock_tx(code: str, day_dash: str, day_compact: str) -> dict[str, Any]
 
 
 def fetch_index_sina(code: str, day_dash: str, day_compact: str) -> dict[str, Any]:
-    row = fetch_stock_sina(code, day_dash, day_compact)
-    row["sec_type"] = "index"
-    row["source"] = "akshare_stock_zh_a_daily_index"
-    return row
+    import akshare as ak  # type: ignore
+
+    symbol = index_market_prefix(code) + code
+    df = ak.stock_zh_a_daily(symbol=symbol, start_date=day_compact, end_date=day_compact, adjust="")
+    if df is None or df.empty:
+        raise RuntimeError("empty dataframe")
+    row = df.iloc[-1]
+    return {
+        "sec_type": "index",
+        "sec_code": code,
+        "trade_date": day_dash,
+        "open": _num(row, "open"),
+        "high": _num(row, "high"),
+        "low": _num(row, "low"),
+        "close": _num(row, "close"),
+        "pre_close": None,
+        "change": None,
+        "change_pct": None,
+        "volume": _num(row, "volume"),
+        "amount": _num(row, "amount"),
+        "turnover_ratio": _num(row, "turnover"),
+        "source": "akshare_stock_zh_a_daily_index",
+        "updated_at": now_iso(),
+    }
 
 
 def fetch_index_tx(code: str, day_dash: str, day_compact: str) -> dict[str, Any]:
-    row = fetch_stock_tx(code, day_dash, day_compact)
-    row["sec_type"] = "index"
-    row["source"] = "akshare_stock_zh_a_hist_tx_index"
-    # Tencent's column named "amount" is volume-like for indexes; leave amount empty
-    # so the dashboard can fall back to stock turnover instead of using a wrong unit.
-    row["amount"] = None
-    return row
+    import akshare as ak  # type: ignore
+
+    symbol = index_market_prefix(code) + code
+    df = ak.stock_zh_a_hist_tx(
+        symbol=symbol,
+        start_date=day_compact,
+        end_date=day_compact,
+        adjust="",
+        timeout=10,
+    )
+    if df is None or df.empty:
+        raise RuntimeError("empty dataframe")
+    row = df.iloc[-1]
+    volume_hands = _num(row, "amount")
+    return {
+        "sec_type": "index",
+        "sec_code": code,
+        "trade_date": day_dash,
+        "open": _num(row, "open"),
+        "high": _num(row, "high"),
+        "low": _num(row, "low"),
+        "close": _num(row, "close"),
+        "pre_close": None,
+        "change": None,
+        "change_pct": None,
+        "volume": volume_hands * 100.0 if volume_hands is not None else None,
+        "amount": None,
+        "turnover_ratio": None,
+        "source": "akshare_stock_zh_a_hist_tx_index",
+        "updated_at": now_iso(),
+    }
+
+
+
+def _latest_stock_close_before(conn: sqlite3.Connection, code: str, trade_date: str) -> float | None:
+    row = conn.execute(
+        """
+        SELECT close
+        FROM kline_daily
+        WHERE sec_type='stock'
+          AND sec_code=?
+          AND trade_date < ?
+          AND close IS NOT NULL
+        ORDER BY trade_date DESC
+        LIMIT 1
+        """,
+        (code, trade_date),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return None
+    try:
+        return float(row[0])
+    except Exception:
+        return None
+
+
+def _passes_continuity_guard(row: dict[str, Any], previous_close: float | None, max_jump: float = MAX_FALLBACK_CLOSE_JUMP) -> bool:
+    if row.get("sec_type") != "stock":
+        return True
+    close = row.get("close")
+    try:
+        close_value = float(close)
+    except Exception:
+        return True
+    if previous_close is None or previous_close <= 0:
+        return True
+    return abs(close_value / previous_close - 1.0) <= float(max_jump)
+
+
+def _filter_continuous_stock_rows(
+    conn: sqlite3.Connection,
+    rows: list[dict[str, Any]],
+    *,
+    max_jump: float = MAX_FALLBACK_CLOSE_JUMP,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    accepted: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+    for row in rows:
+        previous_close = _latest_stock_close_before(conn, str(row.get("sec_code", "")), str(row.get("trade_date", "")))
+        if _passes_continuity_guard(row, previous_close, max_jump=max_jump):
+            accepted.append(row)
+        else:
+            blocked = dict(row)
+            blocked["previous_close"] = previous_close
+            rejected.append(blocked)
+    return accepted, rejected
 
 
 def fetch_with_sources(
@@ -354,6 +465,7 @@ def repair_day(
 
     rows: list[dict[str, Any]] = []
     failures: dict[str, list[str]] = {}
+    guard_rejections: list[dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
         futures = {
@@ -377,10 +489,13 @@ def repair_day(
             if i % 200 == 0 or i == len(futures):
                 conn = connect(db_path)
                 try:
-                    n = upsert_rows(conn, rows)
+                    accepted, rejected = _filter_continuous_stock_rows(conn, rows)
+                    guard_rejections.extend(rejected)
+                    n = upsert_rows(conn, accepted)
                     rows = []
                     print(
                         f"[STOCK] progress {i}/{len(futures)} saved_batch={n} "
+                        f"guard_rejected={len(guard_rejections)} "
                         f"failures={len(failures)} elapsed={time.time() - started:.1f}s",
                         flush=True,
                     )
@@ -410,6 +525,8 @@ def repair_day(
         "skipped_existing": int(len(existing_codes)),
         "stock_failures": failures,
         "index_failures": index_failures,
+        "guard_rejections": guard_rejections[:50],
+        "guard_rejection_count": int(len(guard_rejections)),
         "elapsed_sec": round(time.time() - started, 1),
     }
 

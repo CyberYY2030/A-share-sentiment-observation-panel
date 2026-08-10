@@ -54,8 +54,7 @@ class StrongTrendTests(unittest.TestCase):
             index=dates,
             dtype="float64",
         )
-        return (
-            SelectionContext(
+        context = SelectionContext(
                 bars=pd.DataFrame(rows),
                 universe=universe,
                 trade_date=dates[-1],
@@ -66,14 +65,14 @@ class StrongTrendTests(unittest.TestCase):
                 trend_profile=None,
                 data_status="ready",
                 diagnostics={"clean_dates": dates},
-            ),
-            benchmark,
-        )
+            )
+        context.benchmark_returns = benchmark
+        return context, benchmark
 
     def test_a_uses_absolute_gates_and_mutually_exclusive_paths(self) -> None:
         context, benchmark = self._context()
 
-        evaluation = evaluate_strong_trend(context, benchmark_returns=benchmark, min_down_days=3)
+        evaluation = evaluate_strong_trend(context, min_down_days=3)
         tiers = evaluation.rows.set_index("sec_code")["strength_tier"].to_dict()
 
         self.assertEqual(tiers["600001"], "continuation")
@@ -91,7 +90,8 @@ class StrongTrendTests(unittest.TestCase):
     def test_no_benchmark_profile_removes_separation_for_everyone(self) -> None:
         context, _ = self._context()
 
-        evaluation = evaluate_strong_trend(context, benchmark_returns=None)
+        context.benchmark_returns = None
+        evaluation = evaluate_strong_trend(context)
 
         self.assertTrue(evaluation.rows["ranking_profile"].eq("no_benchmark").all())
         self.assertTrue(evaluation.rows["separation_pct"].isna().all())
@@ -100,7 +100,7 @@ class StrongTrendTests(unittest.TestCase):
     def test_history_tiers_are_the_current_a_source_of_truth(self) -> None:
         context, benchmark = self._context()
 
-        evaluation = evaluate_strong_trend(context, benchmark_returns=benchmark)
+        evaluation = evaluate_strong_trend(context)
         history = _a_tier_history(context, context.diagnostics["clean_dates"])
         expected = history.tiers.loc[context.trade_date].dropna().sort_index().to_dict()
         actual = evaluation.rows.set_index("sec_code")["strength_tier"].sort_index().to_dict()
@@ -122,7 +122,7 @@ class StrongTrendTests(unittest.TestCase):
             ]
         context.bars = bars
 
-        evaluation = evaluate_strong_trend(context, benchmark_returns=benchmark)
+        evaluation = evaluate_strong_trend(context)
         history = _a_tier_history(context, context.diagnostics["clean_dates"])
 
         self.assertNotIn("300996", set(evaluation.rows["sec_code"]))
@@ -143,14 +143,14 @@ class StrongTrendTests(unittest.TestCase):
             ]
         context.bars = bars
 
-        evaluation = evaluate_strong_trend(context, benchmark_returns=benchmark)
+        evaluation = evaluate_strong_trend(context)
 
         self.assertTrue(evaluation.rows.empty)
 
     def test_candidates_are_ranked_after_gates_with_only_formal_tiers(self) -> None:
         context, benchmark = self._context()
 
-        candidates = select_from_context(context, benchmark_returns=benchmark)
+        candidates = select_from_context(context)
 
         self.assertEqual([candidate.rank for candidate in candidates], list(range(1, len(candidates) + 1)))
         self.assertTrue(candidates)

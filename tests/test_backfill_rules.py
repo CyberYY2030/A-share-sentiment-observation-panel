@@ -445,5 +445,157 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual(set(fetched_codes), {"600002", "600003"})
 
 
+    def test_health_summary_alerts_on_stale_domain_and_zero_complete_streak(self) -> None:
+        import json
+        import sqlite3
+
+        from offline_daily_update import write_health_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            stock = sqlite3.connect(base / "a_share_mvp.db")
+            try:
+                stock.execute("CREATE TABLE kline_daily (sec_type TEXT, sec_code TEXT, trade_date TEXT, close REAL)")
+                for day in ("2026-04-20", "2026-04-21", "2026-04-22", "2026-04-23", "2026-04-24"):
+                    stock.execute("INSERT INTO kline_daily VALUES ('stock', '600001', ?, 10.0)", (day,))
+                    stock.execute("INSERT INTO kline_daily VALUES ('index', '000001', ?, 3000.0)", (day,))
+                stock.commit()
+            finally:
+                stock.close()
+
+            concept = sqlite3.connect(base / "ths_concept.db")
+            try:
+                concept.execute("CREATE TABLE concept_kline (trade_date TEXT, concept_code TEXT)")
+                concept.execute("INSERT INTO concept_kline VALUES ('2026-04-20', '880001')")
+                concept.commit()
+            finally:
+                concept.close()
+
+            etf = sqlite3.connect(base / "etf_mvp.db")
+            try:
+                etf.execute("CREATE TABLE etf_scale (trade_date TEXT)")
+                etf.execute("CREATE TABLE etf_total (trade_date TEXT)")
+                etf.execute("INSERT INTO etf_scale VALUES ('2026-04-24')")
+                etf.execute("INSERT INTO etf_total VALUES ('2026-04-24')")
+                etf.commit()
+            finally:
+                etf.close()
+
+            mining = sqlite3.connect(base / "mining_mvp.db")
+            try:
+                mining.execute("CREATE TABLE candidates (trade_date TEXT)")
+                mining.execute("CREATE TABLE watchlist_snapshots (snapshot_date TEXT)")
+                mining.execute("CREATE TABLE outcomes (status TEXT)")
+                mining.execute("CREATE TABLE watchlist_outcomes (status TEXT)")
+                mining.executemany("INSERT INTO candidates VALUES (?)", [("2026-04-24",), ("2026-04-24",)])
+                mining.execute("INSERT INTO watchlist_snapshots VALUES ('2026-04-24')")
+                mining.execute("INSERT INTO outcomes VALUES ('complete')")
+                mining.commit()
+            finally:
+                mining.close()
+
+            output = base / "output"
+            output.mkdir()
+            (output / "health_state.json").write_text(
+                json.dumps(
+                    {
+                        "complete_counts": {"outcomes": 0, "watchlist_outcomes": 0},
+                        "zero_complete_delta_streaks": {"outcomes": 0, "watchlist_outcomes": 2},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            result = write_health_summary(
+                base,
+                {
+                    "ok": False,
+                    "plan": {"expected_dates": ["2026-04-24"]},
+                    "commands": [{"domain": "etf", "returncode": 999, "output": "source down"}],
+                    "logs": [],
+                },
+            )
+            body = Path(result["path"]).read_text(encoding="utf-8")
+
+        self.assertEqual(result["today_rows"]["candidates"], 2)
+        self.assertEqual(result["today_rows"]["watchlist_snapshots"], 1)
+        self.assertIn("[ALERT] concept lag_vs_stock_days=4", body)
+        self.assertIn("[ALERT] watchlist_outcomes complete_delta_zero_streak=3", body)
+        self.assertIn("[ALERT] domain_errors=1", body)
+
+    def test_health_summary_handles_missing_tables_as_na(self) -> None:
+        from offline_daily_update import write_health_summary
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            result = write_health_summary(base, {"ok": True, "plan": {"expected_dates": ["2026-04-24"]}})
+            body = Path(result["path"]).read_text(encoding="utf-8")
+
+        self.assertIn("| stock | n/a | n/a |", body)
+        self.assertIn("- candidates: n/a", body)
+        self.assertIn("- outcomes: n/a; complete_delta=0", body)
+
+
+
+    def test_repair_market_prefix_maps_stock_and_index_symbols_separately(self) -> None:
+        from repair_market_day_akshare import index_market_prefix, market_prefix
+
+        self.assertEqual(market_prefix("000001"), "sz")
+        self.assertEqual(market_prefix("002001"), "sz")
+        self.assertEqual(market_prefix("300001"), "sz")
+        self.assertEqual(market_prefix("301001"), "sz")
+        self.assertEqual(market_prefix("600001"), "sh")
+        self.assertEqual(market_prefix("688001"), "sh")
+        self.assertEqual(market_prefix("830001"), "bj")
+        self.assertEqual(index_market_prefix("000001"), "sh")
+        self.assertEqual(index_market_prefix("000852"), "sh")
+        self.assertEqual(index_market_prefix("399001"), "sz")
+
+    def test_repair_market_continuity_guard_rejects_index_price_in_stock_rows(self) -> None:
+        from repair_market_day_akshare import _passes_continuity_guard
+
+        self.assertFalse(
+            _passes_continuity_guard(
+                {"sec_type": "stock", "sec_code": "000001", "close": 4000.0},
+                previous_close=10.0,
+                max_jump=0.30,
+            )
+        )
+        self.assertTrue(
+            _passes_continuity_guard(
+                {"sec_type": "stock", "sec_code": "000001", "close": 10.8},
+                previous_close=10.0,
+                max_jump=0.30,
+            )
+        )
+        self.assertTrue(
+            _passes_continuity_guard(
+                {"sec_type": "index", "sec_code": "000001", "close": 4000.0},
+                previous_close=10.0,
+                max_jump=0.30,
+            )
+        )
+
+    def test_etf_safe_call_allows_akshare_read_excel_bytes_payload(self) -> None:
+        from io import BytesIO
+
+        import pandas as pd
+
+        from backfill_etf_equity_60d_v2 import _safe_call
+
+        payload = BytesIO()
+        pd.DataFrame({"基金代码": ["510300"], "基金份额": [1.0]}).to_excel(payload, index=False)
+        raw = payload.getvalue()
+
+        def fake_akshare_endpoint():
+            return pd.read_excel(raw, engine="openpyxl")
+
+        result = _safe_call(fake_akshare_endpoint)
+
+        self.assertEqual(result.iloc[0]["基金代码"], 510300)
+        self.assertEqual(float(result.iloc[0]["基金份额"]), 1.0)
+
+
+
 if __name__ == "__main__":
     unittest.main()

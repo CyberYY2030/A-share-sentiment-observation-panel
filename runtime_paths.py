@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,7 +24,7 @@ def choose_existing_path(candidates: Iterable[Path]) -> Path | None:
 
 
 def build_runtime_paths(base_dir: str) -> RuntimePaths:
-    base = Path(base_dir).resolve()
+    base = Path(base_dir).absolute()
     data_dir = base / "data"
 
     stock_candidates = [
@@ -60,3 +60,4 @@ def build_runtime_paths(base_dir: str) -> RuntimePaths:
 
 def ensure_runtime_dirs(paths: RuntimePaths) -> None:
     Path(paths.data_dir).mkdir(parents=True, exist_ok=True)
+

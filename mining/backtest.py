@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import math
@@ -15,11 +15,16 @@ def _compute_return(numerator: float | None, entry_price: float) -> float | None
     return (float(numerator) - entry_price) / entry_price
 
 
-def _forward_bars(conn: sqlite3.Connection, sec_code: str, trade_date: str) -> dict[str, object] | None:
-    calendar = list_stock_trade_dates(conn)
+def _forward_bars(
+    conn: sqlite3.Connection,
+    sec_code: str,
+    trade_date: str,
+    calendar: list[str] | None = None,
+) -> dict[str, object] | None:
+    calendar = calendar if calendar is not None else list_stock_trade_dates(conn)
     calendar_index = {day: idx for idx, day in enumerate(calendar)}
     idx = calendar_index.get(trade_date)
-    if idx is None:
+    if idx is None or idx + 1 >= len(calendar):
         return None
 
     target_dates = {
@@ -108,7 +113,7 @@ def backfill_outcomes(
             WHERE c.sec_type='stock'
               AND (? IS NULL OR c.trade_date=?)
               AND NOT (c.version=? AND c.strategy_id IN ({formal_marks}))
-              AND (o.candidate_id IS NULL OR o.status='partial')
+              AND (o.candidate_id IS NULL OR o.status != 'complete')
             ORDER BY c.trade_date, c.candidate_id
             """,
             (trade_date, trade_date, SCREENING_DEFINITION_VERSION, *formal_ids),
@@ -117,16 +122,26 @@ def backfill_outcomes(
     processed = 0
     completed = 0
     partial = 0
+    skipped = 0
+    delisted = 0
+    halted = 0
+    calendar = list_stock_trade_dates(conn)
     for row in rows:
         processed += 1
-        bars = _forward_bars(conn, row["sec_code"], row["trade_date"])
+        bars = _forward_bars(conn, row["sec_code"], row["trade_date"], calendar=calendar)
         if bars is None:
+            skipped += 1
+            conn.execute("DELETE FROM outcomes WHERE candidate_id=?", (row["candidate_id"],))
             continue
         values = _forward_outcome_values(float(row["entry_price"]), bars)
         if values["status"] == "complete":
             completed += 1
         elif values["status"] == "partial":
             partial += 1
+        elif values["status"] == "delisted":
+            delisted += 1
+        elif values["status"] == "halted":
+            halted += 1
 
         conn.execute(
             """
@@ -155,7 +170,14 @@ def backfill_outcomes(
         )
 
     conn.commit()
-    return {"processed": processed, "complete": completed, "partial": partial}
+    return {
+        "processed": processed,
+        "complete": completed,
+        "partial": partial,
+        "skipped": skipped,
+        "delisted": delisted,
+        "halted": halted,
+    }
 
 
 def backfill_snapshot_outcomes(
@@ -183,7 +205,7 @@ def backfill_snapshot_outcomes(
              AND o.sec_code=s.sec_code
              AND o.state=s.state
             WHERE (? IS NULL OR s.snapshot_date=?)
-              AND (o.snapshot_date IS NULL OR o.status='partial')
+              AND (o.snapshot_date IS NULL OR o.status != 'complete')
             ORDER BY s.snapshot_date, s.sec_code, s.state
             """,
             (snapshot_date, snapshot_date),
@@ -192,16 +214,32 @@ def backfill_snapshot_outcomes(
     processed = 0
     completed = 0
     partial = 0
+    skipped = 0
+    delisted = 0
+    halted = 0
+    calendar = list_stock_trade_dates(conn)
     for row in rows:
         processed += 1
-        bars = _forward_bars(conn, row["sec_code"], row["snapshot_date"])
+        bars = _forward_bars(conn, row["sec_code"], row["snapshot_date"], calendar=calendar)
         if bars is None:
+            skipped += 1
+            conn.execute(
+                """
+                DELETE FROM watchlist_outcomes
+                WHERE snapshot_date=? AND sec_code=? AND state=?
+                """,
+                (row["snapshot_date"], row["sec_code"], row["state"]),
+            )
             continue
         values = _forward_outcome_values(float(row["entry_price"]), bars)
         if values["status"] == "complete":
             completed += 1
         elif values["status"] == "partial":
             partial += 1
+        elif values["status"] == "delisted":
+            delisted += 1
+        elif values["status"] == "halted":
+            halted += 1
 
         conn.execute(
             """
@@ -233,7 +271,14 @@ def backfill_snapshot_outcomes(
         )
 
     conn.commit()
-    return {"processed": processed, "complete": completed, "partial": partial}
+    return {
+        "processed": processed,
+        "complete": completed,
+        "partial": partial,
+        "skipped": skipped,
+        "delisted": delisted,
+        "halted": halted,
+    }
 
 
 def main() -> None:
@@ -256,4 +301,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 

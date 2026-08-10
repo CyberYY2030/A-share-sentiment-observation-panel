@@ -3,6 +3,7 @@
 __pycache__/
 *.pyc
 
+data/notify_config.json
 data/
 output/
 csv_out/
@@ -17,6 +18,7 @@ __tmp_*/
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 daily_metrics_last40.csv
 daily_matrics_last40.csv
 intraday_metrics_latest.csv

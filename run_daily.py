@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import datetime as dt
@@ -20,8 +20,8 @@ from mining.db import (
     save_candidates,
 )
 from mining.intraday import scan_intraday
-from mining.refresh_basics import refresh_basics
 from mining.history_bootstrap import run_history_bootstrap_dry_run, write_history_bootstrap_report
+from mining.refresh_basics import refresh_basics
 from mining.reports import generate_excel_report, generate_markdown_report
 from mining.scanners import get_registered_scanners
 from mining.selection_context import build_selection_context
@@ -171,7 +171,7 @@ def execute_daily_pipeline(
         formal_results, formal_batch = _run_formal_capabilities(conn, resolved_trade_date)
         legacy_results = _run_legacy_scanners(conn, resolved_trade_date)
         scanner_results = [*formal_results, *legacy_results]
-        backfill_result = backfill_outcomes(conn, trade_date=resolved_trade_date)
+        backfill_result = backfill_outcomes(conn)
         watchlist_validation = None
         try:
             watchlist_rows = persist_watchlist_snapshot(conn, resolved_trade_date)
@@ -311,3 +311,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
