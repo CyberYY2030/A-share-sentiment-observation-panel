@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import math
 import sqlite3
 from collections import Counter
@@ -10,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 
 SESSION_DIAGNOSTICS_TABLE = "selection_session_diagnostics"
+SESSION_REVALIDATIONS_TABLE = "selection_session_revalidations"
 STATUS_CLEAN = "clean"
 STATUS_USABLE_WITH_QUARANTINE = "usable_with_quarantine"
 STATUS_PARTIAL = "partial_missing"
@@ -78,7 +80,7 @@ def _diagnostics_table(conn: sqlite3.Connection) -> str:
     return f"{_schema_prefix(conn)}{SESSION_DIAGNOSTICS_TABLE}"
 
 
-def ensure_session_diagnostics_table(conn: sqlite3.Connection) -> None:
+def ensure_session_diagnostics_table(conn: sqlite3.Connection, *, commit: bool = True) -> None:
     conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {_diagnostics_table(conn)} (
@@ -90,7 +92,31 @@ def ensure_session_diagnostics_table(conn: sqlite3.Connection) -> None:
         )
         """
     )
-    conn.commit()
+    if commit:
+        conn.commit()
+
+
+def ensure_session_revalidations_table(conn: sqlite3.Connection, *, commit: bool = True) -> None:
+    """Create the append-only audit ledger before a caller-owned transaction."""
+    conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {_schema_prefix(conn)}{SESSION_REVALIDATIONS_TABLE} (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trade_date TEXT NOT NULL,
+          revalidated_at TEXT NOT NULL,
+          before_latched INTEGER NOT NULL,
+          before_status TEXT,
+          before_reason TEXT,
+          raw_status TEXT NOT NULL,
+          raw_reasons TEXT NOT NULL,
+          action TEXT NOT NULL,
+          after_status TEXT NOT NULL,
+          after_reasons TEXT NOT NULL
+        )
+        """
+    )
+    if commit:
+        conn.commit()
 
 
 def mark_known_bad_session(
@@ -99,8 +125,9 @@ def mark_known_bad_session(
     *,
     reason: str,
     source_errors: str = "",
+    commit: bool = True,
 ) -> None:
-    ensure_session_diagnostics_table(conn)
+    ensure_session_diagnostics_table(conn, commit=commit)
     conn.execute(
         f"""
         INSERT INTO {_diagnostics_table(conn)} (
@@ -120,13 +147,15 @@ def mark_known_bad_session(
             dt.datetime.now().isoformat(timespec="seconds"),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
-def clear_known_bad_session(conn: sqlite3.Connection, trade_date: str) -> None:
-    ensure_session_diagnostics_table(conn)
+def clear_known_bad_session(conn: sqlite3.Connection, trade_date: str, *, commit: bool = True) -> None:
+    ensure_session_diagnostics_table(conn, commit=commit)
     conn.execute(f"DELETE FROM {_diagnostics_table(conn)} WHERE trade_date=?", (str(trade_date),))
-    conn.commit()
+    if commit:
+        conn.commit()
 
 
 def _known_bad_record(conn: sqlite3.Connection, trade_date: str) -> sqlite3.Row | None:
@@ -386,6 +415,92 @@ def inspect_stock_session(
         summary,
         int(median(baseline)) if len(baseline) >= 5 else None,
     )
+
+
+def reinspect_stock_session(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    coverage_lookback: int = 20,
+) -> dict[str, Any]:
+    """Classify the raw session while deliberately ignoring its diagnostic latch."""
+    if not _has_quality_columns(conn):
+        return {
+            "trade_date": str(trade_date),
+            "stock_rows": 0,
+            "valid_rows": 0,
+            "normal_halt_rows": 0,
+            "coverage_baseline": None,
+            "coverage_ratio": None,
+            "usable_ratio": None,
+            "status": STATUS_UNAVAILABLE,
+            "reasons": ["quality_columns_unavailable"],
+            "quarantined_rows": [],
+        }
+    summary = _raw_session_summary(_session_rows(conn, trade_date))
+    baseline = _recent_reference_coverage(conn, trade_date, max(1, int(coverage_lookback)))
+    return _classify_summary(
+        trade_date,
+        summary,
+        int(median(baseline)) if len(baseline) >= 5 else None,
+    )
+
+
+def revalidate_known_bad_session(conn: sqlite3.Connection, trade_date: str) -> dict[str, Any]:
+    """Atomically retain or clear a known-bad latch from freshly inspected raw rows.
+
+    The caller owns ``BEGIN IMMEDIATE`` / commit / rollback.  Both schema helpers
+    must be run before the transaction, so a failure cannot leave a half-created
+    audit table beside a changed diagnostic record.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("revalidation requires a caller-owned active transaction")
+
+    before = _known_bad_record(conn, trade_date)
+    raw = reinspect_stock_session(conn, trade_date)
+    raw_status = str(raw["status"])
+    raw_reasons = [str(reason) for reason in raw.get("reasons", [])]
+    raw_is_usable = raw_status in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}
+
+    if raw_is_usable:
+        action = "cleared_after_raw_usable" if before is not None else "raw_usable_without_latch"
+        if before is not None:
+            clear_known_bad_session(conn, trade_date, commit=False)
+    else:
+        if before is None:
+            action = "raw_not_usable_without_latch"
+        else:
+            action = "retained_after_raw_not_usable"
+            mark_known_bad_session(
+                conn,
+                trade_date,
+                reason="revalidation_raw_" + (raw_reasons[0] if raw_reasons else raw_status),
+                source_errors=str(before["source_errors"] or ""),
+                commit=False,
+            )
+
+    after = inspect_stock_session(conn, trade_date)
+    conn.execute(
+        f"""
+        INSERT INTO {_schema_prefix(conn)}{SESSION_REVALIDATIONS_TABLE} (
+          trade_date, revalidated_at, before_latched, before_status, before_reason,
+          raw_status, raw_reasons, action, after_status, after_reasons
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(trade_date),
+            dt.datetime.now().isoformat(timespec="seconds"),
+            int(before is not None),
+            STATUS_KNOWN_BAD if before is not None else None,
+            str(before["reason"] or "") if before is not None else None,
+            raw_status,
+            json.dumps(raw_reasons, ensure_ascii=False),
+            action,
+            str(after["status"]),
+            json.dumps([str(reason) for reason in after.get("reasons", [])], ensure_ascii=False),
+        ),
+    )
+    return {"trade_date": str(trade_date), "before_latched": before is not None, "raw": raw, "action": action, "after": after}
 
 
 def inspect_stock_sessions(

@@ -1,10 +1,86 @@
 import unittest
+import datetime as dt
 import tempfile
 from pathlib import Path
 from unittest import mock
 
 
 class BackfillRuleTests(unittest.TestCase):
+    def test_close_ready_target_excludes_pre_cutoff_current_day_and_asof_cannot_bypass(self) -> None:
+        from offline_daily_update import resolve_target_close_date
+
+        before_close = dt.datetime(2026, 8, 11, 17, 29, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        after_close = dt.datetime(2026, 8, 11, 17, 30, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+
+        self.assertEqual(resolve_target_close_date(now_cn=before_close), "2026-08-10")
+        self.assertEqual(resolve_target_close_date(now_cn=after_close), "2026-08-11")
+        self.assertEqual(resolve_target_close_date("2026-08-12", now_cn=before_close), "2026-08-10")
+        self.assertEqual(resolve_target_close_date("2026-08-07", now_cn=after_close), "2026-08-07")
+
+    def test_one_invocation_budget_uses_remaining_time_and_preserves_reserve(self) -> None:
+        from offline_daily_update import _run_with_remaining_budget
+
+        calls: list[int] = []
+
+        def runner(_cmd, *, cwd, timeout_sec):
+            del cwd
+            calls.append(timeout_sec)
+            return 0, "ok"
+
+        with mock.patch("offline_daily_update.time.monotonic", return_value=100.0):
+            rc, output, allowance = _run_with_remaining_budget(
+                ["worker"],
+                cwd=".",
+                deadline=1_000.0,
+                reserve_seconds=120,
+                runner=runner,
+            )
+        self.assertEqual((rc, output, allowance), (0, "ok", 780))
+        self.assertEqual(calls, [780])
+
+    def test_concept_and_etf_coverage_use_explicit_eligible_universes(self) -> None:
+        import json
+        import sqlite3
+
+        from offline_daily_update import concept_coverage_for_date, etf_coverage_for_date
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            concept = sqlite3.connect(root / "ths_concept.db")
+            try:
+                concept.execute("CREATE TABLE concept_kline (trade_date TEXT, concept_code TEXT)")
+                concept.execute(
+                    "CREATE TABLE concept_coverage_expectations (trade_date TEXT PRIMARY KEY, eligible_codes_json TEXT, expect_source TEXT)"
+                )
+                concept.execute("INSERT INTO concept_kline VALUES ('2026-04-22', '880001')")
+                concept.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES ('2026-04-22', ?, 'provider_eligible_universe')",
+                    (json.dumps(["880001", "880002"]),),
+                )
+                concept.commit()
+            finally:
+                concept.close()
+
+            etf = sqlite3.connect(root / "etf_mvp.db")
+            try:
+                etf.execute("CREATE TABLE etf_master (fund_code TEXT, is_equity INTEGER)")
+                etf.execute("CREATE TABLE etf_scale (trade_date TEXT, fund_code TEXT)")
+                etf.execute("CREATE TABLE etf_total (trade_date TEXT)")
+                etf.executemany("INSERT INTO etf_master VALUES (?, 1)", [("510300",), ("510500",)])
+                etf.execute("INSERT INTO etf_scale VALUES ('2026-04-22', '510300')")
+                etf.execute("INSERT INTO etf_total VALUES ('2026-04-22')")
+                etf.commit()
+            finally:
+                etf.close()
+
+            concept_coverage = concept_coverage_for_date(root / "ths_concept.db", "2026-04-22")
+            etf_coverage = etf_coverage_for_date(root / "etf_mvp.db", "2026-04-22")
+
+        self.assertFalse(concept_coverage["concept"])
+        self.assertEqual((concept_coverage["concept_have"], concept_coverage["concept_expect"], concept_coverage["concept_missing"]), (1, 2, 1))
+        self.assertFalse(etf_coverage["etf"])
+        self.assertEqual((etf_coverage["etf_have"], etf_coverage["etf_expect"], etf_coverage["etf_missing"]), (1, 2, 1))
+
     def test_initial_build_uses_full_history_window(self) -> None:
         from app_panel import calc_backfill_days
 
@@ -133,8 +209,6 @@ class BackfillRuleTests(unittest.TestCase):
                 base,
                 ["2026-04-21", "2026-04-22", "2026-04-23"],
                 stock_min_rows=1,
-                concept_min_rows=1,
-                etf_min_rows=1,
             )
 
         self.assertIn("2026-04-22", plan["missing_by_day"])

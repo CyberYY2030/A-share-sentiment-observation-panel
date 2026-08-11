@@ -6,15 +6,21 @@ import json
 import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable
+from zoneinfo import ZoneInfo
 
 from mining.data_quality import (
     STATUS_BAD,
     STATUS_CLEAN,
     STATUS_USABLE_WITH_QUARANTINE,
+    ensure_session_diagnostics_table,
+    ensure_session_revalidations_table,
     inspect_stock_session,
     mark_known_bad_session,
+    reinspect_stock_session,
+    revalidate_known_bad_session,
 )
 from runtime_paths import build_runtime_paths
 
@@ -46,6 +52,8 @@ SCRIPT_CONCEPT_CANDIDATES = (
 )
 SCRIPT_ETF_CANDIDATES = ("backfill_etf_equity_60d_v2.py", "backfill_etf_equity_60d.py")
 SCRIPT_REPAIR_MARKET_DAY_CANDIDATES = ("repair_market_day_akshare.py",)
+CN_TZ = ZoneInfo("Asia/Shanghai")
+CLOSE_READY_CUTOFF = dt.time(17, 30)
 
 
 def normalize_day(value: Any) -> str | None:
@@ -60,6 +68,26 @@ def normalize_day(value: Any) -> str | None:
         return dt.date.fromisoformat(text[:10]).isoformat()
     except Exception:
         return None
+
+
+def resolve_target_close_date(
+    asof: str | None = None,
+    *,
+    now_cn: dt.datetime | None = None,
+) -> str:
+    """Return the latest date eligible for close data; explicit ``asof`` can only cap it."""
+    observed = now_cn or dt.datetime.now(CN_TZ)
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=CN_TZ)
+    else:
+        observed = observed.astimezone(CN_TZ)
+    natural_cap = observed.date()
+    if observed.timetz().replace(tzinfo=None) < CLOSE_READY_CUTOFF:
+        natural_cap -= dt.timedelta(days=1)
+    requested = normalize_day(asof) if asof else None
+    if requested:
+        natural_cap = min(natural_cap, dt.date.fromisoformat(requested))
+    return natural_cap.isoformat()
 
 
 def _connect(db_path: str | Path) -> sqlite3.Connection:
@@ -105,7 +133,7 @@ def stock_coverage_for_date(
     stock_db: str | Path,
     day: str,
     *,
-    stock_min_rows: int = 2000,
+    stock_min_rows: int | None = None,
     required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
@@ -149,7 +177,7 @@ def stock_coverage_for_date(
         session_quality = inspect_stock_session(con, day)
         result.update(
             {
-                "stock": stock_rows >= int(stock_min_rows)
+                "stock": (stock_min_rows is None or stock_rows >= int(stock_min_rows))
                 and session_quality["status"] in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE},
                 "index": required.issubset(set(index_codes)),
                 "stock_rows": stock_rows,
@@ -165,10 +193,15 @@ def stock_coverage_for_date(
 def concept_coverage_for_date(
     concept_db: str | Path,
     day: str,
-    *,
-    concept_min_rows: int = 100,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"concept": False, "concept_rows": 0}
+    result: dict[str, Any] = {
+        "concept": False,
+        "concept_rows": 0,
+        "concept_have": 0,
+        "concept_expect": None,
+        "concept_missing": None,
+        "concept_expect_source": "unavailable",
+    }
     if not Path(concept_db).exists():
         return result
 
@@ -179,19 +212,52 @@ def concept_coverage_for_date(
             table = "concept_kline_ths"
         if table is None:
             return result
-        rows = int(
-            _scalar(
-                con,
+        snapshot = None
+        if _table_exists(con, "concept_coverage_expectations"):
+            snapshot = con.execute(
+                """
+                SELECT eligible_codes_json, expect_source
+                FROM concept_coverage_expectations
+                WHERE trade_date=?
+                """,
+                (day,),
+            ).fetchone()
+        if snapshot is None:
+            return result
+        try:
+            eligible_codes = {
+                _canonical_code(value)
+                for value in json.loads(str(snapshot[0]))
+                if _canonical_code(value)
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return result
+        if not eligible_codes:
+            return result
+        rows = {
+            _canonical_code(row[0])
+            for row in con.execute(
                 f"""
-                SELECT COUNT(*)
+                SELECT DISTINCT concept_code
                 FROM {table}
                 WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?
                 """,
                 (day,),
-            )
-            or 0
+            ).fetchall()
+            if row and row[0] is not None
+        }
+        have = len(rows & eligible_codes)
+        expect = len(eligible_codes)
+        result.update(
+            {
+                "concept": have == expect,
+                "concept_rows": len(rows),
+                "concept_have": have,
+                "concept_expect": expect,
+                "concept_missing": expect - have,
+                "concept_expect_source": str(snapshot[1] or "provider_eligible_universe"),
+            }
         )
-        result.update({"concept": rows >= int(concept_min_rows), "concept_rows": rows})
         return result
     finally:
         con.close()
@@ -200,10 +266,16 @@ def concept_coverage_for_date(
 def etf_coverage_for_date(
     etf_db: str | Path,
     day: str,
-    *,
-    etf_min_rows: int = 100,
 ) -> dict[str, Any]:
-    result: dict[str, Any] = {"etf": False, "etf_scale_rows": 0, "etf_total_rows": 0}
+    result: dict[str, Any] = {
+        "etf": False,
+        "etf_scale_rows": 0,
+        "etf_total_rows": 0,
+        "etf_have": 0,
+        "etf_expect": None,
+        "etf_missing": None,
+        "etf_expect_source": "unavailable",
+    }
     if not Path(etf_db).exists():
         return result
 
@@ -220,20 +292,35 @@ def etf_coverage_for_date(
                 )
                 or 0
             )
-        if _table_exists(con, "etf_scale"):
-            scale_rows = int(
-                _scalar(
-                    con,
-                    "SELECT COUNT(*) FROM etf_scale WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?",
-                    (day,),
-                )
-                or 0
-            )
+        if not (_table_exists(con, "etf_master") and _table_exists(con, "etf_scale")):
+            return result
+        eligible_codes = {
+            _canonical_code(row[0])
+            for row in con.execute("SELECT DISTINCT fund_code FROM etf_master WHERE is_equity=1").fetchall()
+            if row and row[0] is not None and _canonical_code(row[0])
+        }
+        if not eligible_codes:
+            return result
+        present_codes = {
+            _canonical_code(row[0])
+            for row in con.execute(
+                "SELECT DISTINCT fund_code FROM etf_scale WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?",
+                (day,),
+            ).fetchall()
+            if row and row[0] is not None and _canonical_code(row[0])
+        }
+        scale_rows = len(present_codes)
+        have = len(present_codes & eligible_codes)
+        expect = len(eligible_codes)
         result.update(
             {
-                "etf": total_rows > 0 and scale_rows >= int(etf_min_rows),
+                "etf": total_rows > 0 and have == expect,
                 "etf_scale_rows": scale_rows,
                 "etf_total_rows": total_rows,
+                "etf_have": have,
+                "etf_expect": expect,
+                "etf_missing": expect - have,
+                "etf_expect_source": "etf_master_is_equity",
             }
         )
         return result
@@ -286,9 +373,7 @@ def coverage_for_date(
     day: str,
     *,
     domains: Iterable[str] | None = None,
-    stock_min_rows: int = 2000,
-    concept_min_rows: int = 100,
-    etf_min_rows: int = 100,
+    stock_min_rows: int | None = None,
 ) -> dict[str, Any]:
     normalized = normalize_day(day)
     if normalized is None:
@@ -311,11 +396,10 @@ def coverage_for_date(
             concept_coverage_for_date(
                 paths.concept_db,
                 normalized,
-                concept_min_rows=concept_min_rows,
             )
         )
     if "etf" in selected:
-        result.update(etf_coverage_for_date(paths.etf_db, normalized, etf_min_rows=etf_min_rows))
+        result.update(etf_coverage_for_date(paths.etf_db, normalized))
     if "mining" in selected:
         result.update(mining_coverage_for_date(paths.base_dir, normalized))
     return result
@@ -326,9 +410,7 @@ def build_missing_update_plan(
     expected_dates: Iterable[Any],
     *,
     domains: Iterable[str] | None = None,
-    stock_min_rows: int = 2000,
-    concept_min_rows: int = 100,
-    etf_min_rows: int = 100,
+    stock_min_rows: int | None = None,
 ) -> dict[str, Any]:
     normalized_dates = [d for d in (normalize_day(x) for x in expected_dates) if d]
     selected_domains = list(domains) if domains is not None else _existing_domains(base_dir)
@@ -342,8 +424,6 @@ def build_missing_update_plan(
             day,
             domains=selected_domains,
             stock_min_rows=stock_min_rows,
-            concept_min_rows=concept_min_rows,
-            etf_min_rows=etf_min_rows,
         )
         coverage[day] = row
         missing = [domain for domain in selected_domains if not bool(row.get(domain))]
@@ -481,6 +561,27 @@ def _run(cmd: list[str], *, cwd: str | Path, timeout_sec: int) -> tuple[int, str
         return 999, f"run failed: {exc}"
 
 
+def _remaining_budget_seconds(deadline: float, *, reserve_seconds: int = 0) -> int:
+    """Return this child-process allowance from one invocation-wide deadline."""
+    remaining = int(deadline - time.monotonic())
+    return max(0, remaining - max(0, int(reserve_seconds)))
+
+
+def _run_with_remaining_budget(
+    cmd: list[str],
+    *,
+    cwd: str | Path,
+    deadline: float,
+    reserve_seconds: int = 0,
+    runner: Any = _run,
+) -> tuple[int, str, int]:
+    allowance = _remaining_budget_seconds(deadline, reserve_seconds=reserve_seconds)
+    if allowance < 30:
+        return 998, "invocation deadline exhausted before child launch", allowance
+    rc, output = runner(cmd, cwd=cwd, timeout_sec=allowance)
+    return int(rc), output, allowance
+
+
 def _run_with_retries(
     cmd: list[str],
     *,
@@ -527,10 +628,11 @@ def _mark_unrecoverable_bad_stock_sessions(
         return marked
     con = _connect(stock_db)
     try:
+        ensure_session_diagnostics_table(con)
         for day in sorted({str(day) for day in days}):
             if day not in attempted:
                 continue
-            quality = inspect_stock_session(con, day)
+            quality = reinspect_stock_session(con, day)
             if quality["status"] != STATUS_BAD:
                 continue
             errors = [
@@ -538,21 +640,68 @@ def _mark_unrecoverable_bad_stock_sessions(
                 for command in commands
                 if command.get("domain") == "stock_index" and day in [str(arg) for arg in (command.get("cmd") or [])]
             ]
-            mark_known_bad_session(
-                con,
-                day,
-                reason="bounded_repair_failed_for_observed_bad_session",
-                source_errors="\n".join(errors),
-            )
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                mark_known_bad_session(
+                    con,
+                    day,
+                    reason="bounded_repair_failed_for_observed_bad_session",
+                    source_errors="\n".join(errors),
+                    commit=False,
+                )
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
             marked.append(day)
     finally:
         con.close()
     return marked
 
 
+def _revalidate_attempted_stock_sessions(stock_db: str | Path, days: Iterable[str]) -> list[dict[str, Any]]:
+    """Re-evaluate attempted sessions without ever clearing a latch before raw checks."""
+    if not Path(stock_db).exists():
+        return []
+    con = _connect(stock_db)
+    try:
+        # DDL is deliberately committed before the caller-owned BEGIN IMMEDIATE.
+        ensure_session_diagnostics_table(con)
+        ensure_session_revalidations_table(con)
+        results: list[dict[str, Any]] = []
+        for day in sorted({str(day) for day in days}):
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                result = revalidate_known_bad_session(con, day)
+                con.commit()
+            except Exception:
+                con.rollback()
+                raise
+            results.append(result)
+        return results
+    finally:
+        con.close()
+
+
 def _emit(logs: list[str], message: str) -> None:
     logs.append(message)
     print(message, flush=True)
+
+
+def _coverage_evidence_from_output(output: str, stage: str) -> list[dict[str, Any]]:
+    prefix = f"COVERAGE {stage} "
+    evidence: list[dict[str, Any]] = []
+    for line in str(output or "").splitlines():
+        marker = line.find(prefix)
+        if marker < 0:
+            continue
+        try:
+            value = json.loads(line[marker + len(prefix) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            evidence.append(value)
+    return evidence
 
 
 def _missing_window_size(expected_dates: list[str], missing_days: list[str]) -> int:
@@ -1135,63 +1284,137 @@ def run_offline_update(
     *,
     asof: str | None = None,
     days: int = 10,
+    target_days: Iterable[str] | None = None,
     dry_run: bool = False,
     timeout_sec: int = 600,
     use_remote_calendar: bool = False,
 ) -> dict[str, Any]:
     paths = build_runtime_paths(str(base_dir))
-    expected_dates = resolve_expected_trade_days(
-        paths.stock_db,
-        asof=asof,
-        days=days,
-        use_baostock=bool(use_remote_calendar),
-    )
+    now_cn = dt.datetime.now(CN_TZ)
+    target_close_date = resolve_target_close_date(asof, now_cn=now_cn)
+    explicit_targets = sorted({day for value in (target_days or []) if (day := normalize_day(value))})
+    if explicit_targets:
+        invalid_targets = [day for day in explicit_targets if day > target_close_date]
+        if invalid_targets:
+            raise ValueError(
+                f"target days are not close-ready at {now_cn.isoformat(timespec='seconds')}: {invalid_targets}"
+            )
+        expected_dates = explicit_targets
+    else:
+        expected_dates = resolve_expected_trade_days(
+            paths.stock_db,
+            asof=target_close_date,
+            days=days,
+            use_baostock=bool(use_remote_calendar),
+        )
     plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    deadline = time.monotonic() + max(30, int(timeout_sec))
+
+    def run_with_remaining_budget(cmd: list[str], *, cwd: str | Path, timeout_sec: int) -> tuple[int, str]:
+        del timeout_sec
+        rc, output, _allowance = _run_with_remaining_budget(cmd, cwd=cwd, deadline=deadline)
+        return rc, output
     logs: list[str] = []
+    _emit(
+        logs,
+        f"now_cn={now_cn.isoformat(timespec='seconds')} target_close_date={target_close_date} cutoff={CLOSE_READY_CUTOFF.isoformat()}",
+    )
     _emit(logs, f"expected_dates={expected_dates}")
     _emit(logs, f"missing_by_day={plan.get('missing_by_day')}")
     _emit(logs, f"missing_by_domain={plan.get('missing_by_domain')}")
     if dry_run or plan.get("ok"):
-        result = {"ok": bool(plan.get("ok")), "plan": plan, "logs": logs, "commands": []}
+        result = {
+            "ok": bool(plan.get("ok")),
+            "plan": plan,
+            "logs": logs,
+            "commands": [],
+            "now_cn": now_cn.isoformat(timespec="seconds"),
+            "target_close_date": target_close_date,
+        }
         result["health"] = write_health_summary(paths.base_dir, result)
         result["push"] = _send_daily_push(paths.base_dir, result["health"])
         return result
 
     commands: list[dict[str, Any]] = []
+    revalidations: list[dict[str, Any]] = []
 
     market_days = _domain_days(plan, "stock", "index")
+    attempted_market_days: list[str] = []
     if market_days:
         repair_script = _find_script(paths.base_dir, SCRIPT_REPAIR_MARKET_DAY_CANDIDATES)
         if repair_script is not None:
-            for market_day in market_days:
-                cmd = [
-                    sys.executable,
-                    str(repair_script),
-                    "--db",
-                    paths.stock_db,
-                    "--date",
-                    market_day,
-                    "--workers",
-                    "12",
-                    "--attempts-per-source",
-                    "1",
-                ]
-                _emit(logs, f"stock_index repair start asof={market_day}")
-                rc, out = _run(cmd, cwd=paths.base_dir, timeout_sec=max(30, timeout_sec))
-                commands.append(
-                    {
-                        "domain": "stock_index",
-                        "interface": "repair_market_day_akshare",
-                        "cmd": cmd,
-                        "returncode": rc,
-                        "attempts": 1,
-                        "output": out[-4000:],
-                    }
-                )
-                coverage = stock_coverage_for_date(paths.stock_db, market_day)
-                _emit(logs, f"stock_index repair rc={rc} asof={market_day} coverage={coverage}")
+            later_domains = {
+                domain
+                for domain in ("concept", "etf", "mining")
+                if _domain_days(plan, domain)
+            }
+            for market_position, market_day in enumerate(market_days):
+                no_growth_rounds = 0
+                attempt = 0
+                while True:
+                    before = stock_coverage_for_date(paths.stock_db, market_day)
+                    if bool(before.get("stock")) and bool(before.get("index")):
+                        break
+                    reserve_seconds = 120 * (
+                        len(later_domains) + max(0, len(market_days) - market_position - 1)
+                    )
+                    cmd = [
+                        sys.executable,
+                        str(repair_script),
+                        "--db",
+                        paths.stock_db,
+                        "--date",
+                        market_day,
+                        "--workers",
+                        "12",
+                        "--attempts-per-source",
+                        "1",
+                    ]
+                    attempt += 1
+                    attempted_market_days.append(market_day)
+                    _emit(logs, f"stock_index repair start asof={market_day} attempt={attempt}")
+                    rc, out, allowance = _run_with_remaining_budget(
+                        cmd,
+                        cwd=paths.base_dir,
+                        deadline=deadline,
+                        reserve_seconds=reserve_seconds,
+                    )
+                    after = stock_coverage_for_date(paths.stock_db, market_day)
+                    delta = int(after.get("stock_rows", 0)) - int(before.get("stock_rows", 0))
+                    commands.append(
+                        {
+                            "domain": "stock_index",
+                            "interface": "repair_market_day_akshare",
+                            "cmd": cmd,
+                            "returncode": rc,
+                            "attempts": attempt,
+                            "timeout_sec": allowance,
+                            "before_stock_rows": int(before.get("stock_rows", 0)),
+                            "after_stock_rows": int(after.get("stock_rows", 0)),
+                            "stock_code_delta": delta,
+                            "output": out[-4000:],
+                        }
+                    )
+                    _emit(
+                        logs,
+                        f"stock_index repair rc={rc} asof={market_day} attempt={attempt} "
+                        f"stock_code_delta={delta} coverage={after}",
+                    )
+                    if bool(after.get("stock")) and bool(after.get("index")):
+                        break
+                    if delta <= 0:
+                        no_growth_rounds += 1
+                    else:
+                        no_growth_rounds = 0
+                    if no_growth_rounds >= 3:
+                        _emit(logs, f"stock_index give_up asof={market_day} reason=three_zero_growth_rounds")
+                        break
+                    if rc == 998:
+                        _emit(logs, f"stock_index give_up asof={market_day} reason=invocation_deadline")
+                        break
         else:
             for market_day in market_days:
+                attempted_market_days.append(market_day)
                 _emit(logs, f"stock_index akshare start asof={market_day}")
                 fallback = akshare_stock_index_backfill(paths.stock_db, market_day)
                 commands.append(
@@ -1210,6 +1433,15 @@ def run_offline_update(
                     f"rows={fallback.get('rows')} asof={market_day} error={fallback.get('error')}"
                 )
 
+        revalidations = _revalidate_attempted_stock_sessions(paths.stock_db, attempted_market_days)
+        for revalidation in revalidations:
+            _emit(
+                logs,
+                "stock_index revalidate "
+                f"day={revalidation['trade_date']} before_latched={revalidation['before_latched']} "
+                f"raw_status={revalidation['raw']['status']} action={revalidation['action']} "
+                f"after_status={revalidation['after']['status']}",
+            )
         current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
         market_days = _domain_days(current_plan, "stock", "index")
 
@@ -1219,15 +1451,14 @@ def run_offline_update(
     current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
 
     concept_days = _domain_days(current_plan, "concept")
+    concept_coverage_evidence: list[dict[str, Any]] = []
     if concept_days:
         script = _find_script(paths.base_dir, SCRIPT_CONCEPT_CANDIDATES)
         if script is None:
             _emit(logs, "concept script not found")
         else:
-            for concept_attempt, asof_arg in enumerate(
-                (concept_days[-1].replace("-", ""), concept_days[-1], concept_days[-1].replace("-", "/")),
-                start=1,
-            ):
+            no_growth_rounds = 0
+            for concept_attempt in range(1, 4):
                 cmd = [
                     sys.executable,
                     str(script),
@@ -1236,12 +1467,47 @@ def run_offline_update(
                     "--days",
                     str(max(days, len(concept_days) + 5)),
                     "--asof",
-                    asof_arg,
+                    concept_days[-1],
+                    "--purge_excluded",
+                    "0",
                 ]
-                rc, out = _run(cmd, cwd=paths.base_dir, timeout_sec=timeout_sec)
-                commands.append({"domain": "concept", "cmd": cmd, "returncode": rc, "attempts": 1, "output": out[-4000:]})
-                _emit(logs, f"concept rc={rc} attempt={concept_attempt}/3 asof={asof_arg}")
-                if rc == 0:
+                for concept_day in concept_days:
+                    cmd.extend(["--target-day", concept_day])
+                rc, out = run_with_remaining_budget(cmd, cwd=paths.base_dir, timeout_sec=timeout_sec)
+                before_evidence = _coverage_evidence_from_output(out, "before")
+                after_evidence = _coverage_evidence_from_output(out, "after")
+                if after_evidence:
+                    concept_coverage_evidence = after_evidence
+                before_total = sum(int(row.get("have", 0)) for row in before_evidence)
+                after_total = sum(int(row.get("have", 0)) for row in after_evidence)
+                delta = after_total - before_total
+                commands.append(
+                    {
+                        "domain": "concept",
+                        "cmd": cmd,
+                        "returncode": rc,
+                        "attempts": concept_attempt,
+                        "concept_code_delta": delta,
+                        "coverage": after_evidence,
+                        "output": out[-4000:],
+                    }
+                )
+                _emit(
+                    logs,
+                    f"concept rc={rc} attempt={concept_attempt}/3 target_days={concept_days} "
+                    f"concept_code_delta={delta} coverage={after_evidence}",
+                )
+                if after_evidence and all(int(row.get("missing", 0)) == 0 for row in after_evidence):
+                    break
+                if delta <= 0:
+                    no_growth_rounds += 1
+                else:
+                    no_growth_rounds = 0
+                if no_growth_rounds >= 3:
+                    _emit(logs, "concept give_up reason=three_zero_growth_rounds")
+                    break
+                if rc == 998:
+                    _emit(logs, "concept give_up reason=invocation_deadline")
                     break
 
     current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
@@ -1269,7 +1535,12 @@ def run_offline_update(
                 "--ref-db",
                 paths.stock_db,
             ]
-            rc, out, attempts = _run_with_retries(cmd, cwd=paths.base_dir, timeout_sec=timeout_sec)
+            rc, out, attempts = _run_with_retries(
+                cmd,
+                cwd=paths.base_dir,
+                timeout_sec=timeout_sec,
+                runner=run_with_remaining_budget,
+            )
             commands.append({"domain": "etf", "cmd": cmd, "returncode": rc, "attempts": attempts, "output": out[-4000:]})
             _emit(logs, f"etf rc={rc} attempts={attempts} asof={etf_days[-1]}")
 
@@ -1297,7 +1568,12 @@ def run_offline_update(
                 mining_days[0],
                 mining_days[-1],
             ]
-            rc, out, attempts = _run_with_retries(cmd, cwd=paths.base_dir, timeout_sec=timeout_sec)
+            rc, out, attempts = _run_with_retries(
+                cmd,
+                cwd=paths.base_dir,
+                timeout_sec=timeout_sec,
+                runner=run_with_remaining_budget,
+            )
             commands.append({"domain": "mining", "cmd": cmd, "returncode": rc, "attempts": attempts, "output": out[-4000:]})
             _emit(logs, f"mining rc={rc} attempts={attempts} range={mining_days[0]}..{mining_days[-1]}")
 
@@ -1311,7 +1587,17 @@ def run_offline_update(
     if marked_bad_days:
         _emit(logs, f"known_bad_sessions={marked_bad_days}")
         final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
-    result = {"ok": bool(final_plan.get("ok")), "plan": final_plan, "initial_plan": plan, "logs": logs, "commands": commands}
+    result = {
+        "ok": bool(final_plan.get("ok")),
+        "plan": final_plan,
+        "initial_plan": plan,
+        "logs": logs,
+        "commands": commands,
+        "revalidations": revalidations,
+        "concept_coverage": concept_coverage_evidence,
+        "now_cn": now_cn.isoformat(timespec="seconds"),
+        "target_close_date": target_close_date,
+    }
     result["health"] = write_health_summary(paths.base_dir, result)
     result["push"] = _send_daily_push(paths.base_dir, result["health"])
     return result
@@ -1322,6 +1608,7 @@ def main() -> int:
     parser.add_argument("--base-dir", default=str(Path.cwd()))
     parser.add_argument("--asof", default=None)
     parser.add_argument("--days", type=int, default=10)
+    parser.add_argument("--target-day", action="append", default=[])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--use-remote-calendar", action="store_true")
@@ -1331,6 +1618,7 @@ def main() -> int:
         args.base_dir,
         asof=args.asof,
         days=max(1, int(args.days)),
+        target_days=args.target_day,
         dry_run=bool(args.dry_run),
         timeout_sec=max(30, int(args.timeout_sec)),
         use_remote_calendar=bool(args.use_remote_calendar),

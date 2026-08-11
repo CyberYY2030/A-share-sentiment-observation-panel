@@ -12,8 +12,12 @@ from mining.data_quality import (
     STATUS_PARTIAL,
     STATUS_USABLE_WITH_QUARANTINE,
     clean_stock_trade_dates,
+    ensure_session_diagnostics_table,
+    ensure_session_revalidations_table,
     inspect_stock_session,
     mark_known_bad_session,
+    reinspect_stock_session,
+    revalidate_known_bad_session,
 )
 
 
@@ -224,6 +228,53 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(quality["status"], STATUS_KNOWN_BAD)
         self.assertEqual(quality["source_errors"], "AkShare: timeout")
         self.assertEqual(calendar, [])
+
+    def test_revalidation_retains_bad_latch_until_raw_rows_are_usable_then_clears_atomically(self) -> None:
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day)
+            _insert_clean_day(conn, "2026-07-06", count=3)
+            mark_known_bad_session(conn, "2026-07-06", reason="bounded_repair_failed")
+            ensure_session_diagnostics_table(conn)
+            ensure_session_revalidations_table(conn)
+
+            self.assertEqual(reinspect_stock_session(conn, "2026-07-06")["status"], STATUS_KNOWN_BAD)
+            with self.assertRaisesRegex(RuntimeError, "caller-owned"):
+                revalidate_known_bad_session(conn, "2026-07-06")
+
+            conn.execute("BEGIN IMMEDIATE")
+            retained = revalidate_known_bad_session(conn, "2026-07-06")
+            conn.commit()
+            self.assertEqual(retained["action"], "retained_after_raw_not_usable")
+            self.assertEqual(retained["after"]["status"], STATUS_KNOWN_BAD)
+
+            _insert_row(conn, "2026-07-06", "600003")
+            _insert_row(conn, "2026-07-06", "600004")
+            conn.commit()
+            self.assertEqual(reinspect_stock_session(conn, "2026-07-06")["status"], STATUS_CLEAN)
+            conn.execute("BEGIN IMMEDIATE")
+            cleared = revalidate_known_bad_session(conn, "2026-07-06")
+            conn.commit()
+
+            audit = conn.execute(
+                "SELECT before_latched, raw_status, action, after_status "
+                "FROM selection_session_revalidations ORDER BY id"
+            ).fetchall()
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM selection_session_diagnostics WHERE trade_date='2026-07-06'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
+        self.assertEqual(cleared["action"], "cleared_after_raw_usable")
+        self.assertEqual(cleared["after"]["status"], STATUS_CLEAN)
+        self.assertEqual(audit[0][0], 1)
+        self.assertEqual(audit[0][2], "retained_after_raw_not_usable")
+        self.assertEqual(audit[1][1], STATUS_CLEAN)
+        self.assertEqual(audit[1][2], "cleared_after_raw_usable")
+        self.assertEqual(audit[1][3], STATUS_CLEAN)
+        self.assertEqual(remaining, 0)
 
     def test_existing_but_bad_day_enters_repair_plan_and_failure_marks_it_known_bad(self) -> None:
         from offline_daily_update import (

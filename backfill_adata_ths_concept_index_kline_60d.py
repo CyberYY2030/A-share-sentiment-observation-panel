@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import sqlite3
@@ -99,33 +100,40 @@ def load_filtered_concepts(filename: Optional[str] = None) -> Tuple[set[str], Op
     script_dir = os.path.dirname(os.path.abspath(__file__))
     fp = detect_filtered_file(script_dir, filename)
     if not fp:
-        return set(), None
+        raise RuntimeError("filtered_concept exclusion file is required but was not found")
+
+    def validate(frame: pd.DataFrame) -> set[str]:
+        if frame is None or frame.empty:
+            raise ValueError("filtered concept file has no rows")
+        column = next(
+            (
+                value
+                for value in frame.columns
+                if str(value).strip().lower() in ("index_code", "concept_code", "code", "指数代码")
+            ),
+            None,
+        )
+        if column is None:
+            raise ValueError("filtered concept file has no recognized code header")
+        codes = {canonical_code(value) for value in frame[column].astype(str).tolist()}
+        codes = {code for code in codes if len(code) == 6 and code.isdigit()}
+        if not codes:
+            raise ValueError("filtered concept file has no six-digit codes")
+        return codes
+
+    if fp.lower().endswith(".csv"):
+        errors: list[str] = []
+        for encoding in ("utf-8-sig", "gb18030"):
+            try:
+                return validate(pd.read_csv(fp, dtype=str, encoding=encoding, engine="python")), fp
+            except Exception as exc:
+                errors.append(f"{encoding}: {type(exc).__name__}: {exc}")
+        raise RuntimeError(f"cannot parse filtered concept CSV {fp}: {'; '.join(errors)}")
 
     try:
-        if fp.lower().endswith(".csv"):
-            df = pd.read_csv(fp, dtype=str, encoding="utf-8", engine="python")
-        else:
-            df = pd.read_excel(fp, dtype=str)
-
-        if df is None or df.empty:
-            return set(), fp
-
-        # try to find the code column
-        col = None
-        for c in df.columns:
-            if str(c).strip().lower() in ("index_code", "concept_code", "code", "指数代码"):
-                col = c
-                break
-        if col is None:
-            # fallback: first column
-            col = df.columns[0]
-
-        codes = df[col].astype(str).apply(canonical_code)
-        out = {c for c in codes.tolist() if c and len(c) == 6}
-        return out, fp
-    except Exception as e:
-        _log(f"WARN: read filtered concepts failed: {e} (file={fp})")
-        return set(), fp
+        return validate(pd.read_excel(fp, dtype=str)), fp
+    except Exception as exc:
+        raise RuntimeError(f"cannot parse filtered concept file {fp}: {type(exc).__name__}: {exc}") from exc
 
 
 # ----------------------------
@@ -158,6 +166,16 @@ def ensure_tables(con: sqlite3.Connection) -> None:
     """
     )
     con.execute("CREATE INDEX IF NOT EXISTS idx_concept_kline_code ON concept_kline(concept_code)")
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS concept_coverage_expectations (
+          trade_date TEXT PRIMARY KEY,
+          eligible_codes_json TEXT NOT NULL,
+          expect_source TEXT NOT NULL,
+          observed_at TEXT NOT NULL
+        )
+        """
+    )
     con.commit()
 
 
@@ -177,6 +195,78 @@ def upsert_df(con: sqlite3.Connection, table: str, df: pd.DataFrame, commit: boo
     if commit:
         con.commit()
     return int(d.shape[0])
+
+
+def concept_target_coverage(
+    con: sqlite3.Connection,
+    target_days: list[str],
+    eligible_codes: set[str],
+) -> dict[str, dict[str, object]]:
+    """Measure only the current provider's eligible post-exclusion code set."""
+    results: dict[str, dict[str, object]] = {}
+    for target_day in target_days:
+        rows = con.execute(
+            """
+            SELECT DISTINCT concept_code
+            FROM concept_kline
+            WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?
+            """,
+            (target_day,),
+        ).fetchall()
+        present = {canonical_code(row[0]) for row in rows if row and row[0] is not None}
+        have_codes = sorted(present & eligible_codes)
+        missing_codes = sorted(eligible_codes - present)
+        results[target_day] = {
+            "domain": "concept",
+            "trade_date": target_day,
+            "have": len(have_codes),
+            "expect": len(eligible_codes),
+            "missing": len(missing_codes),
+            "expect_source": "provider_eligible_universe",
+            "missing_codes": missing_codes,
+        }
+    return results
+
+
+def record_concept_coverage_expectations(
+    con: sqlite3.Connection,
+    target_days: list[str],
+    eligible_codes: set[str],
+) -> None:
+    if not target_days:
+        return
+    payload = json.dumps(sorted(eligible_codes), ensure_ascii=False)
+    observed_at = dt.datetime.now().isoformat(timespec="seconds")
+    con.executemany(
+        """
+        INSERT INTO concept_coverage_expectations (trade_date, eligible_codes_json, expect_source, observed_at)
+        VALUES (?, ?, 'provider_eligible_universe', ?)
+        ON CONFLICT(trade_date) DO UPDATE SET
+          eligible_codes_json=excluded.eligible_codes_json,
+          expect_source=excluded.expect_source,
+          observed_at=excluded.observed_at
+        """,
+        [(target_day, payload, observed_at) for target_day in target_days],
+    )
+    con.commit()
+
+
+def target_completion_exit_code(
+    eligible_count: int,
+    target_days: list[str],
+    coverage_after: dict[str, dict[str, object]],
+    saved_rows: int,
+) -> int:
+    """Return the fail-closed process result for list/target/idempotency cases."""
+    if int(eligible_count) <= 0:
+        return 2
+    if not target_days:
+        return 0
+    complete = bool(coverage_after) and all(int(coverage["missing"]) == 0 for coverage in coverage_after.values())
+    if complete:
+        return 0
+    del saved_rows  # Any incomplete target is a failure; zero saves gets a distinct log above.
+    return 1
 
 
 def _chunked(seq: list[str], size: int = 800):
@@ -347,11 +437,12 @@ def fetch_concept_kline(adata, index_code: str, start: dt.date, end: dt.date) ->
 # ----------------------------
 # Main
 # ----------------------------
-def main():
+def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ths_concept.db", help="sqlite db path")
     ap.add_argument("--days", type=int, default=60, help="backfill target trade days (approx window)")
     ap.add_argument("--asof", default="", help="YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD, default today")
+    ap.add_argument("--target-day", action="append", default=[], help="closed target day; repeat for multiple days")
     ap.add_argument("--limit", type=int, default=0, help="limit number of concept indices for testing")
     ap.add_argument("--purge_excluded", type=int, default=1, help="purge excluded concepts from DB (1=yes,0=no)")
     ap.add_argument("--exclude_file", default="", help="optional exclude file name (csv/xlsx), default auto-detect")
@@ -362,10 +453,11 @@ def main():
         raise SystemExit(1)
 
     asof = _date(args.asof) if args.asof else dt.date.today()
+    target_days = sorted({_date(value).isoformat() for value in args.target_day})
     # wide calendar window; will be filtered by [start,end] later
     start = asof - dt.timedelta(days=max(90, args.days * 2))
     end = asof
-    _log(f"asof={asof} start={start} end={end} db={args.db}")
+    _log(f"asof={asof} start={start} end={end} db={args.db} target_days={target_days}")
 
     os.makedirs(os.path.dirname(os.path.abspath(args.db)) or ".", exist_ok=True)
     con = sqlite3.connect(args.db)
@@ -398,28 +490,47 @@ def main():
 
     # exclude concepts listed in filtered_concept.csv / xlsx
     exclude_set, exclude_fp = load_filtered_concepts(args.exclude_file if args.exclude_file else None)
-    if exclude_set:
-        before = len(concepts)
-        concepts = concepts[~concepts["index_code"].astype(str).isin(exclude_set)].copy()
-        _log(f"excluded {before - len(concepts)} concepts from {os.path.basename(exclude_fp) if exclude_fp else 'exclude_file'}; remain={len(concepts)}")
-        if args.purge_excluded:
-            try:
-                ex_list = sorted(list(exclude_set))
-                for chunk in _chunked(ex_list, 800):
-                    q = ",".join(["?"] * len(chunk))
-                    con.execute(f"DELETE FROM concept_master WHERE index_code IN ({q})", tuple(chunk))
-                    con.execute(f"DELETE FROM concept_kline WHERE concept_code IN ({q})", tuple(chunk))
-                con.commit()
-                _log(f"purged excluded concepts from DB: {len(exclude_set)}")
-            except Exception as e:
-                _log(f"WARN: purge excluded failed: {e}")
-    else:
-        _log(f"exclude_set empty (file={exclude_fp or 'not found'}) -> will NOT exclude anything")
+    before = len(concepts)
+    concepts = concepts[~concepts["index_code"].astype(str).isin(exclude_set)].copy()
+    _log(f"excluded {before - len(concepts)} concepts from {os.path.basename(exclude_fp or 'exclude_file')}; remain={len(concepts)}")
+    if args.purge_excluded:
+        try:
+            ex_list = sorted(list(exclude_set))
+            for chunk in _chunked(ex_list, 800):
+                q = ",".join(["?"] * len(chunk))
+                con.execute(f"DELETE FROM concept_master WHERE index_code IN ({q})", tuple(chunk))
+                con.execute(f"DELETE FROM concept_kline WHERE concept_code IN ({q})", tuple(chunk))
+            con.commit()
+            _log(f"purged excluded concepts from DB: {len(exclude_set)}")
+        except Exception as e:
+            _log(f"WARN: purge excluded failed: {e}")
 
     # LIMIT should work regardless exclude_set is empty
     if args.limit and args.limit > 0:
         concepts = concepts.head(args.limit).copy()
         _log(f"LIMIT enabled -> {len(concepts)}")
+
+    eligible_codes = {str(code) for code in concepts["index_code"].tolist()}
+    if not eligible_codes:
+        con.close()
+        _log("ERROR: concept list has zero eligible codes after normalization and exclusions")
+        return target_completion_exit_code(0, target_days, {}, 0)
+
+    record_concept_coverage_expectations(con, target_days, eligible_codes)
+    coverage_before = concept_target_coverage(con, target_days, eligible_codes)
+    if target_days:
+        missing_codes = {
+            code
+            for coverage in coverage_before.values()
+            for code in coverage["missing_codes"]  # type: ignore[index]
+        }
+        concepts = concepts[concepts["index_code"].astype(str).isin(missing_codes)].copy()
+        for coverage in coverage_before.values():
+            _log(
+                "COVERAGE before "
+                + json.dumps({key: value for key, value in coverage.items() if key != "missing_codes"}, ensure_ascii=False, sort_keys=True)
+            )
+        _log(f"target continuation remaining_concepts={len(concepts)}")
 
     # upsert master
     master = pd.DataFrame(
@@ -455,9 +566,25 @@ def main():
             _log(f"progress {i}/{len(concepts)} saved_rows={total_rows} fail={fail}")
 
     con.commit()
+    coverage_after = concept_target_coverage(con, target_days, eligible_codes)
     con.close()
     _log(f"DONE saved_rows={total_rows} fail={fail} db={args.db}")
+    for coverage in coverage_after.values():
+        _log(
+            "COVERAGE after "
+            + json.dumps({key: value for key, value in coverage.items() if key != "missing_codes"}, ensure_ascii=False, sort_keys=True)
+        )
+    if target_days:
+        result_code = target_completion_exit_code(len(eligible_codes), target_days, coverage_after, total_rows)
+        if result_code == 0:
+            return 0
+        if total_rows == 0:
+            _log("ERROR: target coverage remains incomplete and saved_rows=0")
+        else:
+            _log("ERROR: target coverage remains incomplete after this continuation")
+        return result_code
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
