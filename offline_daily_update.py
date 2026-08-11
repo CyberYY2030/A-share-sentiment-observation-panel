@@ -1300,11 +1300,19 @@ def run_offline_update(
     asof: str | None = None,
     days: int = 10,
     target_days: Iterable[str] | None = None,
+    include_mining: bool = True,
     dry_run: bool = False,
     timeout_sec: int = 600,
     use_remote_calendar: bool = False,
 ) -> dict[str, Any]:
     paths = build_runtime_paths(str(base_dir))
+    managed_domains = _existing_domains(paths.base_dir)
+    if not include_mining:
+        managed_domains = [domain for domain in managed_domains if domain != "mining"]
+
+    def build_plan() -> dict[str, Any]:
+        return build_missing_update_plan(paths.base_dir, expected_dates, domains=managed_domains)
+
     now_cn = dt.datetime.now(CN_TZ)
     target_close_date = resolve_target_close_date(asof, now_cn=now_cn)
     explicit_targets = sorted({day for value in (target_days or []) if (day := normalize_day(value))})
@@ -1322,7 +1330,7 @@ def run_offline_update(
             days=days,
             use_baostock=bool(use_remote_calendar),
         )
-    plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    plan = build_plan()
     deadline = time.monotonic() + max(30, int(timeout_sec))
 
     def run_with_remaining_budget(cmd: list[str], *, cwd: str | Path, timeout_sec: int) -> tuple[int, str]:
@@ -1345,6 +1353,7 @@ def run_offline_update(
             "commands": [],
             "now_cn": now_cn.isoformat(timespec="seconds"),
             "target_close_date": target_close_date,
+            "mining_deferred": not include_mining,
         }
         result["health"] = write_health_summary(paths.base_dir, result)
         result["push"] = _send_daily_push(paths.base_dir, result["health"])
@@ -1457,13 +1466,13 @@ def run_offline_update(
                 f"raw_status={revalidation['raw']['status']} action={revalidation['action']} "
                 f"after_status={revalidation['after']['status']}",
             )
-        current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+        current_plan = build_plan()
         market_days = _domain_days(current_plan, "stock", "index")
 
     if market_days:
         _emit(logs, f"skip baostock fallback for unresolved stock/index days {market_days}; use AkShare/repair source explicitly")
 
-    current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    current_plan = build_plan()
 
     concept_days = _domain_days(current_plan, "concept")
     concept_coverage_evidence: list[dict[str, Any]] = []
@@ -1525,7 +1534,7 @@ def run_offline_update(
                     _emit(logs, "concept give_up reason=invocation_deadline")
                     break
 
-    current_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    current_plan = build_plan()
 
     etf_days = _domain_days(current_plan, "etf")
     blocked_market_days = set(_domain_days(current_plan, "stock", "index"))
@@ -1559,7 +1568,7 @@ def run_offline_update(
             commands.append({"domain": "etf", "cmd": cmd, "returncode": rc, "attempts": attempts, "output": out[-4000:]})
             _emit(logs, f"etf rc={rc} attempts={attempts} asof={etf_days[-1]}")
 
-    post_market_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    post_market_plan = build_plan()
     mining_days = sorted(
         set(_domain_days(plan, "mining"))
         | set(day for day, missing in (post_market_plan.get("missing_by_day") or {}).items() if "mining" in missing)
@@ -1592,7 +1601,7 @@ def run_offline_update(
             commands.append({"domain": "mining", "cmd": cmd, "returncode": rc, "attempts": attempts, "output": out[-4000:]})
             _emit(logs, f"mining rc={rc} attempts={attempts} range={mining_days[0]}..{mining_days[-1]}")
 
-    final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+    final_plan = build_plan()
     unresolved_bad_days = [
         day
         for day in _domain_days(final_plan, "stock")
@@ -1601,7 +1610,7 @@ def run_offline_update(
     marked_bad_days = _mark_unrecoverable_bad_stock_sessions(paths.stock_db, unresolved_bad_days, commands)
     if marked_bad_days:
         _emit(logs, f"known_bad_sessions={marked_bad_days}")
-        final_plan = build_missing_update_plan(paths.base_dir, expected_dates)
+        final_plan = build_plan()
     result = {
         "ok": bool(final_plan.get("ok")),
         "plan": final_plan,
@@ -1612,6 +1621,7 @@ def run_offline_update(
         "concept_coverage": concept_coverage_evidence,
         "now_cn": now_cn.isoformat(timespec="seconds"),
         "target_close_date": target_close_date,
+        "mining_deferred": not include_mining,
     }
     result["health"] = write_health_summary(paths.base_dir, result)
     result["push"] = _send_daily_push(paths.base_dir, result["health"])
@@ -1624,6 +1634,7 @@ def main() -> int:
     parser.add_argument("--asof", default=None)
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--target-day", action="append", default=[])
+    parser.add_argument("--skip-mining", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--use-remote-calendar", action="store_true")
@@ -1634,6 +1645,7 @@ def main() -> int:
         asof=args.asof,
         days=max(1, int(args.days)),
         target_days=args.target_day,
+        include_mining=not bool(args.skip_mining),
         dry_run=bool(args.dry_run),
         timeout_sec=max(30, int(args.timeout_sec)),
         use_remote_calendar=bool(args.use_remote_calendar),

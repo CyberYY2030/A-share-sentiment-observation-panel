@@ -81,6 +81,19 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertFalse(etf_coverage["etf"])
         self.assertEqual((etf_coverage["etf_have"], etf_coverage["etf_expect"], etf_coverage["etf_missing"]), (1, 2, 1))
 
+    def test_skip_mining_excludes_mining_from_the_ops1_market_recovery_plan(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "a_share_mvp.db").touch()
+            (base / "mining_mvp.db").touch()
+            with mock.patch("offline_daily_update.resolve_expected_trade_days", return_value=[]):
+                result = run_offline_update(base, asof="2026-04-30", include_mining=False, dry_run=True)
+
+        self.assertNotIn("mining", result["plan"]["domains"])
+        self.assertTrue(result["mining_deferred"])
+
     def test_initial_build_uses_full_history_window(self) -> None:
         from app_panel import calc_backfill_days
 
