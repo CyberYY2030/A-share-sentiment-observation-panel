@@ -28,6 +28,8 @@ ROW_INVALID_PRICE = "invalid_price"
 ROW_INVALID_ACTIVITY = "invalid_activity"
 ROW_MISSING = "missing"
 _PRICE_USABLE_STATUSES = {ROW_VALID_TRADE, ROW_CONFIRMED_HALT, ROW_PROVIDER_HALT}
+COMPLETED_STOCK_ROW_STATUSES = frozenset(_PRICE_USABLE_STATUSES)
+REQUIRED_MARKET_INDEX_CODES = ("000001", "399001", "000300", "000852")
 _REQUIRED_KLINE_COLUMNS = {"open", "high", "low", "close", "pre_close", "volume", "amount"}
 
 
@@ -205,6 +207,18 @@ def _row_status(row: Mapping[str, Any] | sqlite3.Row) -> tuple[str, str | None]:
     if no_activity and flat_prices and pre_close_matches:
         return ROW_PROVIDER_HALT, "provider_flat_no_activity_placeholder"
     return ROW_INVALID_ACTIVITY, "activity_invalid_for_price_move"
+
+
+def classify_stock_row(row: Mapping[str, Any] | sqlite3.Row) -> dict[str, Any]:
+    """Classify one stock row using the canonical completion contract."""
+    status, reason = _row_status(row)
+    complete = status in COMPLETED_STOCK_ROW_STATUSES
+    return {
+        "row_status": status,
+        "reason": reason,
+        "complete": complete,
+        "retryable": not complete,
+    }
 
 
 def _duplicate_signature(row: Mapping[str, Any] | sqlite3.Row) -> tuple[str, ...]:
@@ -444,6 +458,42 @@ def reinspect_stock_session(
         summary,
         int(median(baseline)) if len(baseline) >= 5 else None,
     )
+
+
+def raw_market_postcondition(
+    conn: sqlite3.Connection,
+    trade_date: str,
+    *,
+    required_index_codes: Iterable[str] = REQUIRED_MARKET_INDEX_CODES,
+) -> dict[str, Any]:
+    """Return the shared latch-independent stock/index repair postcondition."""
+    quality = reinspect_stock_session(conn, trade_date)
+    date_expr = "substr(replace(trade_date, '/', '-'), 1, 10)"
+    rows = conn.execute(
+        f"""
+        SELECT DISTINCT sec_code
+        FROM {_kline_table(conn)}
+        WHERE sec_type='index' AND {date_expr}=?
+        """,
+        (str(trade_date),),
+    ).fetchall()
+
+    def canonical_code(value: Any) -> str:
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        return digits[-6:].zfill(6)
+
+    index_codes = sorted({canonical_code(row[0]) for row in rows if row and row[0] is not None})
+    required = {canonical_code(code) for code in required_index_codes}
+    stock_ok = str(quality.get("status")) in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}
+    index_ok = required.issubset(set(index_codes))
+    return {
+        "ok": stock_ok and index_ok,
+        "stock": stock_ok,
+        "index": index_ok,
+        "stock_rows": int(quality.get("distinct_stock_codes", quality.get("stock_rows", 0)) or 0),
+        "index_codes": index_codes,
+        "session_quality": quality,
+    }
 
 
 def revalidate_known_bad_session(conn: sqlite3.Connection, trade_date: str) -> dict[str, Any]:

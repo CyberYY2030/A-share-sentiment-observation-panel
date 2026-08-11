@@ -19,6 +19,7 @@ from mining.data_quality import (
     ensure_session_revalidations_table,
     inspect_stock_session,
     mark_known_bad_session,
+    raw_market_postcondition,
     reinspect_stock_session,
     revalidate_known_bad_session,
 )
@@ -715,13 +716,16 @@ def raw_stock_coverage_for_repair(
     required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
 ) -> dict[str, Any]:
     """Repair-only coverage that deliberately re-inspects raw rows before a latch is cleared."""
-    return _stock_coverage_for_date(
-        stock_db,
-        day,
-        stock_min_rows=stock_min_rows,
-        required_index_codes=required_index_codes,
-        quality_reader=reinspect_stock_session,
-    )
+    del stock_min_rows
+    if not Path(stock_db).exists():
+        return {"ok": False, "stock": False, "index": False, "stock_rows": 0, "index_codes": [], "session_quality": {}}
+    con = _connect(stock_db)
+    try:
+        if not _table_exists(con, "kline_daily"):
+            return {"ok": False, "stock": False, "index": False, "stock_rows": 0, "index_codes": [], "session_quality": {}}
+        return raw_market_postcondition(con, day, required_index_codes=required_index_codes)
+    finally:
+        con.close()
 
 
 def _revalidate_attempted_stock_sessions(stock_db: str | Path, days: Iterable[str]) -> list[dict[str, Any]]:
@@ -1420,6 +1424,7 @@ def run_offline_update(
 
     commands: list[dict[str, Any]] = []
     revalidations: list[dict[str, Any]] = []
+    quality_mismatches: list[dict[str, Any]] = []
 
     revalidated_market_days: set[str] = set()
 
@@ -1450,6 +1455,7 @@ def run_offline_update(
                 if _domain_days(plan, domain)
             }
             for market_position, market_day in enumerate(market_days):
+                market_day_mismatch = False
                 raw_before = raw_stock_coverage_for_repair(paths.stock_db, market_day)
                 if bool(raw_before.get("stock")) and bool(raw_before.get("index")):
                     revalidate_market_day(market_day)
@@ -1489,6 +1495,19 @@ def run_offline_update(
                         reserve_seconds=reserve_seconds,
                     )
                     raw_after = raw_stock_coverage_for_repair(paths.stock_db, market_day)
+                    parent_ok = bool(raw_after.get("ok", bool(raw_after.get("stock")) and bool(raw_after.get("index"))))
+                    child_ok = rc == 0
+                    mismatch = None
+                    if child_ok != parent_ok:
+                        mismatch = {
+                            "code": "child_parent_quality_mismatch",
+                            "child_ok": child_ok,
+                            "parent_ok": parent_ok,
+                            "returncode": rc,
+                            "raw_status": (raw_after.get("session_quality") or {}).get("status"),
+                        }
+                        quality_mismatches.append(mismatch)
+                        market_day_mismatch = True
                     delta = int(raw_after.get("stock_rows", 0)) - int(raw_before.get("stock_rows", 0))
                     commands.append(
                         {
@@ -1505,6 +1524,7 @@ def run_offline_update(
                             "before_stock_rows": int(raw_before.get("stock_rows", 0)),
                             "after_stock_rows": int(raw_after.get("stock_rows", 0)),
                             "stock_code_delta": delta,
+                            "quality_mismatch": mismatch,
                             "output": out[-4000:],
                         }
                     )
@@ -1513,6 +1533,9 @@ def run_offline_update(
                         f"stock_index repair rc={rc} asof={market_day} attempt={attempt} "
                         f"stock_code_delta={delta} raw_coverage={raw_after}",
                     )
+                    if mismatch is not None:
+                        _emit(logs, f"child_parent_quality_mismatch asof={market_day} details={mismatch}")
+                        break
                     if bool(raw_after.get("stock")) and bool(raw_after.get("index")):
                         revalidate_market_day(market_day)
                         post_revalidation = stock_coverage_for_date(paths.stock_db, market_day)
@@ -1531,7 +1554,8 @@ def run_offline_update(
                     _emit(logs, f"stock_index give_up asof={market_day} reason=max_attempts")
 
                 # Retain an audit trail for a failed repair without allowing a fourth start.
-                revalidate_market_day(market_day)
+                if not market_day_mismatch:
+                    revalidate_market_day(market_day)
         else:
             for market_day in market_days:
                 _emit(logs, f"stock_index akshare start asof={market_day}")
@@ -1699,12 +1723,13 @@ def run_offline_update(
         _emit(logs, f"known_bad_sessions={marked_bad_days}")
         final_plan = build_plan()
     result = {
-        "ok": bool(final_plan.get("ok")),
+        "ok": bool(final_plan.get("ok")) and not quality_mismatches,
         "plan": final_plan,
         "initial_plan": plan,
         "logs": logs,
         "commands": commands,
         "revalidations": revalidations,
+        "quality_mismatches": quality_mismatches,
         "concept_coverage": concept_coverage_evidence,
         "now_cn": now_cn.isoformat(timespec="seconds"),
         "target_close_date": target_close_date,

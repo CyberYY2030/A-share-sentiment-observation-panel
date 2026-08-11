@@ -10,6 +10,8 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from mining.data_quality import ROW_VALID_TRADE, classify_stock_row, raw_market_postcondition
+
 
 KLINE_COLS = [
     "sec_type",
@@ -144,6 +146,7 @@ def normalize_day(value: str) -> tuple[str, str]:
 
 def connect(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
@@ -216,24 +219,34 @@ def stock_codes_from_db(conn: sqlite3.Connection, fallback_day: str | None = Non
     return sorted(set(codes))
 
 
-def existing_stock_codes_for_day(conn: sqlite3.Connection, trade_date: str) -> set[str]:
+def existing_stock_completion_for_day(conn: sqlite3.Connection, trade_date: str) -> dict[str, dict[str, Any]]:
     try:
         rows = conn.execute(
             """
-            SELECT DISTINCT sec_code
+            SELECT sec_code, open, high, low, close, pre_close, volume, amount
             FROM kline_daily
             WHERE sec_type='stock' AND substr(replace(trade_date, '/', '-'), 1, 10)=?
             """,
             (trade_date,),
         ).fetchall()
     except Exception:
-        return set()
-    out: set[str] = set()
+        return {}
+    out: dict[str, dict[str, Any]] = {}
     for row in rows:
         code = "".join(ch for ch in str(row[0]) if ch.isdigit())[-6:]
         if len(code) == 6:
-            out.add(code)
+            values = dict(zip(("open", "high", "low", "close", "pre_close", "volume", "amount"), row[1:]))
+            out[code] = classify_stock_row(values)
     return out
+
+
+def existing_stock_codes_for_day(conn: sqlite3.Connection, trade_date: str) -> set[str]:
+    """Return only existing rows that satisfy the shared completion contract."""
+    return {
+        code
+        for code, classification in existing_stock_completion_for_day(conn, trade_date).items()
+        if bool(classification["complete"])
+    }
 
 
 def _num(row: pd.Series, name: str) -> float | None:
@@ -433,6 +446,9 @@ def _latest_stock_close_before(conn: sqlite3.Connection, code: str, trade_date: 
 def _passes_continuity_guard(row: dict[str, Any], previous_close: float | None, max_jump: float = MAX_FALLBACK_CLOSE_JUMP) -> bool:
     if row.get("sec_type") != "stock":
         return True
+    classification = classify_stock_row(row)
+    if classification["complete"] and classification["row_status"] != ROW_VALID_TRADE:
+        return True
     close = row.get("close")
     try:
         close_value = float(close)
@@ -471,9 +487,11 @@ def fetch_with_sources(
     attempts_per_source: int,
     pacer: GlobalRequestPacer | None = None,
     provider_calls: ProviderCallLimiter | None = None,
+    require_complete_stock: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     for source_name, fn in sources:
+        quality_rejected = False
         for attempt in range(1, attempts_per_source + 1):
             try:
                 if provider_calls is not None:
@@ -489,10 +507,20 @@ def fetch_with_sources(
                     if pacer is not None:
                         pacer.wait()
                     row = fn(code, day_dash, day_compact)
+                if require_complete_stock or row.get("sec_type") == "stock":
+                    classification = classify_stock_row(row)
+                    if not classification["complete"]:
+                        errors.append(
+                            f"{source_name} rejected source={row.get('source') or source_name} "
+                            f"status={classification['row_status']} reason={classification['reason']}"
+                        )
+                        quality_rejected = True
+                        break
                 return row, errors
             except Exception as exc:
                 errors.append(f"{source_name} attempt {attempt}: {type(exc).__name__}: {str(exc)[:180]}")
-        errors.append(f"{source_name}: stopped after {attempts_per_source} failed attempts")
+        if not quality_rejected:
+            errors.append(f"{source_name}: stopped after {attempts_per_source} failed attempts")
     return None, errors
 
 
@@ -514,11 +542,13 @@ def repair_day(
             "SELECT MAX(trade_date) FROM kline_daily WHERE sec_type='stock'"
         ).fetchone()[0]
         codes = stock_codes_from_db(conn, fallback_day=fallback_day)
-        existing_codes = existing_stock_codes_for_day(conn, day_dash)
+        existing_completion = existing_stock_completion_for_day(conn, day_dash)
     finally:
         conn.close()
 
     total_codes = len(codes)
+    existing_codes = {code for code, item in existing_completion.items() if bool(item["complete"])}
+    retryable_existing = {code for code, item in existing_completion.items() if bool(item["retryable"])}
     if existing_codes:
         codes = [code for code in codes if code not in existing_codes]
 
@@ -571,6 +601,7 @@ def repair_day(
 
     rows: list[dict[str, Any]] = []
     failures: dict[str, list[str]] = {}
+    provider_quality_rejections: dict[str, list[str]] = {}
     guard_rejections: list[dict[str, Any]] = []
 
     with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
@@ -584,12 +615,16 @@ def repair_day(
                 attempts_per_source=attempts_per_source,
                 pacer=pacer,
                 provider_calls=provider_calls,
+                require_complete_stock=True,
             ): code
             for code in codes
         }
         for i, future in enumerate(as_completed(futures), start=1):
             code = futures[future]
             row, errs = future.result()
+            quality_errors = [error for error in errs if " rejected source=" in error]
+            if quality_errors:
+                provider_quality_rejections[code] = quality_errors[-8:]
             if row is None:
                 failures[code] = errs[-8:]
             else:
@@ -620,6 +655,7 @@ def repair_day(
             "SELECT COUNT(*) FROM kline_daily WHERE sec_type='index' AND trade_date=?",
             (day_dash,),
         ).fetchone()[0]
+        postcondition = raw_market_postcondition(conn, day_dash)
     finally:
         conn.close()
 
@@ -631,7 +667,9 @@ def repair_day(
         "total_codes": int(total_codes),
         "pending_codes": int(len(codes)),
         "skipped_existing": int(len(existing_codes)),
+        "retryable_existing": int(len(retryable_existing)),
         "stock_failures": failures,
+        "provider_quality_rejections": provider_quality_rejections,
         "index_failures": index_failures,
         "guard_rejections": guard_rejections[:50],
         "guard_rejection_count": int(len(guard_rejections)),
@@ -640,6 +678,7 @@ def repair_day(
         "provider_timeout_sec": float(max(0.1, provider_timeout_sec)),
         "provider_timed_out_calls": provider_calls.timed_out_calls,
         "provider_saturated_calls": provider_calls.saturated_calls,
+        "raw_postcondition": postcondition,
         "elapsed_sec": round(time.time() - started, 1),
     }
 
@@ -665,7 +704,7 @@ def main() -> int:
         provider_timeout_sec=max(0.1, float(args.provider_timeout_sec)),
     )
     print(result)
-    return 0 if result["stock_count"] >= 2000 and result["index_count"] >= 4 else 1
+    return 0 if bool(result["raw_postcondition"]["ok"]) else 1
 
 
 if __name__ == "__main__":

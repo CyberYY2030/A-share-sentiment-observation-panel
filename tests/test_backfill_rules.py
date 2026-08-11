@@ -115,7 +115,7 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update.build_missing_update_plan", return_value=unresolved_plan),
                 mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
                 mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_unresolved),
-                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(0, "child incomplete", 3_000)) as run_child,
+                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(1, "child incomplete", 3_000)) as run_child,
                 mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[]),
             ):
                 result = run_offline_update(
@@ -437,14 +437,15 @@ class BackfillRuleTests(unittest.TestCase):
                     )
                     """
                 )
-                for code in ("600001", "600002", "600003"):
-                    conn.execute(
-                        """
-                        INSERT INTO kline_daily VALUES
-                        ('2026-04-22', 'stock', ?, 10.0, 10.0, 10.0, 10.0, 10.0, 100.0, 1000.0)
-                        """,
-                        (code,),
-                    )
+                for day in ("2026-04-15", "2026-04-16", "2026-04-17", "2026-04-20", "2026-04-21", "2026-04-22"):
+                    for code in ("600001", "600002", "600003"):
+                        conn.execute(
+                            """
+                            INSERT INTO kline_daily VALUES
+                            (?, 'stock', ?, 10.0, 10.0, 10.0, 10.0, 10.0, 100.0, 1000.0)
+                            """,
+                            (day, code),
+                        )
                 conn.commit()
             finally:
                 conn.close()
@@ -468,13 +469,12 @@ class BackfillRuleTests(unittest.TestCase):
 
             # A repair decision must inspect raw data, otherwise a stale latch can
             # re-launch a child after the data rows have already been restored.
-            with mock.patch("offline_daily_update.reinspect_stock_session", return_value={"status": STATUS_CLEAN}):
-                raw_coverage = raw_stock_coverage_for_repair(
-                    stock_path,
-                    "2026-04-22",
-                    stock_min_rows=3,
-                    required_index_codes=(),
-                )
+            raw_coverage = raw_stock_coverage_for_repair(
+                stock_path,
+                "2026-04-22",
+                stock_min_rows=3,
+                required_index_codes=(),
+            )
             self.assertTrue(raw_coverage["stock"])
 
     def test_expected_trade_days_use_market_calendar_not_plain_weekdays(self) -> None:
@@ -700,6 +700,13 @@ class BackfillRuleTests(unittest.TestCase):
                     f"INSERT INTO kline_daily ({','.join(KLINE_COLS)}) VALUES ({','.join(['?'] * len(KLINE_COLS))})",
                     kline_row("stock", "600001", "2026-05-19"),
                 )
+                invalid = list(kline_row("stock", "600002", "2026-05-19"))
+                invalid[KLINE_COLS.index("amount")] = None
+                invalid[KLINE_COLS.index("source")] = "incomplete_fixture"
+                conn.execute(
+                    f"INSERT INTO kline_daily ({','.join(KLINE_COLS)}) VALUES ({','.join(['?'] * len(KLINE_COLS))})",
+                    invalid,
+                )
                 conn.commit()
             finally:
                 conn.close()
@@ -712,10 +719,260 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=fake_index_fetch),
             ):
                 result = repair_day(db_path, "2026-05-19", workers=1, attempts_per_source=1)
+            conn = sqlite3.connect(db_path)
+            try:
+                replaced_amount, replaced_source = conn.execute(
+                    "SELECT amount, source FROM kline_daily WHERE sec_type='stock' AND sec_code='600002' AND trade_date='2026-05-19'"
+                ).fetchone()
+            finally:
+                conn.close()
 
         self.assertEqual(result["stock_count"], 3)
         self.assertEqual(result["skipped_existing"], 1)
+        self.assertEqual(result["retryable_existing"], 1)
         self.assertEqual(set(fetched_codes), {"600002", "600003"})
+        self.assertEqual(float(replaced_amount), 100000.0)
+        self.assertEqual(replaced_source, "test")
+
+    def test_stock_provider_quality_gate_rejects_missing_amount_and_continues_fallback(self) -> None:
+        from repair_market_day_akshare import fetch_with_sources
+
+        def stock_row(source: str, amount) -> dict:
+            return {
+                "sec_type": "stock",
+                "sec_code": "600001",
+                "trade_date": "2026-05-19",
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "volume": 1_000.0,
+                "amount": amount,
+                "source": source,
+            }
+
+        row, errors = fetch_with_sources(
+            "600001",
+            "2026-05-19",
+            "20260519",
+            [
+                ("ak_tx", lambda *_: stock_row("akshare_stock_zh_a_hist_tx", None)),
+                ("complete", lambda *_: stock_row("complete_fixture", 100_000.0)),
+            ],
+            attempts_per_source=1,
+        )
+
+        self.assertEqual(row["source"], "complete_fixture")
+        self.assertTrue(any("ak_tx rejected" in error and "missing_required_field" in error for error in errors))
+
+    def test_tencent_stock_cannot_terminate_success_but_tencent_index_is_unchanged(self) -> None:
+        from repair_market_day_akshare import fetch_with_sources
+
+        tx_stock = {
+            "sec_type": "stock",
+            "sec_code": "600001",
+            "trade_date": "2026-05-19",
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "pre_close": None,
+            "volume": 1_000.0,
+            "amount": None,
+            "source": "akshare_stock_zh_a_hist_tx",
+        }
+        tx_index = dict(tx_stock, sec_type="index", sec_code="000852", source="akshare_stock_zh_a_hist_tx_index")
+
+        stock, stock_errors = fetch_with_sources(
+            "600001", "2026-05-19", "20260519", [("ak_tx", lambda *_: tx_stock)], attempts_per_source=1
+        )
+        index, index_errors = fetch_with_sources(
+            "000852", "2026-05-19", "20260519", [("ak_tx", lambda *_: tx_index)], attempts_per_source=1
+        )
+
+        self.assertIsNone(stock)
+        self.assertTrue(any("missing_required_field" in error for error in stock_errors))
+        self.assertEqual(index["sec_code"], "000852")
+        self.assertEqual(index_errors, [])
+
+    def test_all_invalid_stock_sources_leave_existing_row_retryable(self) -> None:
+        import sqlite3
+
+        from mining.data_quality import classify_stock_row
+        from repair_market_day_akshare import KLINE_COLS, repair_day
+
+        def row(sec_type: str, code: str, day: str, *, amount, source: str) -> dict:
+            return {
+                "sec_type": sec_type,
+                "sec_code": code,
+                "trade_date": day,
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "change": 0.5,
+                "change_pct": 5.0,
+                "volume": 1_000.0,
+                "amount": amount,
+                "turnover_ratio": None,
+                "source": source,
+                "updated_at": "2026-05-20T00:00:00",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "a_share_mvp.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE stock_info(sec_code TEXT PRIMARY KEY, bs_code TEXT, name TEXT)")
+                conn.execute("INSERT INTO stock_info VALUES ('600001', 'sh.600001', 'A')")
+                conn.execute(
+                    f"CREATE TABLE kline_daily ({','.join(col + ' TEXT' for col in KLINE_COLS)}, PRIMARY KEY (sec_type, sec_code, trade_date))"
+                )
+                invalid = row("stock", "600001", "2026-05-19", amount=None, source="original_incomplete")
+                conn.execute(
+                    f"INSERT INTO kline_daily ({','.join(KLINE_COLS)}) VALUES ({','.join(['?'] * len(KLINE_COLS))})",
+                    tuple(invalid[col] for col in KLINE_COLS),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            invalid_provider = lambda code, day, _compact: row("stock", code, day, amount=None, source="invalid_fixture")
+            valid_index = lambda code, day, _compact: row("index", code, day, amount=None, source="index_fixture")
+            with (
+                mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=invalid_provider),
+                mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=invalid_provider),
+                mock.patch("repair_market_day_akshare.fetch_stock_tx", side_effect=invalid_provider),
+                mock.patch("repair_market_day_akshare.fetch_index_sina", side_effect=valid_index),
+                mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=valid_index),
+            ):
+                result = repair_day(db_path, "2026-05-19", workers=1, attempts_per_source=1)
+
+            conn = sqlite3.connect(db_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                persisted = conn.execute(
+                    "SELECT * FROM kline_daily WHERE sec_type='stock' AND sec_code='600001' AND trade_date='2026-05-19'"
+                ).fetchone()
+                classification = classify_stock_row(persisted)
+            finally:
+                conn.close()
+
+        self.assertEqual(result["retryable_existing"], 1)
+        self.assertEqual(result["stock_count"], 1)
+        self.assertEqual(persisted["source"], "original_incomplete")
+        self.assertTrue(classification["retryable"])
+        self.assertEqual(classification["reason"], "missing_required_field")
+
+    def test_parent_reports_child_quality_mismatch_and_preserves_active_latch(self) -> None:
+        import sqlite3
+
+        from mining.data_quality import mark_known_bad_session
+        from offline_daily_update import run_offline_update
+
+        day = "2026-04-22"
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            stock_path = base / "a_share_mvp.db"
+            conn = sqlite3.connect(stock_path)
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE kline_daily (
+                      sec_type TEXT, sec_code TEXT, trade_date TEXT, open REAL, high REAL,
+                      low REAL, close REAL, pre_close REAL, volume REAL, amount REAL,
+                      PRIMARY KEY (sec_type, sec_code, trade_date)
+                    )
+                    """
+                )
+                for history_day in ("2026-04-15", "2026-04-16", "2026-04-17", "2026-04-20", "2026-04-21"):
+                    for index in range(5):
+                        conn.execute(
+                            "INSERT INTO kline_daily VALUES ('stock', ?, ?, 10, 10, 10, 10, 10, 100, 1000)",
+                            (f"60000{index}", history_day),
+                        )
+                for index in range(5):
+                    conn.execute(
+                        "INSERT INTO kline_daily VALUES ('stock', ?, ?, 10, 10, 10, 10, 10, 100, ?)",
+                        (f"60000{index}", day, None if index == 4 else 1000),
+                    )
+                for code in ("000001", "399001", "000300", "000852"):
+                    conn.execute("INSERT INTO kline_daily(sec_type, sec_code, trade_date) VALUES ('index', ?, ?)", (code, day))
+                conn.commit()
+                conn.row_factory = sqlite3.Row
+                mark_known_bad_session(conn, day, reason="active_latch")
+            finally:
+                conn.close()
+
+            latch_seen_by_child: list[bool] = []
+
+            def child_returns_wrong_rc(_cmd, *, cwd, deadline, reserve_seconds):
+                del cwd, deadline, reserve_seconds
+                child_conn = sqlite3.connect(stock_path)
+                try:
+                    latch_seen_by_child.append(
+                        child_conn.execute(
+                            "SELECT COUNT(*) FROM selection_session_diagnostics WHERE trade_date=?",
+                            (day,),
+                        ).fetchone()[0]
+                        == 1
+                    )
+                    child_conn.execute(
+                        "UPDATE kline_daily SET amount=1000 WHERE sec_type='stock' AND sec_code='600004' AND trade_date=?",
+                        (day,),
+                    )
+                    child_conn.commit()
+                finally:
+                    child_conn.close()
+                return 1, "child incorrectly reported failure", 3000
+
+            with (
+                mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
+                mock.patch("offline_daily_update._run_with_remaining_budget", side_effect=child_returns_wrong_rc) as child,
+            ):
+                result = run_offline_update(
+                    base,
+                    asof=day,
+                    target_days=[day],
+                    include_mining=False,
+                    publish_health=False,
+                    timeout_sec=3600,
+                )
+
+            conn = sqlite3.connect(stock_path)
+            try:
+                latch_count = conn.execute(
+                    "SELECT COUNT(*) FROM selection_session_diagnostics WHERE trade_date=?",
+                    (day,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(child.call_count, 1)
+        self.assertEqual(latch_seen_by_child, [True])
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["quality_mismatches"][0]["code"], "child_parent_quality_mismatch")
+        self.assertEqual(result["quality_mismatches"][0]["child_ok"], False)
+        self.assertEqual(result["quality_mismatches"][0]["parent_ok"], True)
+        self.assertEqual(result["revalidations"], [])
+        self.assertEqual(latch_count, 1)
+
+    def test_repair_cli_exit_code_is_exactly_shared_raw_postcondition(self) -> None:
+        import repair_market_day_akshare as repair
+
+        base_result = {"stock_count": 5_182, "index_count": 4}
+        with (
+            mock.patch.object(repair, "repair_day", return_value={**base_result, "raw_postcondition": {"ok": False}}),
+            mock.patch("sys.argv", ["repair_market_day_akshare.py", "--date", "2026-05-19"]),
+        ):
+            self.assertEqual(repair.main(), 1)
+        with (
+            mock.patch.object(repair, "repair_day", return_value={**base_result, "raw_postcondition": {"ok": True}}),
+            mock.patch("sys.argv", ["repair_market_day_akshare.py", "--date", "2026-05-19"]),
+        ):
+            self.assertEqual(repair.main(), 0)
 
 
     def test_health_summary_alerts_on_stale_domain_and_zero_complete_streak(self) -> None:

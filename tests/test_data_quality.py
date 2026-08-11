@@ -71,6 +71,126 @@ def _insert_clean_day(conn: sqlite3.Connection, day: str, count: int = 5) -> Non
 
 
 class DataQualityTests(unittest.TestCase):
+    def test_public_stock_row_classification_exposes_completion_contract(self) -> None:
+        from mining.data_quality import classify_stock_row
+
+        valid = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "volume": 1_000.0,
+                "amount": 100_000.0,
+            }
+        )
+        missing = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "volume": 1_000.0,
+                "amount": None,
+            }
+        )
+        confirmed_halt = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "pre_close": 10.0,
+                "volume": 0.0,
+                "amount": 0.0,
+                "halt_source": "confirmed",
+            }
+        )
+        provider_halt = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 10.0,
+                "low": 10.0,
+                "close": 10.0,
+                "pre_close": 10.0,
+                "volume": 0.0,
+                "amount": 0.0,
+            }
+        )
+        invalid_price = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 9.0,
+                "low": 9.0,
+                "close": 10.0,
+                "pre_close": 10.0,
+                "volume": 100.0,
+                "amount": 1_000.0,
+            }
+        )
+        invalid_activity = classify_stock_row(
+            {
+                "open": 10.0,
+                "high": 11.0,
+                "low": 10.0,
+                "close": 11.0,
+                "pre_close": 10.0,
+                "volume": 0.0,
+                "amount": 0.0,
+            }
+        )
+
+        self.assertEqual(valid, {"row_status": "valid_trade", "reason": None, "complete": True, "retryable": False})
+        self.assertEqual(
+            missing,
+            {
+                "row_status": "missing",
+                "reason": "missing_required_field",
+                "complete": False,
+                "retryable": True,
+            },
+        )
+        self.assertEqual(confirmed_halt["row_status"], "confirmed_halt")
+        self.assertTrue(confirmed_halt["complete"])
+        self.assertEqual(provider_halt["row_status"], "provider_halt_placeholder")
+        self.assertTrue(provider_halt["complete"])
+        self.assertEqual(invalid_price["row_status"], "invalid_price")
+        self.assertTrue(invalid_price["retryable"])
+        self.assertEqual(invalid_activity["row_status"], "invalid_activity")
+        self.assertTrue(invalid_activity["retryable"])
+
+    def test_raw_market_postcondition_ignores_latch_and_requires_all_indexes(self) -> None:
+        from mining.data_quality import raw_market_postcondition
+
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day)
+            _insert_clean_day(conn, "2026-07-06")
+            for code in ("000001", "399001", "000300", "000852"):
+                conn.execute(
+                    "INSERT INTO kline_daily(sec_type, sec_code, trade_date) VALUES ('index', ?, '2026-07-06')",
+                    (code,),
+                )
+            conn.commit()
+            mark_known_bad_session(conn, "2026-07-06", reason="old_latch")
+
+            complete = raw_market_postcondition(conn, "2026-07-06")
+            conn.execute("DELETE FROM kline_daily WHERE sec_type='index' AND sec_code='000852'")
+            conn.commit()
+            missing_index = raw_market_postcondition(conn, "2026-07-06")
+        finally:
+            conn.close()
+
+        self.assertTrue(complete["ok"])
+        self.assertTrue(complete["stock"])
+        self.assertTrue(complete["index"])
+        self.assertEqual(complete["session_quality"]["status"], STATUS_CLEAN)
+        self.assertFalse(missing_index["ok"])
+        self.assertFalse(missing_index["index"])
+
     def test_clean_calendar_excludes_full_zero_session_and_keeps_normal_halt(self) -> None:
         conn = _connect()
         try:
