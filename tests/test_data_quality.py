@@ -310,6 +310,11 @@ class DataQualityTests(unittest.TestCase):
                 ["2026-07-13"],
                 [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "output": "AkShare timeout"}],
             )
+            repeated = _mark_unrecoverable_bad_stock_sessions(
+                stock_path,
+                ["2026-07-13"],
+                [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "output": "AkShare timeout"}],
+            )
             conn = sqlite3.connect(stock_path)
             conn.row_factory = sqlite3.Row
             try:
@@ -320,6 +325,7 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(plan["missing_by_day"]["2026-07-13"], ["stock"])
         self.assertEqual(plan["coverage"]["2026-07-13"]["session_quality"]["status"], STATUS_BAD)
         self.assertEqual(marked, ["2026-07-13"])
+        self.assertEqual(repeated, [])
         self.assertEqual(quality["status"], STATUS_KNOWN_BAD)
 
     def test_ten_day_repair_plan_skips_quarantined_session_but_repairs_known_bad(self) -> None:

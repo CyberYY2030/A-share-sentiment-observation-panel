@@ -640,13 +640,28 @@ def _mark_unrecoverable_bad_stock_sessions(
                 for command in commands
                 if command.get("domain") == "stock_index" and day in [str(arg) for arg in (command.get("cmd") or [])]
             ]
+            source_errors = "\n".join(errors)
+            existing = con.execute(
+                """
+                SELECT reason, source_errors
+                FROM selection_session_diagnostics
+                WHERE trade_date=? AND status=?
+                """,
+                (day, STATUS_BAD),
+            ).fetchone()
+            if (
+                existing is not None
+                and str(existing["reason"] or "") == "bounded_repair_failed_for_observed_bad_session"
+                and str(existing["source_errors"] or "") == source_errors
+            ):
+                continue
             con.execute("BEGIN IMMEDIATE")
             try:
                 mark_known_bad_session(
                     con,
                     day,
                     reason="bounded_repair_failed_for_observed_bad_session",
-                    source_errors="\n".join(errors),
+                    source_errors=source_errors,
                     commit=False,
                 )
                 con.commit()

@@ -471,13 +471,6 @@ def revalidate_known_bad_session(conn: sqlite3.Connection, trade_date: str) -> d
             action = "raw_not_usable_without_latch"
         else:
             action = "retained_after_raw_not_usable"
-            mark_known_bad_session(
-                conn,
-                trade_date,
-                reason="revalidation_raw_" + (raw_reasons[0] if raw_reasons else raw_status),
-                source_errors=str(before["source_errors"] or ""),
-                commit=False,
-            )
 
     after = inspect_stock_session(conn, trade_date)
     conn.execute(
