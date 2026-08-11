@@ -233,6 +233,244 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual((etf_coverage["etf_have"], etf_coverage["etf_expect"], etf_coverage["etf_missing"]), (1, 2, 1))
         self.assertEqual(etf_coverage["etf_expect_source"], "etf_master_latest_provider_snapshot")
 
+    def test_concept_universe_regression_rejects_and_preserves_same_day_expectation(self) -> None:
+        import json
+        import sqlite3
+
+        import pandas as pd
+
+        import backfill_adata_ths_concept_index_kline_60d as concept_backfill
+        from backfill_adata_ths_concept_index_kline_60d import apply_concept_universe_gate, ensure_tables
+
+        original = {f"88{index:04d}" for index in range(349)}
+        candidate = set(sorted(original)[:263])
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ths_concept.db"
+            con = sqlite3.connect(db_path)
+            try:
+                ensure_tables(con)
+                con.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES (?, ?, 'provider_eligible_universe', ?)",
+                    ("2026-08-10", json.dumps(sorted(original)), "2026-08-11T00:00:00"),
+                )
+                con.execute(
+                    "INSERT INTO concept_master VALUES ('889999', 'sentinel', '', 'fixture', '2026-08-11T00:00:00')"
+                )
+                con.execute(
+                    "INSERT INTO concept_kline VALUES ('2026/08/10', '889999', 1, 1, 0, 1, 1)"
+                )
+                con.commit()
+
+                result = apply_concept_universe_gate(con, ["2026-08-10"], candidate)
+                persisted = set(
+                    json.loads(
+                        con.execute(
+                            "SELECT eligible_codes_json FROM concept_coverage_expectations WHERE trade_date='2026-08-10'"
+                        ).fetchone()[0]
+                    )
+                )
+            finally:
+                con.close()
+
+            provider_frame = pd.DataFrame({"index_code": sorted(candidate), "name": ["fixture"] * len(candidate)})
+            with (
+                mock.patch("sys.argv", ["concept-backfill", "--db", str(db_path), "--target-day", "2026-08-10"]),
+                mock.patch.object(concept_backfill, "try_import_adata", return_value=object()),
+                mock.patch.object(concept_backfill, "get_ths_concept_list", return_value=provider_frame),
+                mock.patch.object(concept_backfill, "load_filtered_concepts", return_value=({"889999"}, "fixture.csv")),
+                mock.patch.object(concept_backfill, "fetch_concept_kline", side_effect=AssertionError("gate must stop before fetch")),
+            ):
+                rc = concept_backfill.main()
+
+            con = sqlite3.connect(db_path)
+            try:
+                master_rows = con.execute("SELECT COUNT(*) FROM concept_master WHERE index_code='889999'").fetchone()[0]
+                kline_rows = con.execute("SELECT COUNT(*) FROM concept_kline WHERE concept_code='889999'").fetchone()[0]
+            finally:
+                con.close()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "eligible_universe_regression")
+        self.assertEqual(result["candidate_count"], 263)
+        self.assertEqual(result["references"][0]["reference_count"], 349)
+        self.assertLess(result["references"][0]["count_ratio"], 0.95)
+        self.assertLess(result["references"][0]["overlap_ratio"], 0.95)
+        self.assertEqual(persisted, original)
+        self.assertNotEqual(rc, 0)
+        self.assertEqual((master_rows, kline_rows), (1, 1))
+
+    def test_concept_universe_same_day_idempotent_expectation_is_unchanged(self) -> None:
+        import json
+        import sqlite3
+
+        from backfill_adata_ths_concept_index_kline_60d import apply_concept_universe_gate, ensure_tables
+
+        original = {f"88{index:04d}" for index in range(349)}
+        with tempfile.TemporaryDirectory() as tmp:
+            con = sqlite3.connect(Path(tmp) / "ths_concept.db")
+            try:
+                ensure_tables(con)
+                con.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES (?, ?, 'provider_eligible_universe', ?)",
+                    ("2026-08-10", json.dumps(sorted(original)), "2026-08-11T00:00:00"),
+                )
+                con.commit()
+                result = apply_concept_universe_gate(con, ["2026-08-10"], original)
+                persisted = set(json.loads(con.execute("SELECT eligible_codes_json FROM concept_coverage_expectations").fetchone()[0]))
+            finally:
+                con.close()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(result["universe_bootstrap"])
+        self.assertEqual(persisted, original)
+
+    def test_concept_universe_same_day_expectation_expands_monotonically(self) -> None:
+        import json
+        import sqlite3
+
+        from backfill_adata_ths_concept_index_kline_60d import apply_concept_universe_gate, ensure_tables
+
+        original = {f"88{index:04d}" for index in range(349)}
+        candidate = original | {"889998", "889999"}
+        with tempfile.TemporaryDirectory() as tmp:
+            con = sqlite3.connect(Path(tmp) / "ths_concept.db")
+            try:
+                ensure_tables(con)
+                con.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES (?, ?, 'provider_eligible_universe', ?)",
+                    ("2026-08-10", json.dumps(sorted(original)), "2026-08-11T00:00:00"),
+                )
+                con.commit()
+                result = apply_concept_universe_gate(con, ["2026-08-10"], candidate)
+                persisted = set(json.loads(con.execute("SELECT eligible_codes_json FROM concept_coverage_expectations").fetchone()[0]))
+            finally:
+                con.close()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(persisted), 351)
+        self.assertEqual(persisted, candidate)
+
+    def test_concept_universe_new_day_rejects_against_latest_trusted_reference(self) -> None:
+        import json
+        import sqlite3
+
+        from backfill_adata_ths_concept_index_kline_60d import apply_concept_universe_gate, ensure_tables
+
+        trusted = {f"88{index:04d}" for index in range(349)}
+        candidate = set(sorted(trusted)[:263])
+        with tempfile.TemporaryDirectory() as tmp:
+            con = sqlite3.connect(Path(tmp) / "ths_concept.db")
+            try:
+                ensure_tables(con)
+                con.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES (?, ?, 'provider_eligible_universe', ?)",
+                    ("2026-08-07", json.dumps(sorted(trusted)), "2026-08-11T00:00:00"),
+                )
+                con.commit()
+                result = apply_concept_universe_gate(con, ["2026-08-10"], candidate)
+                new_day_rows = con.execute(
+                    "SELECT COUNT(*) FROM concept_coverage_expectations WHERE trade_date='2026-08-10'"
+                ).fetchone()[0]
+            finally:
+                con.close()
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["reason"], "eligible_universe_regression")
+        self.assertEqual(result["references"][0]["reference_kind"], "latest_prior")
+        self.assertEqual(new_day_rows, 0)
+
+    def test_concept_limit_probe_does_not_contaminate_formal_expectation(self) -> None:
+        import json
+        import sqlite3
+
+        import pandas as pd
+
+        import backfill_adata_ths_concept_index_kline_60d as concept_backfill
+
+        original = {f"88{index:04d}" for index in range(349)}
+        provider_frame = pd.DataFrame({"index_code": sorted(original), "name": ["fixture"] * len(original)})
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ths_concept.db"
+            con = sqlite3.connect(db_path)
+            try:
+                concept_backfill.ensure_tables(con)
+                con.execute(
+                    "INSERT INTO concept_coverage_expectations VALUES (?, ?, 'provider_eligible_universe', ?)",
+                    ("2026-08-10", json.dumps(sorted(original)), "2026-08-11T00:00:00"),
+                )
+                con.commit()
+            finally:
+                con.close()
+
+            with (
+                mock.patch("sys.argv", ["concept-backfill", "--db", str(db_path), "--target-day", "2026-08-10", "--limit", "1"]),
+                mock.patch.object(concept_backfill, "try_import_adata", return_value=object()),
+                mock.patch.object(concept_backfill, "get_ths_concept_list", return_value=provider_frame),
+                mock.patch.object(concept_backfill, "load_filtered_concepts", return_value=(set(), "fixture.csv")),
+                mock.patch.object(concept_backfill, "fetch_concept_kline", return_value=pd.DataFrame()),
+            ):
+                rc = concept_backfill.main()
+
+            con = sqlite3.connect(db_path)
+            try:
+                persisted = set(json.loads(con.execute("SELECT eligible_codes_json FROM concept_coverage_expectations").fetchone()[0]))
+            finally:
+                con.close()
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(persisted, original)
+
+    def test_parent_preserves_structured_concept_universe_failure(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        day = "2026-08-10"
+        incomplete_plan = {
+            "ok": False,
+            "expected_dates": [day],
+            "domains": ["concept"],
+            "missing_by_day": {day: ["concept"]},
+            "missing_by_domain": {"concept": [day]},
+            "coverage": {},
+        }
+        stale_false_green_plan = {
+            "ok": True,
+            "expected_dates": [day],
+            "domains": ["concept"],
+            "missing_by_day": {},
+            "missing_by_domain": {"concept": []},
+            "coverage": {},
+        }
+        plans = [incomplete_plan, incomplete_plan]
+
+        def build_plan(*_args, **_kwargs):
+            return plans.pop(0) if plans else stale_false_green_plan
+
+        child_output = (
+            '[THS-KLINE fixture] UNIVERSE_GATE '
+            '{"ok": false, "reason": "eligible_universe_regression", "candidate_count": 263, '
+            '"references": [{"reference_count": 349, "count_ratio": 0.7535, '
+            '"overlap_ratio": 0.7535, "missing_count": 86, "missing_codes": ["880263"]}]}'
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch("offline_daily_update.build_missing_update_plan", side_effect=build_plan),
+                mock.patch("offline_daily_update._find_script", return_value=base / "backfill_adata_ths_concept_index_kline_60d.py"),
+                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(2, child_output, 3_000)) as run_child,
+            ):
+                result = run_offline_update(
+                    base,
+                    asof=day,
+                    target_days=[day],
+                    include_mining=False,
+                    publish_health=False,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(run_child.call_count, 1)
+        self.assertEqual(result["quality_failures"][0]["code"], "eligible_universe_regression")
+        self.assertEqual(result["quality_failures"][0]["candidate_count"], 263)
+
     def test_skip_mining_excludes_mining_from_the_ops1_market_recovery_plan(self) -> None:
         from offline_daily_update import run_offline_update
 

@@ -773,6 +773,22 @@ def _coverage_evidence_from_output(output: str, stage: str) -> list[dict[str, An
     return evidence
 
 
+def _structured_events_from_output(output: str, event: str) -> list[dict[str, Any]]:
+    prefix = f"{event} "
+    events: list[dict[str, Any]] = []
+    for line in str(output or "").splitlines():
+        marker = line.find(prefix)
+        if marker < 0:
+            continue
+        try:
+            value = json.loads(line[marker + len(prefix) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            events.append(value)
+    return events
+
+
 def _missing_window_size(expected_dates: list[str], missing_days: list[str]) -> int:
     if not missing_days:
         return 0
@@ -1425,6 +1441,7 @@ def run_offline_update(
     commands: list[dict[str, Any]] = []
     revalidations: list[dict[str, Any]] = []
     quality_mismatches: list[dict[str, Any]] = []
+    quality_failures: list[dict[str, Any]] = []
 
     revalidated_market_days: set[str] = set()
 
@@ -1611,6 +1628,25 @@ def run_offline_update(
                 rc, out = run_with_remaining_budget(cmd, cwd=paths.base_dir, timeout_sec=timeout_sec)
                 before_evidence = _coverage_evidence_from_output(out, "before")
                 after_evidence = _coverage_evidence_from_output(out, "after")
+                universe_events = _structured_events_from_output(out, "UNIVERSE_GATE")
+                universe_failure = next(
+                    (
+                        event
+                        for event in universe_events
+                        if event.get("ok") is False
+                        and str(event.get("reason") or "").startswith("eligible_universe_")
+                    ),
+                    None,
+                )
+                quality_failure = None
+                if universe_failure is not None:
+                    quality_failure = {
+                        **universe_failure,
+                        "code": str(universe_failure.get("reason")),
+                        "domain": "concept",
+                        "returncode": rc,
+                    }
+                    quality_failures.append(quality_failure)
                 if after_evidence:
                     concept_coverage_evidence = after_evidence
                 before_total = sum(int(row.get("have", 0)) for row in before_evidence)
@@ -1624,6 +1660,7 @@ def run_offline_update(
                         "attempts": concept_attempt,
                         "concept_code_delta": delta,
                         "coverage": after_evidence,
+                        "quality_failure": quality_failure,
                         "output": out[-4000:],
                     }
                 )
@@ -1632,6 +1669,9 @@ def run_offline_update(
                     f"concept rc={rc} attempt={concept_attempt}/3 target_days={concept_days} "
                     f"concept_code_delta={delta} coverage={after_evidence}",
                 )
+                if quality_failure is not None:
+                    _emit(logs, f"concept give_up reason={quality_failure['code']} details={quality_failure}")
+                    break
                 if after_evidence and all(int(row.get("missing", 0)) == 0 for row in after_evidence):
                     break
                 if delta <= 0:
@@ -1723,13 +1763,14 @@ def run_offline_update(
         _emit(logs, f"known_bad_sessions={marked_bad_days}")
         final_plan = build_plan()
     result = {
-        "ok": bool(final_plan.get("ok")) and not quality_mismatches,
+        "ok": bool(final_plan.get("ok")) and not quality_mismatches and not quality_failures,
         "plan": final_plan,
         "initial_plan": plan,
         "logs": logs,
         "commands": commands,
         "revalidations": revalidations,
         "quality_mismatches": quality_mismatches,
+        "quality_failures": quality_failures,
         "concept_coverage": concept_coverage_evidence,
         "now_cn": now_cn.isoformat(timespec="seconds"),
         "target_close_date": target_close_date,

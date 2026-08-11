@@ -35,6 +35,11 @@ import numpy as np
 import pandas as pd
 
 
+MIN_CONCEPT_UNIVERSE_RETENTION = 0.95
+TRUSTED_CONCEPT_EXPECT_SOURCES = {"provider_eligible_universe"}
+UNIVERSE_MISSING_CODE_SUMMARY_LIMIT = 20
+
+
 # ----------------------------
 # Helpers
 # ----------------------------
@@ -200,11 +205,12 @@ def upsert_df(con: sqlite3.Connection, table: str, df: pd.DataFrame, commit: boo
 def concept_target_coverage(
     con: sqlite3.Connection,
     target_days: list[str],
-    eligible_codes: set[str],
+    eligible_codes: set[str] | dict[str, set[str]],
 ) -> dict[str, dict[str, object]]:
-    """Measure only the current provider's eligible post-exclusion code set."""
+    """Measure each target against its accepted, monotonic eligible code set."""
     results: dict[str, dict[str, object]] = {}
     for target_day in target_days:
+        target_codes = eligible_codes[target_day] if isinstance(eligible_codes, dict) else eligible_codes
         rows = con.execute(
             """
             SELECT DISTINCT concept_code
@@ -214,13 +220,13 @@ def concept_target_coverage(
             (target_day,),
         ).fetchall()
         present = {canonical_code(row[0]) for row in rows if row and row[0] is not None}
-        have_codes = sorted(present & eligible_codes)
-        missing_codes = sorted(eligible_codes - present)
+        have_codes = sorted(present & target_codes)
+        missing_codes = sorted(target_codes - present)
         results[target_day] = {
             "domain": "concept",
             "trade_date": target_day,
             "have": len(have_codes),
-            "expect": len(eligible_codes),
+            "expect": len(target_codes),
             "missing": len(missing_codes),
             "expect_source": "provider_eligible_universe",
             "missing_codes": missing_codes,
@@ -235,8 +241,16 @@ def record_concept_coverage_expectations(
 ) -> None:
     if not target_days:
         return
-    payload = json.dumps(sorted(eligible_codes), ensure_ascii=False)
     observed_at = dt.datetime.now().isoformat(timespec="seconds")
+    rows: list[tuple[str, str, str]] = []
+    for target_day in target_days:
+        existing = con.execute(
+            "SELECT eligible_codes_json FROM concept_coverage_expectations WHERE trade_date=?",
+            (target_day,),
+        ).fetchone()
+        existing_codes = set(json.loads(existing[0])) if existing else set()
+        payload = json.dumps(sorted(existing_codes | eligible_codes), ensure_ascii=False)
+        rows.append((target_day, payload, observed_at))
     con.executemany(
         """
         INSERT INTO concept_coverage_expectations (trade_date, eligible_codes_json, expect_source, observed_at)
@@ -246,9 +260,133 @@ def record_concept_coverage_expectations(
           expect_source=excluded.expect_source,
           observed_at=excluded.observed_at
         """,
-        [(target_day, payload, observed_at) for target_day in target_days],
+        rows,
     )
     con.commit()
+
+
+def _validated_expectation_codes(payload: object) -> set[str]:
+    values = json.loads(str(payload))
+    if not isinstance(values, list) or not values:
+        raise ValueError("eligible_codes_json must be a non-empty list")
+    codes = [str(value).strip() for value in values]
+    if len(set(codes)) != len(codes) or any(not re.fullmatch(r"88\d{4}", code) for code in codes):
+        raise ValueError("eligible_codes_json must contain unique six-digit 88xxxx codes")
+    return set(codes)
+
+
+def apply_concept_universe_gate(
+    con: sqlite3.Connection,
+    target_days: list[str],
+    candidate_codes: set[str],
+    *,
+    persist: bool = True,
+) -> dict[str, object]:
+    """Validate a normalized provider universe and optionally persist monotonic expectations."""
+    candidate = {str(code).strip() for code in candidate_codes}
+    result: dict[str, object] = {
+        "ok": True,
+        "reason": None,
+        "threshold": MIN_CONCEPT_UNIVERSE_RETENTION,
+        "candidate_count": len(candidate),
+        "references": [],
+        "universe_bootstrap": False,
+        "formal_expectation_persisted": False,
+        "expectations": {},
+    }
+    if not candidate or any(not re.fullmatch(r"88\d{4}", code) for code in candidate):
+        result.update({"ok": False, "reason": "eligible_universe_candidate_invalid"})
+        return result
+
+    references: list[dict[str, object]] = []
+    existing_by_day: dict[str, set[str]] = {}
+    invalid_reference = False
+    for target_day in target_days:
+        rows: list[tuple[str, sqlite3.Row | tuple[object, ...]]] = []
+        same_day = con.execute(
+            """
+            SELECT trade_date, eligible_codes_json, expect_source
+            FROM concept_coverage_expectations
+            WHERE trade_date=?
+            """,
+            (target_day,),
+        ).fetchone()
+        if same_day is not None:
+            rows.append(("same_day", same_day))
+        trusted_sources = sorted(TRUSTED_CONCEPT_EXPECT_SOURCES)
+        placeholders = ",".join("?" for _ in trusted_sources)
+        latest_prior = con.execute(
+            f"""
+            SELECT trade_date, eligible_codes_json, expect_source
+            FROM concept_coverage_expectations
+            WHERE trade_date < ? AND expect_source IN ({placeholders})
+            ORDER BY trade_date DESC
+            LIMIT 1
+            """,
+            (target_day, *trusted_sources),
+        ).fetchone()
+        if latest_prior is not None:
+            rows.append(("latest_prior", latest_prior))
+
+        for reference_kind, row in rows:
+            reference_day = str(row[0])
+            try:
+                reference_codes = _validated_expectation_codes(row[1])
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                invalid_reference = True
+                references.append(
+                    {
+                        "target_day": target_day,
+                        "reference_kind": reference_kind,
+                        "reference_day": reference_day,
+                        "reference_source": str(row[2]),
+                        "valid": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            if reference_kind == "same_day":
+                existing_by_day[target_day] = reference_codes
+            missing_codes = sorted(reference_codes - candidate)
+            reference_count = len(reference_codes)
+            count_ratio = len(candidate) / reference_count
+            overlap_ratio = len(candidate & reference_codes) / reference_count
+            references.append(
+                {
+                    "target_day": target_day,
+                    "reference_kind": reference_kind,
+                    "reference_day": reference_day,
+                    "reference_source": str(row[2]),
+                    "valid": True,
+                    "reference_count": reference_count,
+                    "count_ratio": count_ratio,
+                    "overlap_ratio": overlap_ratio,
+                    "missing_count": len(missing_codes),
+                    "missing_codes": missing_codes[:UNIVERSE_MISSING_CODE_SUMMARY_LIMIT],
+                    "passed": count_ratio >= MIN_CONCEPT_UNIVERSE_RETENTION
+                    and overlap_ratio >= MIN_CONCEPT_UNIVERSE_RETENTION,
+                }
+            )
+
+    result["references"] = references
+    if invalid_reference:
+        result.update({"ok": False, "reason": "eligible_universe_reference_invalid"})
+        return result
+    failed_references = [row for row in references if row.get("valid") and not row.get("passed")]
+    if failed_references:
+        result.update({"ok": False, "reason": "eligible_universe_regression"})
+        return result
+
+    result["universe_bootstrap"] = bool(target_days) and not references
+    expectations = {
+        target_day: sorted(existing_by_day.get(target_day, set()) | candidate)
+        for target_day in target_days
+    }
+    result["expectations"] = expectations
+    if persist and target_days:
+        record_concept_coverage_expectations(con, target_days, candidate)
+        result["formal_expectation_persisted"] = True
+    return result
 
 
 def target_completion_exit_code(
@@ -493,7 +631,31 @@ def main() -> int:
     before = len(concepts)
     concepts = concepts[~concepts["index_code"].astype(str).isin(exclude_set)].copy()
     _log(f"excluded {before - len(concepts)} concepts from {os.path.basename(exclude_fp or 'exclude_file')}; remain={len(concepts)}")
-    if args.purge_excluded:
+
+    candidate_codes = {str(code) for code in concepts["index_code"].tolist()}
+    if not candidate_codes:
+        con.close()
+        _log("ERROR: concept list has zero eligible codes after normalization and exclusions")
+        return target_completion_exit_code(0, target_days, {}, 0)
+
+    limited_probe = bool(args.limit and args.limit > 0)
+    universe_gate = apply_concept_universe_gate(
+        con,
+        target_days,
+        candidate_codes,
+        persist=not limited_probe,
+    )
+    universe_gate_log = {key: value for key, value in universe_gate.items() if key != "expectations"}
+    universe_gate_log["expectation_counts"] = {
+        target_day: len(codes)
+        for target_day, codes in universe_gate["expectations"].items()  # type: ignore[union-attr]
+    }
+    _log("UNIVERSE_GATE " + json.dumps(universe_gate_log, ensure_ascii=False, sort_keys=True))
+    if not universe_gate["ok"]:
+        con.close()
+        return 2
+
+    if args.purge_excluded and not limited_probe:
         try:
             ex_list = sorted(list(exclude_set))
             for chunk in _chunked(ex_list, 800):
@@ -505,18 +667,31 @@ def main() -> int:
         except Exception as e:
             _log(f"WARN: purge excluded failed: {e}")
 
-    # LIMIT should work regardless exclude_set is empty
-    if args.limit and args.limit > 0:
+    if limited_probe:
         concepts = concepts.head(args.limit).copy()
-        _log(f"LIMIT enabled -> {len(concepts)}")
+        _log(
+            "LIMIT_PROBE "
+            + json.dumps(
+                {
+                    "candidate_count": len(candidate_codes),
+                    "formal_expectation_persisted": False,
+                    "limited_probe": True,
+                    "probe_count": len(concepts),
+                },
+                sort_keys=True,
+            )
+        )
+        eligible_codes: set[str] | dict[str, set[str]] = {
+            str(code) for code in concepts["index_code"].tolist()
+        }
+    elif target_days:
+        eligible_codes = {
+            target_day: set(codes)
+            for target_day, codes in universe_gate["expectations"].items()  # type: ignore[union-attr]
+        }
+    else:
+        eligible_codes = candidate_codes
 
-    eligible_codes = {str(code) for code in concepts["index_code"].tolist()}
-    if not eligible_codes:
-        con.close()
-        _log("ERROR: concept list has zero eligible codes after normalization and exclusions")
-        return target_completion_exit_code(0, target_days, {}, 0)
-
-    record_concept_coverage_expectations(con, target_days, eligible_codes)
     coverage_before = concept_target_coverage(con, target_days, eligible_codes)
     if target_days:
         missing_codes = {
@@ -575,7 +750,20 @@ def main() -> int:
             + json.dumps({key: value for key, value in coverage.items() if key != "missing_codes"}, ensure_ascii=False, sort_keys=True)
         )
     if target_days:
-        result_code = target_completion_exit_code(len(eligible_codes), target_days, coverage_after, total_rows)
+        if limited_probe:
+            _log(
+                "ERROR: "
+                + json.dumps(
+                    {
+                        "formal_expectation_persisted": False,
+                        "limited_probe": True,
+                        "reason": "limited_probe_not_formal_completion",
+                    },
+                    sort_keys=True,
+                )
+            )
+            return 3
+        result_code = target_completion_exit_code(len(candidate_codes), target_days, coverage_after, total_rows)
         if result_code == 0:
             return 0
         if total_rows == 0:
