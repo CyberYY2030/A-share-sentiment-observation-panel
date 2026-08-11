@@ -1301,6 +1301,7 @@ def run_offline_update(
     days: int = 10,
     target_days: Iterable[str] | None = None,
     include_mining: bool = True,
+    publish_health: bool = True,
     dry_run: bool = False,
     timeout_sec: int = 600,
     use_remote_calendar: bool = False,
@@ -1355,8 +1356,12 @@ def run_offline_update(
             "target_close_date": target_close_date,
             "mining_deferred": not include_mining,
         }
-        result["health"] = write_health_summary(paths.base_dir, result)
-        result["push"] = _send_daily_push(paths.base_dir, result["health"])
+        if publish_health:
+            result["health"] = write_health_summary(paths.base_dir, result)
+            result["push"] = _send_daily_push(paths.base_dir, result["health"])
+        else:
+            result["health"] = {"status": "not_published"}
+            result["push"] = {"status": "disabled"}
         return result
 
     commands: list[dict[str, Any]] = []
@@ -1623,8 +1628,12 @@ def run_offline_update(
         "target_close_date": target_close_date,
         "mining_deferred": not include_mining,
     }
-    result["health"] = write_health_summary(paths.base_dir, result)
-    result["push"] = _send_daily_push(paths.base_dir, result["health"])
+    if publish_health:
+        result["health"] = write_health_summary(paths.base_dir, result)
+        result["push"] = _send_daily_push(paths.base_dir, result["health"])
+    else:
+        result["health"] = {"status": "not_published"}
+        result["push"] = {"status": "disabled"}
     return result
 
 
@@ -1635,6 +1644,7 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--target-day", action="append", default=[])
     parser.add_argument("--skip-mining", action="store_true")
+    parser.add_argument("--no-health", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--use-remote-calendar", action="store_true")
@@ -1646,6 +1656,7 @@ def main() -> int:
         days=max(1, int(args.days)),
         target_days=args.target_day,
         include_mining=not bool(args.skip_mining),
+        publish_health=not bool(args.no_health),
         dry_run=bool(args.dry_run),
         timeout_sec=max(30, int(args.timeout_sec)),
         use_remote_calendar=bool(args.use_remote_calendar),

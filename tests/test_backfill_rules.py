@@ -94,6 +94,29 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertNotIn("mining", result["plan"]["domains"])
         self.assertTrue(result["mining_deferred"])
 
+    def test_no_health_suppresses_health_file_and_push_for_ops1_recovery(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch("offline_daily_update.resolve_expected_trade_days", return_value=[]),
+                mock.patch("offline_daily_update.write_health_summary") as write_health,
+                mock.patch("offline_daily_update._send_daily_push") as send_push,
+            ):
+                result = run_offline_update(
+                    base,
+                    asof="2026-04-30",
+                    include_mining=False,
+                    publish_health=False,
+                    dry_run=True,
+                )
+
+        write_health.assert_not_called()
+        send_push.assert_not_called()
+        self.assertEqual(result["health"], {"status": "not_published"})
+        self.assertEqual(result["push"], {"status": "disabled"})
+
     def test_initial_build_uses_full_history_window(self) -> None:
         from app_panel import calc_backfill_days
 
