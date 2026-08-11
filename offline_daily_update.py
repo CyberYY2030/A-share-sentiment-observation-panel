@@ -8,7 +8,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
 from mining.data_quality import (
@@ -129,12 +129,13 @@ def _existing_domains(base_dir: str | Path) -> list[str]:
     return domains
 
 
-def stock_coverage_for_date(
+def _stock_coverage_for_date(
     stock_db: str | Path,
     day: str,
     *,
     stock_min_rows: int | None = None,
     required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
+    quality_reader: Callable[[sqlite3.Connection, str], dict[str, Any]],
 ) -> dict[str, Any]:
     result: dict[str, Any] = {
         "stock": False,
@@ -174,7 +175,7 @@ def stock_coverage_for_date(
         index_codes = sorted({_canonical_code(row[0]) for row in rows if row and row[0] is not None})
         required = {_canonical_code(code) for code in required_index_codes}
 
-        session_quality = inspect_stock_session(con, day)
+        session_quality = quality_reader(con, day)
         result.update(
             {
                 "stock": (stock_min_rows is None or stock_rows >= int(stock_min_rows))
@@ -672,6 +673,40 @@ def _mark_unrecoverable_bad_stock_sessions(
     finally:
         con.close()
     return marked
+
+
+def stock_coverage_for_date(
+    stock_db: str | Path,
+    day: str,
+    *,
+    stock_min_rows: int | None = None,
+    required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
+) -> dict[str, Any]:
+    """Public coverage remains fail-closed when a diagnostic latch is present."""
+    return _stock_coverage_for_date(
+        stock_db,
+        day,
+        stock_min_rows=stock_min_rows,
+        required_index_codes=required_index_codes,
+        quality_reader=inspect_stock_session,
+    )
+
+
+def raw_stock_coverage_for_repair(
+    stock_db: str | Path,
+    day: str,
+    *,
+    stock_min_rows: int | None = None,
+    required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
+) -> dict[str, Any]:
+    """Repair-only coverage that deliberately re-inspects raw rows before a latch is cleared."""
+    return _stock_coverage_for_date(
+        stock_db,
+        day,
+        stock_min_rows=stock_min_rows,
+        required_index_codes=required_index_codes,
+        quality_reader=reinspect_stock_session,
+    )
 
 
 def _revalidate_attempted_stock_sessions(stock_db: str | Path, days: Iterable[str]) -> list[dict[str, Any]]:
@@ -1304,6 +1339,8 @@ def run_offline_update(
     publish_health: bool = True,
     dry_run: bool = False,
     timeout_sec: int = 600,
+    market_workers: int = 12,
+    market_min_request_interval_sec: float = 0.0,
     use_remote_calendar: bool = False,
 ) -> dict[str, Any]:
     paths = build_runtime_paths(str(base_dir))
@@ -1333,6 +1370,8 @@ def run_offline_update(
         )
     plan = build_plan()
     deadline = time.monotonic() + max(30, int(timeout_sec))
+    market_workers = max(1, int(market_workers))
+    market_min_request_interval_sec = max(0.0, float(market_min_request_interval_sec))
 
     def run_with_remaining_budget(cmd: list[str], *, cwd: str | Path, timeout_sec: int) -> tuple[int, str]:
         del timeout_sec
@@ -1367,8 +1406,26 @@ def run_offline_update(
     commands: list[dict[str, Any]] = []
     revalidations: list[dict[str, Any]] = []
 
+    revalidated_market_days: set[str] = set()
+
+    def revalidate_market_day(day: str) -> list[dict[str, Any]]:
+        """Audit a repaired date immediately so a stale latch cannot trigger another repair."""
+        if day in revalidated_market_days:
+            return []
+        audited = _revalidate_attempted_stock_sessions(paths.stock_db, [day])
+        revalidations.extend(audited)
+        revalidated_market_days.add(day)
+        for revalidation in audited:
+            _emit(
+                logs,
+                "stock_index revalidate "
+                f"day={revalidation['trade_date']} before_latched={revalidation['before_latched']} "
+                f"raw_status={revalidation['raw']['status']} action={revalidation['action']} "
+                f"after_status={revalidation['after']['status']}",
+            )
+        return audited
+
     market_days = _domain_days(plan, "stock", "index")
-    attempted_market_days: list[str] = []
     if market_days:
         repair_script = _find_script(paths.base_dir, SCRIPT_REPAIR_MARKET_DAY_CANDIDATES)
         if repair_script is not None:
@@ -1378,12 +1435,20 @@ def run_offline_update(
                 if _domain_days(plan, domain)
             }
             for market_position, market_day in enumerate(market_days):
-                no_growth_rounds = 0
-                attempt = 0
-                while True:
-                    before = stock_coverage_for_date(paths.stock_db, market_day)
-                    if bool(before.get("stock")) and bool(before.get("index")):
-                        break
+                raw_before = raw_stock_coverage_for_repair(paths.stock_db, market_day)
+                if bool(raw_before.get("stock")) and bool(raw_before.get("index")):
+                    revalidate_market_day(market_day)
+                    post_revalidation = stock_coverage_for_date(paths.stock_db, market_day)
+                    if not (bool(post_revalidation.get("stock")) and bool(post_revalidation.get("index"))):
+                        _emit(
+                            logs,
+                            f"stock_index give_up asof={market_day} reason=revalidation_not_usable "
+                            f"coverage={post_revalidation}",
+                        )
+                    continue
+
+                raw_after = raw_before
+                for attempt in range(1, MAX_INTERFACE_ATTEMPTS + 1):
                     reserve_seconds = 120 * (
                         len(later_domains) + max(0, len(market_days) - market_position - 1)
                     )
@@ -1395,12 +1460,12 @@ def run_offline_update(
                         "--date",
                         market_day,
                         "--workers",
-                        "12",
+                        str(market_workers),
                         "--attempts-per-source",
                         "1",
+                        "--min-request-interval-sec",
+                        format(market_min_request_interval_sec, "g"),
                     ]
-                    attempt += 1
-                    attempted_market_days.append(market_day)
                     _emit(logs, f"stock_index repair start asof={market_day} attempt={attempt}")
                     rc, out, allowance = _run_with_remaining_budget(
                         cmd,
@@ -1408,8 +1473,8 @@ def run_offline_update(
                         deadline=deadline,
                         reserve_seconds=reserve_seconds,
                     )
-                    after = stock_coverage_for_date(paths.stock_db, market_day)
-                    delta = int(after.get("stock_rows", 0)) - int(before.get("stock_rows", 0))
+                    raw_after = raw_stock_coverage_for_repair(paths.stock_db, market_day)
+                    delta = int(raw_after.get("stock_rows", 0)) - int(raw_before.get("stock_rows", 0))
                     commands.append(
                         {
                             "domain": "stock_index",
@@ -1418,8 +1483,12 @@ def run_offline_update(
                             "returncode": rc,
                             "attempts": attempt,
                             "timeout_sec": allowance,
-                            "before_stock_rows": int(before.get("stock_rows", 0)),
-                            "after_stock_rows": int(after.get("stock_rows", 0)),
+                            "market_workers": market_workers,
+                            "market_min_request_interval_sec": market_min_request_interval_sec,
+                            "raw_before_quality": raw_before,
+                            "raw_after_quality": raw_after,
+                            "before_stock_rows": int(raw_before.get("stock_rows", 0)),
+                            "after_stock_rows": int(raw_after.get("stock_rows", 0)),
                             "stock_code_delta": delta,
                             "output": out[-4000:],
                         }
@@ -1427,23 +1496,29 @@ def run_offline_update(
                     _emit(
                         logs,
                         f"stock_index repair rc={rc} asof={market_day} attempt={attempt} "
-                        f"stock_code_delta={delta} coverage={after}",
+                        f"stock_code_delta={delta} raw_coverage={raw_after}",
                     )
-                    if bool(after.get("stock")) and bool(after.get("index")):
-                        break
-                    if delta <= 0:
-                        no_growth_rounds += 1
-                    else:
-                        no_growth_rounds = 0
-                    if no_growth_rounds >= 3:
-                        _emit(logs, f"stock_index give_up asof={market_day} reason=three_zero_growth_rounds")
+                    if bool(raw_after.get("stock")) and bool(raw_after.get("index")):
+                        revalidate_market_day(market_day)
+                        post_revalidation = stock_coverage_for_date(paths.stock_db, market_day)
+                        if not (bool(post_revalidation.get("stock")) and bool(post_revalidation.get("index"))):
+                            _emit(
+                                logs,
+                                f"stock_index give_up asof={market_day} reason=revalidation_not_usable "
+                                f"coverage={post_revalidation}",
+                            )
                         break
                     if rc == 998:
                         _emit(logs, f"stock_index give_up asof={market_day} reason=invocation_deadline")
                         break
+                    raw_before = raw_after
+                else:
+                    _emit(logs, f"stock_index give_up asof={market_day} reason=max_attempts")
+
+                # Retain an audit trail for a failed repair without allowing a fourth start.
+                revalidate_market_day(market_day)
         else:
             for market_day in market_days:
-                attempted_market_days.append(market_day)
                 _emit(logs, f"stock_index akshare start asof={market_day}")
                 fallback = akshare_stock_index_backfill(paths.stock_db, market_day)
                 commands.append(
@@ -1461,16 +1536,8 @@ def run_offline_update(
                     f"stock_index akshare ok={fallback.get('ok')} attempts={fallback.get('attempts')} "
                     f"rows={fallback.get('rows')} asof={market_day} error={fallback.get('error')}"
                 )
+                revalidate_market_day(market_day)
 
-        revalidations = _revalidate_attempted_stock_sessions(paths.stock_db, attempted_market_days)
-        for revalidation in revalidations:
-            _emit(
-                logs,
-                "stock_index revalidate "
-                f"day={revalidation['trade_date']} before_latched={revalidation['before_latched']} "
-                f"raw_status={revalidation['raw']['status']} action={revalidation['action']} "
-                f"after_status={revalidation['after']['status']}",
-            )
         current_plan = build_plan()
         market_days = _domain_days(current_plan, "stock", "index")
 
@@ -1648,6 +1715,8 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-sec", type=int, default=600)
     parser.add_argument("--use-remote-calendar", action="store_true")
+    parser.add_argument("--market-workers", type=int, default=12)
+    parser.add_argument("--market-min-request-interval-sec", type=float, default=0.0)
     args = parser.parse_args()
 
     result = run_offline_update(
@@ -1660,6 +1729,8 @@ def main() -> int:
         dry_run=bool(args.dry_run),
         timeout_sec=max(30, int(args.timeout_sec)),
         use_remote_calendar=bool(args.use_remote_calendar),
+        market_workers=max(1, int(args.market_workers)),
+        market_min_request_interval_sec=max(0.0, float(args.market_min_request_interval_sec)),
     )
     for line in result.get("logs", []):
         print(line)

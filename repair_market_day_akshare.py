@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -30,6 +31,25 @@ KLINE_COLS = [
 
 REQUIRED_INDEX_CODES = ("000001", "399001", "000300", "000852")
 MAX_FALLBACK_CLOSE_JUMP = 0.30
+
+
+class GlobalRequestPacer:
+    """Space provider request starts across every worker in one repair run."""
+
+    def __init__(self, min_interval_sec: float = 0.0) -> None:
+        self._interval = max(0.0, float(min_interval_sec))
+        self._lock = threading.Lock()
+        self._next_start = 0.0
+
+    def wait(self) -> None:
+        if self._interval <= 0.0:
+            return
+        with self._lock:
+            now = time.monotonic()
+            delay = max(0.0, self._next_start - now)
+            self._next_start = max(self._next_start, now) + self._interval
+        if delay > 0.0:
+            time.sleep(delay)
 
 
 def now_iso() -> str:
@@ -386,11 +406,14 @@ def fetch_with_sources(
     sources: list[tuple[str, Callable[[str, str, str], dict[str, Any]]]],
     *,
     attempts_per_source: int,
+    pacer: GlobalRequestPacer | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     for source_name, fn in sources:
         for attempt in range(1, attempts_per_source + 1):
             try:
+                if pacer is not None:
+                    pacer.wait()
                 row = fn(code, day_dash, day_compact)
                 return row, errors
             except Exception as exc:
@@ -406,6 +429,7 @@ def repair_day(
     limit: int = 0,
     workers: int = 4,
     attempts_per_source: int = 3,
+    min_request_interval_sec: float = 0.0,
 ) -> dict[str, Any]:
     day_dash, day_compact = normalize_day(trade_date)
     conn = connect(db_path)
@@ -435,6 +459,7 @@ def repair_day(
         ("ak_sina", fetch_index_sina),
         ("ak_tx", fetch_index_tx),
     ]
+    pacer = GlobalRequestPacer(min_request_interval_sec)
 
     started = time.time()
     index_rows: list[dict[str, Any]] = []
@@ -446,6 +471,7 @@ def repair_day(
             day_compact,
             index_sources,
             attempts_per_source=attempts_per_source,
+            pacer=pacer,
         )
         if row is None:
             index_failures[code] = errs[-8:]
@@ -476,6 +502,7 @@ def repair_day(
                 day_compact,
                 stock_sources,
                 attempts_per_source=attempts_per_source,
+                pacer=pacer,
             ): code
             for code in codes
         }
@@ -527,6 +554,8 @@ def repair_day(
         "index_failures": index_failures,
         "guard_rejections": guard_rejections[:50],
         "guard_rejection_count": int(len(guard_rejections)),
+        "workers": int(max(1, workers)),
+        "min_request_interval_sec": float(max(0.0, min_request_interval_sec)),
         "elapsed_sec": round(time.time() - started, 1),
     }
 
@@ -538,6 +567,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--attempts-per-source", type=int, default=3)
+    parser.add_argument("--min-request-interval-sec", type=float, default=0.0)
     args = parser.parse_args()
 
     result = repair_day(
@@ -546,6 +576,7 @@ def main() -> int:
         limit=max(0, int(args.limit)),
         workers=max(1, int(args.workers)),
         attempts_per_source=max(1, min(3, int(args.attempts_per_source))),
+        min_request_interval_sec=max(0.0, float(args.min_request_interval_sec)),
     )
     print(result)
     return 0 if result["stock_count"] >= 2000 and result["index_count"] >= 4 else 1

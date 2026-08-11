@@ -38,6 +38,113 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual((rc, output, allowance), (0, "ok", 780))
         self.assertEqual(calls, [780])
 
+    def test_market_repair_revalidates_raw_success_before_a_second_child(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        initial_plan = {
+            "ok": False,
+            "expected_dates": ["2026-04-30"],
+            "domains": ["stock", "index"],
+            "missing_by_day": {"2026-04-30": ["stock"]},
+            "missing_by_domain": {"stock": ["2026-04-30"], "index": []},
+        }
+        complete_plan = {
+            "ok": True,
+            "expected_dates": ["2026-04-30"],
+            "domains": ["stock", "index"],
+            "missing_by_day": {},
+            "missing_by_domain": {"stock": [], "index": []},
+        }
+        raw_before = {"stock": False, "index": True, "stock_rows": 3, "session_quality": {"status": "known_bad_session"}}
+        raw_after = {"stock": True, "index": True, "stock_rows": 4, "session_quality": {"status": "clean"}}
+        revalidation = {
+            "trade_date": "2026-04-30",
+            "before_latched": True,
+            "raw": {"status": "clean"},
+            "action": "cleared_after_raw_usable",
+            "after": {"status": "clean"},
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch(
+                    "offline_daily_update.build_missing_update_plan",
+                    side_effect=[initial_plan, complete_plan, complete_plan, complete_plan, complete_plan, complete_plan],
+                ),
+                mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
+                mock.patch("offline_daily_update.raw_stock_coverage_for_repair", side_effect=[raw_before, raw_after]),
+                mock.patch("offline_daily_update.stock_coverage_for_date", return_value={"stock": True, "index": True}),
+                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(0, "child complete", 3_000)) as run_child,
+                mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[revalidation]) as revalidate,
+            ):
+                result = run_offline_update(
+                    base,
+                    asof="2026-04-30",
+                    target_days=["2026-04-30"],
+                    include_mining=False,
+                    publish_health=False,
+                    market_workers=4,
+                    market_min_request_interval_sec=0.25,
+                    timeout_sec=3_600,
+                )
+
+        self.assertEqual(run_child.call_count, 1)
+        self.assertEqual(revalidate.call_count, 1)
+        cmd = run_child.call_args.args[0]
+        self.assertEqual(cmd[cmd.index("--workers") + 1], "4")
+        self.assertEqual(cmd[cmd.index("--min-request-interval-sec") + 1], "0.25")
+        self.assertEqual([command["attempts"] for command in result["commands"]], [1])
+        self.assertEqual(result["revalidations"], [revalidation])
+
+    def test_market_repair_caps_total_child_starts_at_three(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        unresolved_plan = {
+            "ok": False,
+            "expected_dates": ["2026-04-30"],
+            "domains": ["stock", "index"],
+            "missing_by_day": {"2026-04-30": ["stock"]},
+            "missing_by_domain": {"stock": ["2026-04-30"], "index": []},
+        }
+        raw_unresolved = {"stock": False, "index": True, "stock_rows": 3, "session_quality": {"status": "known_bad_session"}}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch("offline_daily_update.build_missing_update_plan", return_value=unresolved_plan),
+                mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
+                mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_unresolved),
+                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(0, "child incomplete", 3_000)) as run_child,
+                mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[]),
+            ):
+                result = run_offline_update(
+                    base,
+                    asof="2026-04-30",
+                    target_days=["2026-04-30"],
+                    include_mining=False,
+                    publish_health=False,
+                    timeout_sec=3_600,
+                )
+
+        self.assertEqual(run_child.call_count, 3)
+        self.assertEqual([command["attempts"] for command in result["commands"]], [1, 2, 3])
+        self.assertIn("stock_index give_up asof=2026-04-30 reason=max_attempts", result["logs"])
+
+    def test_global_request_pacer_spaces_provider_attempts(self) -> None:
+        from repair_market_day_akshare import GlobalRequestPacer
+
+        pacer = GlobalRequestPacer(0.25)
+        with (
+            mock.patch("repair_market_day_akshare.time.monotonic", side_effect=[10.0, 10.1]),
+            mock.patch("repair_market_day_akshare.time.sleep") as sleep,
+        ):
+            pacer.wait()
+            pacer.wait()
+
+        sleep.assert_called_once()
+        self.assertAlmostEqual(sleep.call_args.args[0], 0.15, places=6)
+
     def test_concept_and_etf_coverage_use_explicit_eligible_universes(self) -> None:
         import json
         import sqlite3
@@ -263,7 +370,7 @@ class BackfillRuleTests(unittest.TestCase):
             STATUS_UNAVAILABLE,
             STATUS_USABLE_WITH_QUARANTINE,
         )
-        from offline_daily_update import stock_coverage_for_date
+        from offline_daily_update import raw_stock_coverage_for_repair, stock_coverage_for_date
 
         with tempfile.TemporaryDirectory() as tmp:
             stock_path = Path(tmp) / "a_share_mvp.db"
@@ -313,6 +420,17 @@ class BackfillRuleTests(unittest.TestCase):
                         required_index_codes=(),
                     )
                 self.assertEqual(coverage["stock"], usable, status)
+
+            # A repair decision must inspect raw data, otherwise a stale latch can
+            # re-launch a child after the data rows have already been restored.
+            with mock.patch("offline_daily_update.reinspect_stock_session", return_value={"status": STATUS_CLEAN}):
+                raw_coverage = raw_stock_coverage_for_repair(
+                    stock_path,
+                    "2026-04-22",
+                    stock_min_rows=3,
+                    required_index_codes=(),
+                )
+            self.assertTrue(raw_coverage["stock"])
 
     def test_expected_trade_days_use_market_calendar_not_plain_weekdays(self) -> None:
         from unittest import mock
