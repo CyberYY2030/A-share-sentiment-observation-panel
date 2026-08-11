@@ -31,6 +31,7 @@ KLINE_COLS = [
 
 REQUIRED_INDEX_CODES = ("000001", "399001", "000300", "000852")
 MAX_FALLBACK_CLOSE_JUMP = 0.30
+PROVIDER_CALL_TIMEOUT_SEC = 12.0
 
 
 class GlobalRequestPacer:
@@ -50,6 +51,68 @@ class GlobalRequestPacer:
             self._next_start = max(self._next_start, now) + self._interval
         if delay > 0.0:
             time.sleep(delay)
+
+
+class ProviderCallLimiter:
+    """Bound one provider call without allowing a stalled fallback to block repair workers."""
+
+    def __init__(self, *, max_inflight: int, timeout_sec: float) -> None:
+        self._max_inflight = max(1, int(max_inflight))
+        self._timeout_sec = max(0.1, float(timeout_sec))
+        self._lock = threading.Lock()
+        self._slots: dict[str, threading.BoundedSemaphore] = {}
+        self._timed_out_calls = 0
+        self._saturated_calls = 0
+
+    @property
+    def timed_out_calls(self) -> int:
+        with self._lock:
+            return self._timed_out_calls
+
+    @property
+    def saturated_calls(self) -> int:
+        with self._lock:
+            return self._saturated_calls
+
+    def call(
+        self,
+        source_name: str,
+        fn: Callable[[str, str, str], dict[str, Any]],
+        code: str,
+        day_dash: str,
+        day_compact: str,
+        *,
+        pacer: GlobalRequestPacer | None = None,
+    ) -> dict[str, Any]:
+        with self._lock:
+            slot = self._slots.setdefault(source_name, threading.BoundedSemaphore(self._max_inflight))
+        if not slot.acquire(blocking=False):
+            with self._lock:
+                self._saturated_calls += 1
+            raise TimeoutError(f"{source_name} in-flight limit reached")
+
+        state: dict[str, Any] = {}
+
+        def invoke() -> None:
+            try:
+                if pacer is not None:
+                    pacer.wait()
+                state["row"] = fn(code, day_dash, day_compact)
+            except BaseException as exc:
+                state["error"] = exc
+            finally:
+                slot.release()
+
+        worker = threading.Thread(target=invoke, daemon=True)
+        worker.start()
+        worker.join(self._timeout_sec)
+        if worker.is_alive():
+            with self._lock:
+                self._timed_out_calls += 1
+            raise TimeoutError(f"{source_name} exceeded {self._timeout_sec:g}s")
+        if "error" in state:
+            raise state["error"]
+        return state["row"]
 
 
 def now_iso() -> str:
@@ -407,14 +470,25 @@ def fetch_with_sources(
     *,
     attempts_per_source: int,
     pacer: GlobalRequestPacer | None = None,
+    provider_calls: ProviderCallLimiter | None = None,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
     for source_name, fn in sources:
         for attempt in range(1, attempts_per_source + 1):
             try:
-                if pacer is not None:
-                    pacer.wait()
-                row = fn(code, day_dash, day_compact)
+                if provider_calls is not None:
+                    row = provider_calls.call(
+                        source_name,
+                        fn,
+                        code,
+                        day_dash,
+                        day_compact,
+                        pacer=pacer,
+                    )
+                else:
+                    if pacer is not None:
+                        pacer.wait()
+                    row = fn(code, day_dash, day_compact)
                 return row, errors
             except Exception as exc:
                 errors.append(f"{source_name} attempt {attempt}: {type(exc).__name__}: {str(exc)[:180]}")
@@ -430,6 +504,7 @@ def repair_day(
     workers: int = 4,
     attempts_per_source: int = 3,
     min_request_interval_sec: float = 0.0,
+    provider_timeout_sec: float = PROVIDER_CALL_TIMEOUT_SEC,
 ) -> dict[str, Any]:
     day_dash, day_compact = normalize_day(trade_date)
     conn = connect(db_path)
@@ -460,6 +535,10 @@ def repair_day(
         ("ak_tx", fetch_index_tx),
     ]
     pacer = GlobalRequestPacer(min_request_interval_sec)
+    provider_calls = ProviderCallLimiter(
+        max_inflight=max(1, workers),
+        timeout_sec=provider_timeout_sec,
+    )
 
     started = time.time()
     index_rows: list[dict[str, Any]] = []
@@ -472,6 +551,7 @@ def repair_day(
             index_sources,
             attempts_per_source=attempts_per_source,
             pacer=pacer,
+            provider_calls=provider_calls,
         )
         if row is None:
             index_failures[code] = errs[-8:]
@@ -503,6 +583,7 @@ def repair_day(
                 stock_sources,
                 attempts_per_source=attempts_per_source,
                 pacer=pacer,
+                provider_calls=provider_calls,
             ): code
             for code in codes
         }
@@ -556,6 +637,9 @@ def repair_day(
         "guard_rejection_count": int(len(guard_rejections)),
         "workers": int(max(1, workers)),
         "min_request_interval_sec": float(max(0.0, min_request_interval_sec)),
+        "provider_timeout_sec": float(max(0.1, provider_timeout_sec)),
+        "provider_timed_out_calls": provider_calls.timed_out_calls,
+        "provider_saturated_calls": provider_calls.saturated_calls,
         "elapsed_sec": round(time.time() - started, 1),
     }
 
@@ -568,6 +652,7 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--attempts-per-source", type=int, default=3)
     parser.add_argument("--min-request-interval-sec", type=float, default=0.0)
+    parser.add_argument("--provider-timeout-sec", type=float, default=PROVIDER_CALL_TIMEOUT_SEC)
     args = parser.parse_args()
 
     result = repair_day(
@@ -577,6 +662,7 @@ def main() -> int:
         workers=max(1, int(args.workers)),
         attempts_per_source=max(1, min(3, int(args.attempts_per_source))),
         min_request_interval_sec=max(0.0, float(args.min_request_interval_sec)),
+        provider_timeout_sec=max(0.1, float(args.provider_timeout_sec)),
     )
     print(result)
     return 0 if result["stock_count"] >= 2000 and result["index_count"] >= 4 else 1

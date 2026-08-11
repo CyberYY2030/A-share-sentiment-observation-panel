@@ -145,6 +145,43 @@ class BackfillRuleTests(unittest.TestCase):
         sleep.assert_called_once()
         self.assertAlmostEqual(sleep.call_args.args[0], 0.15, places=6)
 
+    def test_provider_timeout_releases_repair_worker_to_try_next_source(self) -> None:
+        import threading
+
+        from repair_market_day_akshare import ProviderCallLimiter, fetch_with_sources
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def stalled_sina(_code: str, _day_dash: str, _day_compact: str) -> dict:
+            started.set()
+            release.wait(1.0)
+            return {"source": "sina"}
+
+        def tx_fallback(_code: str, _day_dash: str, _day_compact: str) -> dict:
+            return {"source": "tx"}
+
+        limiter = ProviderCallLimiter(max_inflight=1, timeout_sec=0.01)
+        try:
+            row, errors = fetch_with_sources(
+                "600001",
+                "2026-05-19",
+                "20260519",
+                [("ak_sina", stalled_sina), ("ak_tx", tx_fallback)],
+                attempts_per_source=1,
+                provider_calls=limiter,
+            )
+            with self.assertRaisesRegex(TimeoutError, "ak_sina in-flight limit reached"):
+                limiter.call("ak_sina", stalled_sina, "600002", "2026-05-19", "20260519")
+        finally:
+            release.set()
+
+        self.assertTrue(started.is_set())
+        self.assertEqual(row, {"source": "tx"})
+        self.assertEqual(limiter.timed_out_calls, 1)
+        self.assertEqual(limiter.saturated_calls, 1)
+        self.assertTrue(any("ak_sina attempt 1: TimeoutError" in error for error in errors))
+
     def test_concept_and_etf_coverage_use_explicit_eligible_universes(self) -> None:
         import json
         import sqlite3
