@@ -295,9 +295,23 @@ def etf_coverage_for_date(
             )
         if not (_table_exists(con, "etf_master") and _table_exists(con, "etf_scale")):
             return result
+        try:
+            latest_snapshot = _scalar(
+                con,
+                "SELECT MAX(updated_at) FROM etf_master WHERE is_equity=1 AND updated_at IS NOT NULL",
+            )
+            if latest_snapshot is None:
+                return result
+            eligible_rows = con.execute(
+                "SELECT DISTINCT fund_code FROM etf_master WHERE is_equity=1 AND updated_at=?",
+                (latest_snapshot,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # A master without a provider-snapshot marker cannot prove its denominator.
+            return result
         eligible_codes = {
             _canonical_code(row[0])
-            for row in con.execute("SELECT DISTINCT fund_code FROM etf_master WHERE is_equity=1").fetchall()
+            for row in eligible_rows
             if row and row[0] is not None and _canonical_code(row[0])
         }
         if not eligible_codes:
@@ -321,7 +335,8 @@ def etf_coverage_for_date(
                 "etf_have": have,
                 "etf_expect": expect,
                 "etf_missing": expect - have,
-                "etf_expect_source": "etf_master_is_equity",
+                "etf_expect_source": "etf_master_latest_provider_snapshot",
+                "etf_snapshot_at": str(latest_snapshot),
             }
         )
         return result

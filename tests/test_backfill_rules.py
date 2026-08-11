@@ -170,10 +170,17 @@ class BackfillRuleTests(unittest.TestCase):
 
             etf = sqlite3.connect(root / "etf_mvp.db")
             try:
-                etf.execute("CREATE TABLE etf_master (fund_code TEXT, is_equity INTEGER)")
+                etf.execute("CREATE TABLE etf_master (fund_code TEXT, is_equity INTEGER, updated_at TEXT)")
                 etf.execute("CREATE TABLE etf_scale (trade_date TEXT, fund_code TEXT)")
                 etf.execute("CREATE TABLE etf_total (trade_date TEXT)")
-                etf.executemany("INSERT INTO etf_master VALUES (?, 1)", [("510300",), ("510500",)])
+                etf.executemany(
+                    "INSERT INTO etf_master VALUES (?, 1, ?)",
+                    [
+                        ("510300", "2026-04-22 17:31:00"),
+                        ("510500", "2026-04-22 17:31:00"),
+                        ("159001", "2026-04-01 17:31:00"),
+                    ],
+                )
                 etf.execute("INSERT INTO etf_scale VALUES ('2026-04-22', '510300')")
                 etf.execute("INSERT INTO etf_total VALUES ('2026-04-22')")
                 etf.commit()
@@ -187,6 +194,7 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual((concept_coverage["concept_have"], concept_coverage["concept_expect"], concept_coverage["concept_missing"]), (1, 2, 1))
         self.assertFalse(etf_coverage["etf"])
         self.assertEqual((etf_coverage["etf_have"], etf_coverage["etf_expect"], etf_coverage["etf_missing"]), (1, 2, 1))
+        self.assertEqual(etf_coverage["etf_expect_source"], "etf_master_latest_provider_snapshot")
 
     def test_skip_mining_excludes_mining_from_the_ops1_market_recovery_plan(self) -> None:
         from offline_daily_update import run_offline_update
