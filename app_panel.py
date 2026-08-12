@@ -32,7 +32,7 @@ import streamlit as st
 from backfill_orchestrator import start_background_job
 from offline_daily_update import (
     build_missing_update_plan,
-    prototype_readiness_for_date,
+    readiness_for_date,
     resolve_expected_trade_days,
     screening_readiness_for_date,
 )
@@ -942,7 +942,7 @@ def resolve_available_panel_close_date(
         available = [
             day
             for day in available
-            if bool((readiness_by_date.get(str(day.date())) or {}).get("screening_ready"))
+            if bool((readiness_by_date.get(str(day.date())) or {}).get("market_data_ready"))
         ]
     if not available:
         return None, bool(requested is not None), []
@@ -2212,6 +2212,30 @@ def compute_etf_share_pct(etf_df: pd.DataFrame, dates: List[pd.Timestamp]) -> Tu
 # ----------------------------
 # Sentiment computation
 # ----------------------------
+def _stock_metric_observations(stock_df: pd.DataFrame, dates: List[pd.Timestamp]) -> pd.DataFrame:
+    """Keep return and amount validity independent for close-day sentiment metrics."""
+    required = ["trade_date", "sec_code", "change_pct", "amount", "close"]
+    frame = stock_df.reindex(columns=required).copy()
+    frame["trade_date"] = _ensure_trade_dates(frame["trade_date"])
+    frame["sec_code"] = _ensure_canonical_codes(frame["sec_code"])
+    for column in ("change_pct", "amount", "close"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce").where(lambda value: np.isfinite(value))
+    frame = frame.dropna(subset=["trade_date", "sec_code"]).drop_duplicates(
+        ["trade_date", "sec_code"], keep="last"
+    )
+    ordered_dates = sorted({pd.Timestamp(value).normalize() for value in dates})
+    previous_day = {day: ordered_dates[index - 1] for index, day in enumerate(ordered_dates) if index}
+    frame["previous_trade_date"] = pd.to_datetime(frame["trade_date"].map(previous_day))
+    previous_close = frame[["trade_date", "sec_code", "close"]].rename(
+        columns={"trade_date": "previous_trade_date", "close": "previous_close"}
+    )
+    frame = frame.merge(previous_close, on=["previous_trade_date", "sec_code"], how="left")
+    derived_return = (frame["close"] / frame["previous_close"] - 1.0) * 100.0
+    derived_return = derived_return.where(frame["close"].gt(0) & frame["previous_close"].gt(0))
+    frame["return_pct"] = frame["change_pct"].where(frame["change_pct"].notna(), derived_return)
+    return frame
+
+
 def compute_daily_sentiment(
     stock_df: pd.DataFrame,
     index_df: pd.DataFrame,
@@ -2232,23 +2256,19 @@ def compute_daily_sentiment(
     if stock_df is None or stock_df.empty:
         return pd.DataFrame(), ["stock_df empty (no stock cross-section in DB for selected dates)"]
 
-    df = stock_df[["trade_date", "sec_code", "change_pct", "amount", "close"]].copy()
-    df["trade_date"] = _ensure_trade_dates(df["trade_date"])
-    df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
-    df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
+    df = _stock_metric_observations(stock_df, dates)
+    return_df = df.dropna(subset=["return_pct"]).copy()
+    amount_df = df.dropna(subset=["amount"]).copy()
+    hot_df = df.dropna(subset=["return_pct", "amount"]).copy()
+    return_df["is_flat"] = np.isclose(return_df["return_pct"], 0.0)
 
-    # Every metric below needs both a return and turnover input.  Unknown fields
-    # are removed instead of being treated as a flat/zero observation.
-    df = df.dropna(subset=["trade_date", "change_pct", "amount"]).copy()
-    df["is_flat"] = np.isclose(df["change_pct"].fillna(0), 0.0)
-
-    g = df.groupby("trade_date")
-    allA_ew_pct = g["change_pct"].mean()  # unit: percent
+    g = return_df.groupby("trade_date")
+    allA_ew_pct = g["return_pct"].mean()  # unit: percent
     allA_ew_ret = (allA_ew_pct / 100.0).reindex(dates)
 
-    non_flat = df.loc[~df["is_flat"], ["trade_date", "change_pct"]].copy()
-    non_flat["up_cnt"] = (non_flat["change_pct"] > 0).astype(int)
-    non_flat["down_cnt"] = (non_flat["change_pct"] < 0).astype(int)
+    non_flat = return_df.loc[~return_df["is_flat"], ["trade_date", "return_pct"]].copy()
+    non_flat["up_cnt"] = (non_flat["return_pct"] > 0).astype(int)
+    non_flat["down_cnt"] = (non_flat["return_pct"] < 0).astype(int)
     counts = non_flat.groupby("trade_date")[["up_cnt", "down_cnt"]].sum()
     up_cnt = counts["up_cnt"].reindex(dates)
     down_cnt = counts["down_cnt"].reindex(dates)
@@ -2258,11 +2278,11 @@ def compute_daily_sentiment(
 
     # hot proxy: daily top N by amount
     hot_top = (
-        df.sort_values(["trade_date", "amount"], ascending=[True, False])
+        hot_df.sort_values(["trade_date", "amount"], ascending=[True, False])
         .groupby("trade_date", group_keys=False)
         .head(int(hot_top_n))
     )
-    hot_ret_pct = hot_top.groupby("trade_date")["change_pct"].mean().reindex(dates)
+    hot_ret_pct = hot_top.groupby("trade_date")["return_pct"].mean().reindex(dates)
     hot_excess = ((hot_ret_pct - allA_ew_pct.reindex(dates)) / 100.0).reindex(dates)
 
     # style: zz1000 - hs300 (decimal returns)
@@ -2297,7 +2317,7 @@ def compute_daily_sentiment(
     if market_turnover is not None:
         mkt_amt = pd.to_numeric(market_turnover, errors="coerce").reindex(dates).astype(float)
     else:
-        mkt_amt = build_market_turnover(index_df=index_df, stock_df=df, dates=dates, msgs=msgs)
+        mkt_amt = build_market_turnover(index_df=index_df, stock_df=amount_df, dates=dates, msgs=msgs)
 
     ma10 = mkt_amt.rolling(10, min_periods=5).mean()
     turnover_rel_ma10 = (mkt_amt / ma10) - 1.0
@@ -2366,22 +2386,28 @@ def compute_daily_sentiment(
 
 
 def sentiment_metric_coverage(stock_df: pd.DataFrame, trade_date: Any) -> Dict[str, int]:
-    """Return the visible denominator for close-day sentiment metrics."""
+    """Return per-metric close-day denominators without manufacturing values."""
     if stock_df is None or stock_df.empty:
-        return {"valid": 0, "expected": 0, "excluded": 0}
+        return {"return_valid": 0, "amount_valid": 0, "hot_valid": 0, "expected": 0, "excluded": 0}
     day = _day_ts(trade_date)
     if day is None or "trade_date" not in stock_df.columns or "sec_code" not in stock_df.columns:
-        return {"valid": 0, "expected": 0, "excluded": 0}
-    frame = stock_df.copy()
-    frame["trade_date"] = _ensure_trade_dates(frame["trade_date"])
+        return {"return_valid": 0, "amount_valid": 0, "hot_valid": 0, "expected": 0, "excluded": 0}
+    raw_dates = _ensure_trade_dates(stock_df["trade_date"]).dropna().tolist()
+    frame = _stock_metric_observations(stock_df, [pd.Timestamp(value) for value in raw_dates])
     frame = frame[frame["trade_date"] == day].copy()
     expected = int(frame["sec_code"].astype(str).nunique())
     if frame.empty:
-        return {"valid": 0, "expected": expected, "excluded": expected}
-    for column in ("change_pct", "amount"):
-        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
-    valid = int(frame.dropna(subset=["change_pct", "amount"])["sec_code"].astype(str).nunique())
-    return {"valid": valid, "expected": expected, "excluded": max(expected - valid, 0)}
+        return {"return_valid": 0, "amount_valid": 0, "hot_valid": 0, "expected": expected, "excluded": expected}
+    return_valid = int(frame.dropna(subset=["return_pct"])["sec_code"].astype(str).nunique())
+    amount_valid = int(frame.dropna(subset=["amount"])["sec_code"].astype(str).nunique())
+    hot_valid = int(frame.dropna(subset=["return_pct", "amount"])["sec_code"].astype(str).nunique())
+    return {
+        "return_valid": return_valid,
+        "amount_valid": amount_valid,
+        "hot_valid": hot_valid,
+        "expected": expected,
+        "excluded": max(expected - hot_valid, 0),
+    }
 
 
 # ----------------------------
@@ -4651,7 +4677,7 @@ def main():
             readiness_by_date[day_key] = screening_readiness_for_date(runtime_paths.base_dir, day_key)
         except Exception as exc:
             readiness_by_date[day_key] = {"screening_ready": False, "error": type(exc).__name__}
-        if readiness_by_date[day_key].get("screening_ready"):
+        if readiness_by_date[day_key].get("market_data_ready"):
             break
     panel_close_dt, missing_requested_close, available_panel_close_dates = resolve_available_panel_close_date(
         requested_close_dt0,
@@ -4666,7 +4692,7 @@ def main():
     panel_optional_readiness: Dict[str, Any] = {}
     if panel_close_dt is not None:
         try:
-            panel_optional_readiness = prototype_readiness_for_date(runtime_paths.base_dir, str(panel_close_dt.date()))
+            panel_optional_readiness = readiness_for_date(runtime_paths.base_dir, str(panel_close_dt.date()))
         except Exception as exc:
             panel_optional_readiness = {"error": type(exc).__name__}
     if missing_requested_close and requested_close_dt0 is not None:
@@ -4952,7 +4978,10 @@ def main():
     metric_coverage = sentiment_metric_coverage(stock_df, last.get("trade_date"))
     st.caption(
         f"Metric coverage ({pd.Timestamp(last.get('trade_date')).date()}): "
-        f"valid={metric_coverage['valid']} / expected={metric_coverage['expected']} / excluded={metric_coverage['excluded']}"
+        f"return_valid={metric_coverage['return_valid']} / "
+        f"amount_valid={metric_coverage['amount_valid']} / "
+        f"hot_valid={metric_coverage['hot_valid']} / "
+        f"expected={metric_coverage['expected']} / excluded={metric_coverage['excluded']}"
     )
     rt_prefix = '🟢' if (intraday_row is not None) else ''
     c1.metric("情绪总分（0-100）", f"{safe_to_float(last.get('sentiment_score')):.2f}" if np.isfinite(safe_to_float(last.get("sentiment_score"))) else "—")

@@ -48,6 +48,7 @@ from ..selection_batches import latest_complete_batch, selection_batch_schema_st
 from ..selection_runtime import (
     CHINA_TZ,
     MODE_CLOSE_FINAL,
+    MODE_CLOSE_PENDING,
     MODE_DATA_UNAVAILABLE,
     SelectionRuntime,
 )
@@ -844,11 +845,52 @@ def _formal_capability_view(
     trade_date: str,
     *,
     selected_trade_date: str | None = None,
-    snapshot_loader: SnapshotLoader | None = None,
     now: dt.datetime | None = None,
-    runtime: SelectionRuntime | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
-    """Use final persisted rows only after close finalization; otherwise run A–E from one snapshot."""
+    """Read only the current complete close-final batch for formal A–E."""
+    del now
+    batch = latest_complete_batch(conn, trade_date)
+    formal_trade_date = _formal_batch_trade_date(conn, trade_date)
+    batch_pending = batch.code == "unfinalized"
+    selected = str(selected_trade_date or trade_date)
+    date_status = (
+        "aligned"
+        if batch.code == "complete" and selected == str(trade_date) == formal_trade_date
+        else "date_mismatch" if batch.code == "complete" else "batch_pending"
+    )
+    evidence: dict[str, object] = {
+        "mode": MODE_CLOSE_FINAL if batch.code == "complete" else MODE_CLOSE_PENDING,
+        "as_of": None,
+        "price_as_of": str(trade_date),
+        "metadata_as_of": None,
+        "trend_profile": None,
+        "data_status": "complete" if batch.code == "complete" else "pending",
+        "snapshot_source": None,
+        "snapshot_coverage": None,
+        "snapshot_provider": None,
+        "snapshot_status": None,
+        "snapshot_observed_at": None,
+        "snapshot_raw_rows": None,
+        "snapshot_normalized_rows": None,
+        "snapshot_errors": [],
+        "snapshot_from_cache": False,
+        "snapshot_retry_at": None,
+        "selected_trade_date": selected,
+        "effective_trade_date": str(trade_date),
+        "formal_trade_date": formal_trade_date,
+        "date_status": date_status,
+        "formal_batch_status": "pending" if batch_pending else batch.code,
+    }
+    status = _capability_run_status(conn, trade_date)
+    status.attrs["a_history_coverage"] = a_history_coverage(conn, trade_date)
+    if batch.code != "complete":
+        if batch_pending and not status.empty:
+            status["availability"] = "waiting_for_formal_batch"
+        return pd.DataFrame(), status, evidence
+    return _apply_date_evidence_gate(
+        _load_formal_capability_candidates(conn, trade_date), status, evidence
+    )
+
     current = now or dt.datetime.now(CHINA_TZ)
     resolved_runtime = runtime or SelectionRuntime()
     snapshot = None
@@ -895,7 +937,6 @@ def _formal_capability_view(
                 "benchmark_provider": None,
                 "benchmark_observed_at": None,
                 "benchmark_errors": [],
-                "prototype_formal_preview": True,
             }
         )
         c_history = a_history_coverage(
@@ -905,7 +946,6 @@ def _formal_capability_view(
         )
         rows, status = _live_formal_capability_rows(conn, context)
         status.attrs["a_history_coverage"] = c_history
-        status.attrs["prototype_formal_preview"] = True
         return _apply_date_evidence_gate(rows, status, evidence)
 
     result = resolved_runtime.run(
@@ -1776,20 +1816,10 @@ def render_scanner_tab(
         try:
             market_summary = _load_market_regime_summary(status_conn, today_date)
             run_status_df = _load_strategy_run_status(status_conn, today_date)
-            runtime_key = f"formal_selection_runtime_{today_date}"
-            if runtime_key not in st.session_state:
-                st.session_state[runtime_key] = SelectionRuntime()
             formal_today_df, capability_status_df, selection_evidence = _formal_capability_view(
                 status_conn,
                 today_date,
                 selected_trade_date=query_trade_date or today_date,
-                snapshot_loader=(
-                    shared_snapshot_loader
-                    if str(today_date) == str(query_trade_date or today_date)
-                    else None
-                ),
-                now=now,
-                runtime=st.session_state[runtime_key],
             )
             c_history = capability_status_df.attrs.get("a_history_coverage") or a_history_coverage(status_conn, today_date)
         finally:
@@ -1833,7 +1863,9 @@ def render_scanner_tab(
     )
     if selection_evidence.get("date_status") == "date_mismatch":
         st.error("date_mismatch：选择日期、实际评估日期与正式批次日期不一致，候选表已隐藏。")
-    if selection_evidence["mode"] == "intraday_snapshot":
+    if selection_evidence.get("formal_batch_status") == "pending":
+        st.warning("等待正式批次：当日 v2.5 close_final/complete batch 尚不可用，候选为空。")
+    elif selection_evidence["mode"] == "intraday_snapshot":
         st.warning("盘中临时结果：不会写入正式收盘候选或状态历史。")
     elif selection_evidence["mode"] == "close_pending":
         st.warning("收盘待定：正在展示最后一批临时快照，收盘日线通过质量检查后才会定版。")

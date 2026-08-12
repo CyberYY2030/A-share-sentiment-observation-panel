@@ -471,8 +471,8 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual(result["quality_failures"][0]["code"], "eligible_universe_regression")
         self.assertEqual(result["quality_failures"][0]["candidate_count"], 263)
 
-    def test_proto_readiness_keeps_concept_regression_optional(self) -> None:
-        from offline_daily_update import prototype_readiness_for_date
+    def test_selection_readiness_requires_a_complete_formal_batch(self) -> None:
+        from offline_daily_update import readiness_for_date
 
         def coverage(_base, _day, *, domains=None, **_kwargs):
             selected = set(domains or [])
@@ -498,14 +498,17 @@ class BackfillRuleTests(unittest.TestCase):
             if "etf" in selected:
                 result["etf"] = True
             if "mining" in selected:
-                result["mining"] = False
+                result.update({"mining": False, "mining_batch_status": "pending"})
             return result
 
         with mock.patch("offline_daily_update.coverage_for_date", side_effect=coverage):
-            readiness = prototype_readiness_for_date(Path("."), "2026-08-10")
+            readiness = readiness_for_date(Path("."), "2026-08-10")
 
-        self.assertTrue(readiness["screening_ready"])
-        self.assertEqual(readiness["overall_status"], "degraded")
+        self.assertTrue(readiness["market_data_ready"])
+        self.assertFalse(readiness["selection_ready"])
+        self.assertFalse(readiness["screening_ready"])
+        self.assertEqual(readiness["overall_status"], "pending")
+        self.assertEqual(readiness["domains"]["mining"]["status"], "pending")
         self.assertFalse(readiness["domains"]["concept"]["ready"])
         self.assertEqual(readiness["domains"]["concept"]["reason_codes"], ["eligible_universe_regression"])
 

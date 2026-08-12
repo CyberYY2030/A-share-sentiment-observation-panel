@@ -1029,7 +1029,7 @@ class MiningUiSmokeTests(unittest.TestCase):
                 for code in ("000001", "399001", "000300", "000852")
             ]
         )
-        readiness = {"2026-04-21": {"screening_ready": True}}
+        readiness = {"2026-04-21": {"market_data_ready": True, "screening_ready": False}}
         resolved, missing, available = resolve_available_panel_close_date(
             "2026-04-21", stock_df, index_df, readiness_by_date=readiness
         )
@@ -1037,7 +1037,40 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertEqual(resolved, pd.Timestamp("2026-04-21"))
         self.assertFalse(missing)
         self.assertEqual(available, [pd.Timestamp("2026-04-21")])
-        self.assertEqual(sentiment_metric_coverage(stock_df, "2026-04-21"), {"valid": 1, "expected": 2, "excluded": 1})
+        self.assertEqual(
+            sentiment_metric_coverage(stock_df, "2026-04-21"),
+            {"return_valid": 1, "amount_valid": 1, "hot_valid": 1, "expected": 2, "excluded": 1},
+        )
+
+    def test_metric_denominators_keep_return_amount_and_hot_inputs_separate(self) -> None:
+        from app_panel import compute_daily_sentiment, sentiment_metric_coverage
+
+        dates = [pd.Timestamp("2026-04-20"), pd.Timestamp("2026-04-21")]
+        stock_df = pd.DataFrame(
+            [
+                {"trade_date": "2026-04-20", "sec_code": "600001", "change_pct": 0.0, "amount": 10.0, "close": 10.0},
+                {"trade_date": "2026-04-20", "sec_code": "600002", "change_pct": 0.0, "amount": 20.0, "close": 20.0},
+                {"trade_date": "2026-04-21", "sec_code": "600001", "change_pct": None, "amount": 100.0, "close": 11.0},
+                {"trade_date": "2026-04-21", "sec_code": "600002", "change_pct": 2.0, "amount": None, "close": 21.0},
+                {"trade_date": "2026-04-21", "sec_code": "600003", "change_pct": None, "amount": 300.0, "close": 5.0},
+            ]
+        )
+        daily, _ = compute_daily_sentiment(
+            stock_df,
+            pd.DataFrame(),
+            pd.DataFrame(),
+            dates,
+            {"B": 1.0},
+            market_turnover=pd.Series([100.0, 120.0], index=dates),
+        )
+        row = daily.loc[daily["trade_date"].eq(pd.Timestamp("2026-04-21"))].iloc[0]
+
+        self.assertAlmostEqual(float(row["allA_ew_ret"]), 0.06)
+        self.assertAlmostEqual(float(row["hot_excess"]), 0.04)
+        self.assertEqual(
+            sentiment_metric_coverage(stock_df, "2026-04-21"),
+            {"return_valid": 2, "amount_valid": 2, "hot_valid": 1, "expected": 3, "excluded": 2},
+        )
 
     def test_close_mode_opportunity_runtime_follows_selected_close_day(self) -> None:
         from app_panel import resolve_selected_opportunity_runtime

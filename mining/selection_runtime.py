@@ -8,7 +8,12 @@ from typing import Any, Callable
 
 import pandas as pd
 
-from .data_quality import STATUS_CLEAN, clean_stock_trade_dates, inspect_stock_session
+from .data_quality import (
+    STATUS_CLEAN,
+    STATUS_USABLE_WITH_QUARANTINE,
+    clean_stock_trade_dates,
+    inspect_stock_session,
+)
 from .selection_context import SelectionContext, build_selection_context
 
 
@@ -67,8 +72,9 @@ def resolve_selection_mode(
 ) -> ModeResolution:
     """Resolve the only legal runtime mode; finalized close data always wins."""
     current = _as_china_time(now)
-    if close_quality_status == STATUS_CLEAN:
-        return ModeResolution(MODE_CLOSE_FINAL, "clean_close_final")
+    if close_quality_status in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}:
+        reason = "clean_close_final" if close_quality_status == STATUS_CLEAN else "usable_with_quarantine_close_final"
+        return ModeResolution(MODE_CLOSE_FINAL, reason)
     if current.date().isoformat() != str(trade_date) or current.weekday() >= 5:
         return ModeResolution(MODE_DATA_UNAVAILABLE, "snapshot_not_valid_after_trade_date")
     if snapshot_as_of is None or snapshot_coverage is None:

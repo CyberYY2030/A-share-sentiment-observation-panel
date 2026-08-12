@@ -22,6 +22,7 @@ from mining.data_quality import (
     revalidate_known_bad_session,
     stock_quality_is_screening_ready,
 )
+from mining.selection_batches import latest_complete_batch
 from runtime_paths import build_runtime_paths
 
 
@@ -369,20 +370,35 @@ def etf_coverage_for_date(
 
 def mining_coverage_for_date(base_dir: str | Path, day: str) -> dict[str, Any]:
     db_path = Path(base_dir) / "mining_mvp.db"
-    result: dict[str, Any] = {"mining": False, "mining_candidates": 0, "mining_runs": 0}
+    result: dict[str, Any] = {
+        "mining": False,
+        "mining_batch_status": "not_run",
+        "mining_batch_id": None,
+        "mining_candidates": 0,
+        "mining_runs": 0,
+    }
     if not db_path.exists():
         return result
 
     con = _connect(db_path)
     try:
+        batch = latest_complete_batch(con, day)
+        result["mining_batch_status"] = "pending" if batch.code == "unfinalized" else batch.code
+        result["mining_batch_id"] = batch.batch_id
+        if batch.code != "complete" or batch.batch_id is None:
+            return result
         candidates = 0
         runs = 0
-        if _table_exists(con, "candidates"):
+        if _table_exists(con, "candidates") and _table_exists(con, "strategy_runs"):
             candidates = int(
                 _scalar(
                     con,
-                    "SELECT COUNT(*) FROM candidates WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?",
-                    (day,),
+                    """
+                    SELECT COUNT(*) FROM candidates c
+                    JOIN strategy_runs r ON r.run_id=c.run_id
+                    WHERE r.batch_id=? AND r.mode='close_final'
+                    """,
+                    (batch.batch_id,),
                 )
                 or 0
             )
@@ -390,14 +406,14 @@ def mining_coverage_for_date(base_dir: str | Path, day: str) -> dict[str, Any]:
             runs = int(
                 _scalar(
                     con,
-                    "SELECT COUNT(*) FROM strategy_runs WHERE substr(replace(trade_date, '/', '-'), 1, 10)=?",
-                    (day,),
+                    "SELECT COUNT(*) FROM strategy_runs WHERE batch_id=? AND mode='close_final'",
+                    (batch.batch_id,),
                 )
                 or 0
             )
         result.update(
             {
-                "mining": candidates > 0 or runs > 0,
+                "mining": True,
                 "mining_candidates": candidates,
                 "mining_runs": runs,
             }
@@ -445,22 +461,22 @@ def coverage_for_date(
 
 
 def screening_readiness_for_date(base_dir: str | Path, day: str) -> dict[str, Any]:
-    """Return the shared stock/index gate for panels, updater, and selection.
-
-    A complete mining batch is reported independently: stock and the four
-    required indexes decide whether close-data screening may run, while a
-    batch decides only whether persisted results are available to read.
-    """
+    """Return distinct market and formal-selection readiness for one close day."""
     normalized = normalize_day(day)
     if normalized is None:
         raise ValueError(f"Invalid day: {day!r}")
-    coverage = coverage_for_date(base_dir, normalized, domains=("stock", "index"))
+    coverage = coverage_for_date(base_dir, normalized, domains=("stock", "index", "mining"))
     quality = dict(coverage.get("session_quality") or {})
     stock_ready = bool(coverage.get("stock"))
     index_ready = bool(coverage.get("index"))
+    market_data_ready = stock_ready and index_ready
+    selection_ready = market_data_ready and bool(coverage.get("mining"))
+    mining_status = str(coverage.get("mining_batch_status") or "not_run")
     return {
         "trade_date": normalized,
-        "screening_ready": stock_ready and index_ready,
+        "market_data_ready": market_data_ready,
+        "selection_ready": selection_ready,
+        "screening_ready": selection_ready,
         "domains": {
             "stock": {
                 "ready": stock_ready,
@@ -473,6 +489,14 @@ def screening_readiness_for_date(base_dir: str | Path, day: str) -> dict[str, An
                 "status": "ready" if index_ready else "unavailable",
                 "reason_codes": [] if index_ready else ["required_index_codes_missing"],
                 "index_codes": list(coverage.get("index_codes") or []),
+            },
+            "mining": {
+                "ready": bool(coverage.get("mining")),
+                "status": "complete" if coverage.get("mining") else mining_status,
+                "reason_codes": [] if coverage.get("mining") else ["close_final_batch_unavailable"],
+                "batch_id": coverage.get("mining_batch_id"),
+                "runs": int(coverage.get("mining_runs") or 0),
+                "candidates": int(coverage.get("mining_candidates") or 0),
             },
         },
     }
@@ -525,7 +549,7 @@ def _stock_quality_health_evidence(stock_db: str | Path, day: str) -> dict[str, 
     }
 
 
-def prototype_readiness_for_date(
+def readiness_for_date(
     base_dir: str | Path,
     day: str,
     *,
@@ -533,10 +557,10 @@ def prototype_readiness_for_date(
     quality_failures: Iterable[dict[str, Any]] = (),
     include_health_evidence: bool = False,
 ) -> dict[str, Any]:
-    """Apply PROTO-1's optional-domain policy without contacting a provider."""
+    """Apply the optional concept/ETF policy without contacting a provider."""
     core = screening_readiness_for_date(base_dir, day)
     normalized = str(core["trade_date"])
-    optional_domains = ("etf", "mining") if skip_concept else ("concept", "etf", "mining")
+    optional_domains = ("etf",) if skip_concept else ("concept", "etf")
     coverage = coverage_for_date(base_dir, normalized, domains=optional_domains)
     domains = dict(core["domains"])
     failure_codes = [str(item.get("code")) for item in quality_failures if item.get("code")]
@@ -566,17 +590,17 @@ def prototype_readiness_for_date(
         "status": "ready" if etf_ready else "unavailable",
         "reason_codes": [] if etf_ready else ["etf_coverage_incomplete"],
     }
-    mining_ready = bool(coverage.get("mining"))
-    domains["mining"] = {
-        "ready": mining_ready,
-        "status": "complete" if mining_ready else "not_run",
-        "reason_codes": [] if mining_ready else ["close_final_batch_unavailable"],
-    }
-    optional_degraded = any(not bool(domains[name]["ready"]) for name in ("concept", "etf", "mining"))
+    optional_degraded = any(not bool(domains[name]["ready"]) for name in ("concept", "etf"))
+    if not core["market_data_ready"]:
+        overall_status = "blocked"
+    elif not core["selection_ready"]:
+        overall_status = "pending"
+    else:
+        overall_status = "degraded" if optional_degraded else "ready"
     result = {
         **core,
         "domains": domains,
-        "overall_status": "ready" if core["screening_ready"] and not optional_degraded else "degraded" if core["screening_ready"] else "blocked",
+        "overall_status": overall_status,
     }
     if include_health_evidence:
         paths = build_runtime_paths(str(base_dir))
@@ -1220,7 +1244,7 @@ def write_health_summary(base_dir: str | Path, update_result: dict[str, Any] | N
     target_date = normalize_day(plan_dates[-1]) if plan_dates else stock_max
     readiness = (update_result or {}).get("readiness")
     if not isinstance(readiness, dict) and target_date:
-        readiness = prototype_readiness_for_date(base, target_date, include_health_evidence=True)
+        readiness = readiness_for_date(base, target_date, include_health_evidence=True)
 
     domain_dates = {
         "stock": stock_max,
@@ -1626,7 +1650,7 @@ def run_offline_update(
             "mining_deferred": not include_mining,
             "concept_deferred": not include_concept,
         }
-        result["readiness"] = prototype_readiness_for_date(
+        result["readiness"] = readiness_for_date(
             paths.base_dir,
             expected_dates[-1] if expected_dates else target_close_date,
             skip_concept=not include_concept,
@@ -1979,7 +2003,7 @@ def run_offline_update(
         "mining_deferred": not include_mining,
         "concept_deferred": not include_concept,
     }
-    result["readiness"] = prototype_readiness_for_date(
+    result["readiness"] = readiness_for_date(
         paths.base_dir,
         expected_dates[-1] if expected_dates else target_close_date,
         skip_concept=not include_concept,

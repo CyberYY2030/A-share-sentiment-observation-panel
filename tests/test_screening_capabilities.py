@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import datetime as dt
 import tempfile
 import unittest
-from unittest import mock
 from pathlib import Path
 
 import pandas as pd
@@ -14,8 +12,8 @@ from mining.capabilities import CAPABILITY_REGISTRY, formal_strategy_ids
 from mining.db import SCHEMA_SQL
 from mining.db import connect
 from mining.reports import load_formal_capability_candidates
+from mining.candidate_persistence import migrate_selection_batch_schema
 from mining.selection_context import SelectionContext
-from mining.selection_runtime import MODE_INTRADAY, SelectionRuntime
 from mining.streamlit_tabs.tab_scanner import (
     _capability_run_status,
     _filter_pullback_strength_phase,
@@ -106,64 +104,25 @@ class ScreeningCapabilityRegistryTests(unittest.TestCase):
             },
         )
 
-    def test_snapshot_view_recomputes_all_capabilities_without_writing_official_rows(self) -> None:
+    def test_missing_formal_batch_shows_waiting_state_without_recomputation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
             dates = create_sample_market_dbs(base)
             conn = connect(base)
             try:
-                snapshot = pd.read_sql_query(
-                    """
-                    SELECT k.sec_code, s.name AS sec_name, k.open, k.high, k.low, k.close,
-                           k.pre_close, k.volume, k.amount, k.turnover_ratio
-                    FROM ash.kline_daily k
-                    LEFT JOIN ash.stock_info s ON s.sec_code=k.sec_code
-                    WHERE k.sec_type='stock' AND k.trade_date=?
-                    """,
-                    conn,
-                    params=[dates["target_trade_date"]],
-                )
+                migrate_selection_batch_schema(conn)
                 before = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
                 rows, status, evidence = _formal_capability_view(
                     conn,
-                    "2026-04-20",
-                    snapshot_loader=lambda: snapshot,
-                    now=dt.datetime(2026, 4, 20, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
-                    runtime=SelectionRuntime(),
+                    dates["target_trade_date"],
+                    selected_trade_date=dates["target_trade_date"],
                 )
                 after = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
             finally:
                 conn.close()
 
-        self.assertEqual(evidence["mode"], MODE_INTRADAY)
-        self.assertEqual(set(status["strategy_id"]), set(formal_strategy_ids()))
+        self.assertEqual(evidence["formal_batch_status"], "pending")
+        self.assertEqual(evidence["date_status"], "batch_pending")
+        self.assertEqual({"waiting_for_formal_batch"}, set(status["availability"]))
         self.assertEqual(before, after)
-        self.assertTrue(rows.empty or set(rows["strategy_id"]).issubset(set(formal_strategy_ids())))
-
-    def test_quarantined_close_uses_read_only_formal_preview_without_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
-            dates = create_sample_market_dbs(base)
-            conn = connect(base)
-            try:
-                before = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-                with mock.patch(
-                    "mining.streamlit_tabs.tab_scanner.inspect_stock_session",
-                    return_value={"status": "usable_with_quarantine", "reasons": ["row_quarantine"]},
-                ):
-                    rows, status, evidence = _formal_capability_view(
-                        conn,
-                        dates["target_trade_date"],
-                        selected_trade_date=dates["target_trade_date"],
-                        snapshot_loader=lambda: (_ for _ in ()).throw(AssertionError("snapshot must not be called")),
-                        now=dt.datetime(2026, 4, 20, 18, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
-                    )
-                after = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
-            finally:
-                conn.close()
-
-        self.assertTrue(evidence["prototype_formal_preview"])
-        self.assertEqual(evidence["date_status"], "aligned")
-        self.assertTrue(status.attrs["prototype_formal_preview"])
-        self.assertEqual(before, after)
-        self.assertTrue(rows.empty or set(rows["strategy_id"]).issubset(set(formal_strategy_ids())))
+        self.assertTrue(rows.empty)

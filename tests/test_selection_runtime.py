@@ -129,9 +129,19 @@ class SelectionRuntimeTests(unittest.TestCase):
             snapshot_coverage=1.0,
             policy=self.policy,
         )
+        quarantined = resolve_selection_mode(
+            trade_date=self.snapshot_date,
+            now=now,
+            close_quality_status="usable_with_quarantine",
+            snapshot_as_of=None,
+            snapshot_coverage=None,
+            policy=self.policy,
+        )
 
         self.assertEqual(final.mode, MODE_CLOSE_FINAL)
         self.assertEqual(pending.mode, MODE_CLOSE_PENDING)
+        self.assertEqual(quarantined.mode, MODE_CLOSE_FINAL)
+        self.assertEqual(quarantined.reason, "usable_with_quarantine_close_final")
 
     def test_intraday_snapshot_is_cached_and_never_writes_official_candidates(self) -> None:
         runtime = SelectionRuntime(self.policy)
