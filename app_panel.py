@@ -70,6 +70,9 @@ DEFAULT_CSV_OUT = "daily_metrics_last40.csv"
 CATCHUP_THROTTLE_SECONDS = 1800.0
 SCREENING_BASE_DIR_ENV = "SCREENING_BASE_DIR"
 SCREENING_ACCEPTANCE_NOW_CN_ENV = "SCREENING_ACCEPTANCE_NOW_CN"
+CORE_UPDATE_TIMEOUT_SECONDS = 3600
+CORE_FORMAL_MAX_ATTEMPTS = 3
+CORE_FORMAL_RETRY_SECONDS = 300
 
 
 # Backfill scripts (place them in the same folder as this Streamlit app)
@@ -136,6 +139,156 @@ def app_dir() -> str:
         return os.path.dirname(os.path.abspath(__file__))
     except Exception:
         return os.getcwd()
+
+
+def core_update_exclusive_key(base_dir: str | Path) -> str:
+    return f"offline_daily_update_core_{Path(base_dir).resolve()}"
+
+
+def build_core_update_command(
+    base_dir: str | Path,
+    target_day: str,
+    *,
+    script_path: str | Path | None = None,
+) -> list[str]:
+    """Build the only ordinary-page writer command for one target close day."""
+    if not str(target_day or "").strip():
+        raise ValueError("target_day is required for the core update worker")
+    script = Path(script_path) if script_path else Path(app_dir()) / "offline_daily_update.py"
+    return [
+        sys.executable,
+        str(script),
+        "--base-dir",
+        str(base_dir),
+        "--asof",
+        str(target_day),
+        "--target-day",
+        str(target_day),
+        "--domains",
+        "stock",
+        "index",
+        "--timeout-sec",
+        str(CORE_UPDATE_TIMEOUT_SECONDS),
+    ]
+
+
+def _retry_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = dt.datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def target_day_core_decision(
+    readiness: Dict[str, Any],
+    previous: Optional[Dict[str, Any]] = None,
+    *,
+    now_ts: Optional[float] = None,
+    page_open: bool = False,
+    manual_retry: bool = False,
+) -> Dict[str, Any]:
+    """Choose one fail-closed target-day action without touching a database."""
+    previous = dict(previous or {})
+    status = previous.get("last_structured_result")
+    if isinstance(status, dict):
+        merged = {**previous, **status}
+    else:
+        merged = previous
+    now_value = float(now_ts if now_ts is not None else dt.datetime.now().timestamp())
+    prior_attempt = max(0, int(merged.get("formal_attempt") or 0))
+    target = str(readiness.get("trade_date") or readiness.get("target_day") or merged.get("target_day") or "")
+    if bool(readiness.get("screening_ready")):
+        return {
+            "action": "none",
+            "target_day": target,
+            "market_status": "market_ready",
+            "formal_status": "complete",
+            "formal_attempt": prior_attempt,
+        }
+    if not bool(readiness.get("market_data_ready")):
+        return {
+            "action": "enqueue",
+            "target_day": target,
+            "work_kind": "market",
+            "market_status": "market_running",
+            "formal_status": "not_run",
+            "formal_attempt": prior_attempt,
+        }
+
+    prior_failed = str(merged.get("formal_status") or merged.get("phase") or "") == "formal_failed"
+    retry_at = _retry_timestamp(merged.get("next_retry_at") or merged.get("retry_at"))
+    if prior_failed and prior_attempt >= CORE_FORMAL_MAX_ATTEMPTS and not manual_retry:
+        return {
+            "action": "manual_retry_required",
+            "target_day": target,
+            "work_kind": "formal",
+            "market_status": "market_ready",
+            "formal_status": "formal_failed",
+            "formal_attempt": prior_attempt,
+            "last_error": merged.get("reason") or merged.get("last_error"),
+            "next_retry_at": retry_at,
+        }
+    if prior_failed and not manual_retry and not page_open and retry_at is not None and now_value < retry_at:
+        return {
+            "action": "defer",
+            "target_day": target,
+            "work_kind": "formal",
+            "market_status": "market_ready",
+            "formal_status": "formal_failed",
+            "formal_attempt": prior_attempt,
+            "last_error": merged.get("reason") or merged.get("last_error"),
+            "next_retry_at": retry_at,
+        }
+    return {
+        "action": "enqueue",
+        "target_day": target,
+        "work_kind": "formal",
+        "market_status": "market_ready",
+        "formal_status": "formal_running",
+        "formal_attempt": prior_attempt + 1,
+    }
+
+
+def enqueue_core_update(
+    base_dir: str | Path,
+    target_day: str,
+    decision: Dict[str, Any],
+    *,
+    script_path: str | Path | None = None,
+    log_dir: str | Path | None = None,
+) -> Dict[str, Any]:
+    """Launch/reuse the sole day-core writer; the caller never waits for it."""
+    if decision.get("action") != "enqueue":
+        return dict(decision)
+    command = build_core_update_command(base_dir, target_day, script_path=script_path)
+    target = str(target_day)
+    job = start_background_job(
+        cmd=command,
+        cwd=app_dir(),
+        log_dir=log_dir or (Path(app_dir()) / "output" / "backfill_jobs"),
+        name=f"offline_daily_update_{target}",
+        exclusive_key=core_update_exclusive_key(base_dir),
+        metadata={
+            "target_day": target,
+            "phase": decision.get("market_status") if decision.get("work_kind") == "market" else "formal_running",
+            "market_status": decision.get("market_status"),
+            "formal_status": decision.get("formal_status"),
+            "formal_attempt": int(decision.get("formal_attempt") or 0),
+            "budget_seconds": CORE_UPDATE_TIMEOUT_SECONDS,
+            "remaining_budget_seconds": CORE_UPDATE_TIMEOUT_SECONDS,
+            "last_structured_result": None,
+        },
+    )
+    return {**decision, **job, "cmd": command}
 
 
 def screening_base_dir() -> str:
@@ -4309,70 +4462,16 @@ def main():
             offline_state.get("target") == offline_key
             and (now_ts - float(offline_state.get("ts") or 0.0) < CATCHUP_THROTTLE_SECONDS)
         )
-        if (not isolated_screening) and (not offline_throttled):
-            sp = pick_existing_script(SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES)
-            if sp:
-                job = start_background_job(
-                    cmd=[
-                        sys.executable,
-                        sp,
-                        "--base-dir",
-                        runtime_paths.base_dir,
-                        "--asof",
-                        str(remote_stock_day or ""),
-                        "--target-day",
-                        str(remote_stock_day or ""),
-                        "--domains",
-                        "stock",
-                        "index",
-                        "--timeout-sec",
-                        "3600",
-                    ],
-                    cwd=app_dir(),
-                    log_dir=Path(app_dir()) / "output" / "backfill_jobs",
-                    name=f"offline_daily_update_{remote_stock_day or 'latest'}",
-                    exclusive_key=f"offline_daily_update_core_{Path(runtime_paths.base_dir).resolve()}",
-                    metadata={
-                        "target_day": remote_stock_day,
-                        "phase": "queued",
-                        "budget_seconds": 3600,
-                        "remaining_budget_seconds": 3600,
-                        "last_structured_result": None,
-                    },
-                )
-                st.session_state["offline_daily_update_state"] = {
-                    "target": offline_key,
-                    "ts": now_ts,
-                    "pid": job.get("pid"),
-                    "log_path": job.get("log_path"),
-                    "started_at": job.get("started_at"),
-                    "phase": job.get("phase", "running"),
-                    "budget_seconds": job.get("budget_seconds", 3600),
-                    "remaining_budget_seconds": job.get("remaining_budget_seconds", 3600),
-                    "last_structured_result": job.get("last_structured_result"),
-                    "reused": bool(job.get("reused")),
-                }
-                st.session_state["catchup_log"] = (
-                    [
-                        f"[OFFLINE_DAILY_UPDATE_BACKGROUND] pid={job.get('pid')} "
-                        f"asof={remote_stock_day} log={job.get('log_path')}",
-                        f"missing_by_domain={offline_missing}",
-                    ]
-                    + list(st.session_state.get("catchup_log", []))
-                )[-200:]
-            else:
-                st.sidebar.warning("offline_daily_update.py not found; DB gaps cannot be auto-filled.")
 
     offline_state = st.session_state.get("offline_daily_update_state") or {}
-    if offline_state:
-        live_status = background_job_status(
-            Path(app_dir()) / "output" / "backfill_jobs",
-            f"offline_daily_update_{remote_stock_day or 'latest'}",
-            exclusive_key=f"offline_daily_update_core_{Path(runtime_paths.base_dir).resolve()}",
-        )
-        if live_status.get("phase") != "idle":
-            offline_state = {**offline_state, **live_status}
-            st.session_state["offline_daily_update_state"] = offline_state
+    live_status = background_job_status(
+        Path(app_dir()) / "output" / "backfill_jobs",
+        f"offline_daily_update_{remote_stock_day or 'latest'}",
+        exclusive_key=core_update_exclusive_key(runtime_paths.base_dir),
+    )
+    if live_status.get("phase") != "idle":
+        offline_state = {**offline_state, **live_status}
+        st.session_state["offline_daily_update_state"] = offline_state
     if offline_state.get("pid"):
         elapsed = "N/A"
         try:
@@ -4387,18 +4486,57 @@ def main():
             f"last={offline_state.get('last_structured_result') or 'pending'}"
         )
 
-    auto_catchup = st.sidebar.checkbox("自动追平（DB落后时自动更新）", value=False)
-    force_backfill = st.sidebar.checkbox("强制全量 backfill（60日）", value=False)
+    auto_catchup = st.sidebar.checkbox("自动启动目标日 core worker", value=True)
+    manual_core_update = st.sidebar.button("更新目标日 core worker")
+    retry_formal_batch = st.sidebar.button("重试正式批次")
+    force_backfill = st.sidebar.checkbox("强制 60 日回填（需要维护任务授权）", value=False, disabled=True)
     show_catchup_log = st.sidebar.checkbox("显示追平日志", value=False)
 
-    need_sync = False
-    if is_date_behind(local_before.get("stock"), remote_stock_day) or is_date_behind(local_before.get("index"),
-                                                                                     remote_stock_day):
-        need_sync = True
-    if concept_db and os.path.exists(concept_db) and is_date_behind(local_before.get("concept"), remote_concept_day):
-        need_sync = True
-    if etf_db and os.path.exists(etf_db) and is_date_behind(local_before.get("etf"), remote_etf_day):
-        need_sync = True
+    core_target_day = str(remote_stock_day or "")
+    if core_target_day:
+        try:
+            core_readiness = screening_readiness_for_date(runtime_paths.base_dir, core_target_day)
+        except Exception as exc:
+            core_readiness = {
+                "trade_date": core_target_day,
+                "market_data_ready": False,
+                "selection_ready": False,
+                "screening_ready": False,
+                "configuration_error": str(exc),
+            }
+        prior_core_state = offline_state if str(offline_state.get("target_day") or offline_state.get("target") or "") == core_target_day else {}
+        core_decision = target_day_core_decision(
+            core_readiness,
+            prior_core_state,
+            now_ts=now_ts,
+            page_open=True,
+            manual_retry=bool(retry_formal_batch),
+        )
+        if not isolated_screening and (auto_catchup or manual_core_update or retry_formal_batch):
+            if core_decision.get("action") == "enqueue":
+                job = enqueue_core_update(runtime_paths.base_dir, core_target_day, core_decision)
+                offline_state = {**prior_core_state, **job, "target": core_target_day, "target_day": core_target_day, "ts": now_ts}
+                st.session_state["offline_daily_update_state"] = offline_state
+                st.session_state["catchup_log"] = (
+                    [f"[CORE_UPDATE] target={core_target_day} work={core_decision.get('work_kind')} pid={job.get('pid')}"]
+                    + list(st.session_state.get("catchup_log", []))
+                )[-200:]
+            elif core_decision.get("action") == "manual_retry_required":
+                st.sidebar.warning("正式批次已用尽自动重试次数，请使用“重试正式批次”。")
+        elif isolated_screening:
+            st.sidebar.caption("隔离验收为只读模式，已禁用目标日 core worker。")
+
+        effective_state = offline_state.get("last_structured_result") if isinstance(offline_state.get("last_structured_result"), dict) else offline_state
+        st.sidebar.caption(
+            "Core worker: "
+            f"target={core_target_day}; market={effective_state.get('market_status', core_decision.get('market_status'))}; "
+            f"formal={effective_state.get('formal_status', core_decision.get('formal_status'))}; "
+            f"attempt={effective_state.get('formal_attempt', core_decision.get('formal_attempt'))}; "
+            f"last_error={effective_state.get('reason') or effective_state.get('last_error') or 'none'}; "
+            f"next_retry={offline_state.get('next_retry_at') or core_decision.get('next_retry_at') or 'none'}; "
+            f"elapsed={offline_state.get('elapsed_seconds', 0)}s; "
+            f"remaining={offline_state.get('remaining_budget_seconds', CORE_UPDATE_TIMEOUT_SECONDS)}s"
+        )
 
     st.sidebar.caption(
         f"本地最新：stock={local_before.get('stock')}｜index={local_before.get('index')}｜concept={local_before.get('concept')}｜etf={local_before.get('etf')}"
@@ -4431,10 +4569,10 @@ def main():
         and bool(state.get("ok") or (not force_backfill))
     )
 
-    if (force_backfill or (auto_catchup and need_sync)) and (not throttled):
+    if force_backfill:
         with st.spinner("正在追平数据库到接口最新收盘日..."):
-            local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=bool(force_backfill))
-        mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+            local_after, logs = local_before, ["maintenance action is disabled from the daily panel"]
+        mining_sync = {"processed": [], "latest_persisted": None}
         logs = list(logs) + [
             f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
             f"latest_persisted={mining_sync.get('latest_persisted')}"
@@ -4461,10 +4599,10 @@ def main():
 
         # --- 数据库日线更新（adata/baostock；仅日线接口写库） ---
     st.sidebar.subheader("数据库日线更新（adata/baostock）")
-    auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算", value=False)
+    auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算（已迁至 core worker）", value=False, disabled=True)
     validate_db_btn = st.sidebar.button("核验DB最新交易日数据")
     manual_daily_sync = st.sidebar.button("手动更新DB（日线接口）")
-    repair_latest_btn = st.sidebar.button("修复最新交易日（日线接口，覆写当日数据）")
+    repair_latest_btn = st.sidebar.button("修复最新交易日（日线接口，覆写当日数据；需要维护授权）", disabled=True)
 
     if "daily_sync_log" not in st.session_state:
         st.session_state["daily_sync_log"] = []
@@ -4483,26 +4621,17 @@ def main():
         with st.spinner("正在运行离线日更脚本（检查缺失日期并补齐DB）..."):
             sp = pick_existing_script(SCRIPT_OFFLINE_DAILY_UPDATE_CANDIDATES)
             if sp:
-                rc, out = run_cmd(
-                    [
-                        sys.executable,
-                        sp,
-                        "--base-dir",
-                        runtime_paths.base_dir,
-                        "--asof",
-                        str(remote_stock_day or ""),
-                        "--days",
-                        "10",
-                    ],
-                    timeout_sec=3600,
-                )
+                readiness = screening_readiness_for_date(runtime_paths.base_dir, str(remote_stock_day or ""))
+                decision = target_day_core_decision(readiness, manual_retry=True)
+                job = enqueue_core_update(runtime_paths.base_dir, str(remote_stock_day or ""), decision, script_path=sp)
+                rc, out = (0 if job.get("started") or job.get("reused") else 1), str(job)
                 logs = [f"[OFFLINE_DAILY_UPDATE] rc={rc} asof={remote_stock_day}"]
                 if out:
                     logs.append(out[:4000])
                 _clear_local_last_dates_cache()
             else:
-                local_after, fallback_logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=True)
-                mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+                local_after, fallback_logs = local_before, ["offline core worker script missing"]
+                mining_sync = {"processed": [], "latest_persisted": None}
                 logs = list(fallback_logs) + [
                     f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
                     f"latest_persisted={mining_sync.get('latest_persisted')}"
@@ -4517,11 +4646,9 @@ def main():
     # Repair latest day by delete + re-backfill (daily only)
     if repair_latest_btn:
         with st.spinner("正在修复最新交易日数据：删除当日行并重拉（日线接口）..."):
-            ok, logs, val = repair_latest_trade_day_daily(
-                stock_db=stock_db, concept_db=concept_db, etf_db=etf_db, tz_offset_hours=int(tz_offset)
-            )
+            ok, logs, val = False, ["delete-and-repull requires maintenance authorization"], {}
         repair_target_day = val.get("expected_day") if isinstance(val, dict) else None
-        mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, repair_target_day if ok else None)
+        mining_sync = {"processed": [], "latest_persisted": None}
         logs = list(logs) + [
             f"mining history sync target={repair_target_day if ok else None}, processed={mining_sync.get('processed', [])}, "
             f"latest_persisted={mining_sync.get('latest_persisted')}"
@@ -4559,8 +4686,8 @@ def main():
                     and bool(daily_state.get("ok"))
                 )
                 if not daily_throttled:
-                    local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=False)
-                    mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after.get("stock"))
+                    local_after, logs = local_before, ["maintenance auto catch-up requires authorization"]
+                    mining_sync = {"processed": [], "latest_persisted": None}
                     logs = list(logs) + [
                         f"mining history sync target={local_after.get('stock')}, processed={mining_sync.get('processed', [])}, "
                         f"latest_persisted={mining_sync.get('latest_persisted')}"

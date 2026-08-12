@@ -1,0 +1,41 @@
+{
+  "task": "OPS-HARDEN-1A.1",
+  "status": "ready_for_ops_harden_1b_review",
+  "start": {
+    "branch": "codex/screening-v2",
+    "commit": "f59a93407d98290bd735405860dc5692490ac5e2"
+  },
+  "passed": {
+    "focused_tests": 154,
+    "full_tests": {"passed": 341, "skipped": 2},
+    "py_compile": true,
+    "git_diff_check": true,
+    "render_writer_ast_gate": true,
+    "sandbox": {
+      "path": "output/screening-v2-work/ops-harden-1a1-sandbox-20260812-1445",
+      "online_backup_counts_match": true,
+      "formal_only": {"trade_date": "2026-08-10", "status": "complete", "batch_id": 2, "reused": true, "formal_runs": 6},
+      "mining_counts": {"selection_batches": 3, "strategy_runs": 2548, "candidates": 27746, "pullback_state_history": 101}
+    },
+    "browser": {
+      "isolated_read_only": true,
+      "metric_coverage": {"return_valid": 5179, "amount_valid": 5018, "hot_valid": 5015, "expected": 5182, "excluded": 167},
+      "dates": {"selected": "2026-08-10", "effective": "2026-08-10", "formal": "2026-08-10"},
+      "concept": "unavailable (eligible_universe_regression)",
+      "console_errors": 0,
+      "screenshots": ["browser/ops-harden-1a1-readonly-complete.png", "browser/ops-harden-1a1-selection-visible.png"]
+    },
+    "production_sha256_unchanged": {
+      "a_share_mvp.db": "1e83da69b6bc3284ae3062524fb4ef789af68d67cc3565d6c7fadcefdd4ae51d",
+      "mining_mvp.db": "b390562f13301cdeaa07a99f009f292eb8537885691c5ef5b6707d9f43c0278e",
+      "ths_concept.db": "837db4226ab1ab1f807163d8cec99ab35211e1d64371e682b7de30315f323b65",
+      "etf_mvp.db": "721ed4a41372b582189e93bd9363f343fc4eb9314aaed9f5a9a3005251a1bf28"
+    }
+  },
+  "failed": [],
+  "environment_blocked": [],
+  "lessons": [
+    "Launch state must be structured independently of return code.",
+    "A recoverable short lease prevents duplicate launch without permanent stale locks."
+  ]
+}

@@ -790,6 +790,75 @@ def _run_with_remaining_budget(
     return int(rc), output, allowance
 
 
+def _run_child_with_remaining_budget(
+    cmd: list[str],
+    *,
+    cwd: str | Path,
+    deadline: float,
+    reserve_seconds: int = 0,
+    runner: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Run one core child and preserve whether the operating system launched it.
+
+    ``returncode`` is deliberately insufficient for the scheduler: a missing
+    executable and a launched child with a non-zero exit need different
+    recovery behaviour.  Test runners may return the same ``(rc, output)``
+    tuple as the legacy helper, or a fully-structured mapping.
+    """
+    allowance = _remaining_budget_seconds(deadline, reserve_seconds=reserve_seconds)
+    result: dict[str, Any] = {
+        "started": False,
+        "returncode": None,
+        "timed_out": False,
+        "error_kind": None,
+        "output": "",
+        "allowance": allowance,
+    }
+    if allowance < MIN_CHILD_TIMEOUT_SECONDS:
+        result.update(
+            error_kind="budget_exhausted",
+            output="invocation deadline exhausted before child launch",
+        )
+        return result
+
+    try:
+        if runner is None:
+            proc = subprocess.run(
+                cmd,
+                cwd=str(cwd),
+                capture_output=True,
+                text=True,
+                timeout=allowance,
+            )
+            output = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+            result.update(started=True, returncode=int(proc.returncode), output=output.strip())
+            return result
+
+        observed = runner(cmd, cwd=cwd, timeout_sec=allowance)
+        if isinstance(observed, dict):
+            result.update(observed)
+            result["allowance"] = allowance
+            result["started"] = bool(result.get("started"))
+            return result
+        returncode, output = observed
+        result.update(started=True, returncode=int(returncode), output=str(output or ""))
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ""
+        stderr = exc.stderr or ""
+        if isinstance(output, bytes):
+            output = output.decode("utf-8", errors="replace")
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8", errors="replace")
+        result.update(started=True, timed_out=True, error_kind="timeout", output=f"{output}\n{stderr}".strip())
+    except FileNotFoundError as exc:
+        result.update(error_kind="file_not_found", output=str(exc))
+    except PermissionError as exc:
+        result.update(error_kind="permission_denied", output=str(exc))
+    except OSError as exc:
+        result.update(error_kind="spawn_failed", output=str(exc))
+    return result
+
+
 def _run_with_retries(
     cmd: list[str],
     *,
@@ -828,7 +897,7 @@ def _mark_unrecoverable_bad_stock_sessions(
     attempted = {
         str(arg)
         for command in commands
-        if command.get("domain") == "stock_index" and bool(command.get("child_started"))
+        if command.get("domain") == "stock_index" and bool(command.get("started"))
         for arg in (command.get("cmd") or [])
     }
     marked: list[str] = []
@@ -847,7 +916,7 @@ def _mark_unrecoverable_bad_stock_sessions(
                 str(command.get("output") or "")[-1000:]
                 for command in commands
                 if command.get("domain") == "stock_index"
-                and bool(command.get("child_started"))
+                and bool(command.get("started"))
                 and day in [str(arg) for arg in (command.get("cmd") or [])]
             ]
             source_errors = "\n".join(errors)
@@ -1609,6 +1678,18 @@ def _core_scheduler_result(
         skip_concept=False,
         include_health_evidence=True,
     )
+    status_by_phase = {
+        "configuration_error": ("configuration_error", "not_run"),
+        "no_launch": ("no_launch", "not_run"),
+        "market_running": ("market_running", "not_run"),
+        "market_failed": ("market_failed", "not_run"),
+        "market_ready": ("market_ready", "not_run"),
+        "formal_running": ("market_ready", "formal_running"),
+        "formal_failed": ("market_ready", "formal_failed"),
+        "complete": ("market_ready", "complete"),
+    }
+    market_status, formal_status = status_by_phase.get(phase, (phase, "not_run"))
+    formal_attempt = sum(1 for command in commands if command.get("domain") == "formal_batch")
     result = {
         "ok": False,
         "plan": plan,
@@ -1623,6 +1704,10 @@ def _core_scheduler_result(
             "phase": phase,
             "reason": reason,
             "target_day": target_day,
+            "market_status": market_status,
+            "formal_status": formal_status,
+            "formal_attempt": formal_attempt,
+            "retry_after_seconds": 300 if phase == "formal_failed" else None,
             "budget_seconds": int(timeout_sec),
             "formal_reserve_seconds": int(formal_reserve_seconds),
             "remaining_budget_seconds": max(0, int(timeout_sec) - int(formal_reserve_seconds)),
@@ -1746,7 +1831,7 @@ def _run_core_offline_update(
                 plan=plan,
                 logs=logs + ["acquisition_blocked: repair_market_day_akshare.py not found"],
                 commands=commands,
-                phase="acquisition_blocked",
+                phase="configuration_error",
                 reason="repair_script_missing",
                 timeout_sec=total,
                 formal_reserve_seconds=reserve,
@@ -1767,22 +1852,23 @@ def _run_core_offline_update(
                 "--min-request-interval-sec",
                 format(max(0.0, float(market_min_request_interval_sec)), "g"),
             ]
-            rc, output, allowance = _run_with_remaining_budget(
+            child = _run_child_with_remaining_budget(
                 cmd,
                 cwd=paths.base_dir,
                 deadline=deadline,
                 reserve_seconds=reserve,
             )
-            child_started = rc != 998
+            child_started = bool(child.get("started"))
+            returncode = child.get("returncode")
             raw_after = raw_stock_coverage_for_repair(paths.stock_db, target_day)
             parent_ready = bool(raw_after.get("stock")) and bool(raw_after.get("index"))
             mismatch = None
-            if child_started and (rc == 0) != parent_ready:
+            if child_started and not bool(child.get("timed_out")) and (returncode == 0) != parent_ready:
                 mismatch = {
                     "code": "child_parent_quality_mismatch",
-                    "child_ok": rc == 0,
+                    "child_ok": returncode == 0,
                     "parent_ok": parent_ready,
-                    "returncode": rc,
+                    "returncode": returncode,
                     "raw_status": (raw_after.get("session_quality") or {}).get("status"),
                 }
                 quality_mismatches.append(mismatch)
@@ -1791,26 +1877,31 @@ def _run_core_offline_update(
                     "domain": "stock_index",
                     "interface": "repair_market_day_akshare",
                     "cmd": cmd,
-                    "returncode": rc,
+                    "started": child_started,
+                    "returncode": returncode,
+                    "timed_out": bool(child.get("timed_out")),
+                    "error_kind": child.get("error_kind"),
+                    "allowance": child.get("allowance"),
                     "attempts": attempt,
-                    "timeout_sec": allowance,
-                    "child_started": child_started,
                     "raw_before_quality": raw_before,
                     "raw_after_quality": raw_after,
                     "quality_mismatch": mismatch,
-                    "output": output[-4000:],
+                    "output": str(child.get("output") or "")[-4000:],
                 }
             )
             if not child_started:
-                logs.append(f"not_attempted_budget target_day={target_day} allowance={allowance}")
+                logs.append(
+                    "no_launch target_day="
+                    f"{target_day} error_kind={child.get('error_kind')} allowance={child.get('allowance')}"
+                )
                 return _core_scheduler_result(
                     paths=paths,
                     target_day=target_day,
                     plan=plan,
                     logs=logs,
                     commands=commands,
-                    phase="not_attempted_budget",
-                    reason="core_child_deadline_exhausted",
+                    phase="no_launch",
+                    reason=str(child.get("error_kind") or "core_child_not_started"),
                     timeout_sec=total,
                     formal_reserve_seconds=reserve,
                     publish_health=publish_health,
@@ -1842,7 +1933,7 @@ def _run_core_offline_update(
             plan=build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
             logs=logs + ["acquisition_blocked: stock/index raw postcondition remains unavailable"],
             commands=commands,
-            phase="acquisition_blocked",
+            phase="market_failed",
             reason="market_close_not_ready",
             timeout_sec=total,
             formal_reserve_seconds=reserve,
@@ -1860,7 +1951,7 @@ def _run_core_offline_update(
                 plan=build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
                 logs=logs + ["acquisition_blocked: run_daily.py not found"],
                 commands=commands,
-                phase="acquisition_blocked",
+                phase="configuration_error",
                 reason="formal_script_missing",
                 timeout_sec=total,
                 formal_reserve_seconds=reserve,
@@ -1868,19 +1959,48 @@ def _run_core_offline_update(
                 publish_health=publish_health,
             )
         cmd = [sys.executable, str(formal_script), "--base-dir", paths.base_dir, "--date", target_day, "--formal-only"]
-        rc, output, allowance = _run_with_remaining_budget(cmd, cwd=paths.base_dir, deadline=deadline)
+        child = _run_child_with_remaining_budget(cmd, cwd=paths.base_dir, deadline=deadline)
         commands.append(
             {
                 "domain": "formal_batch",
                 "cmd": cmd,
-                "returncode": rc,
-                "timeout_sec": allowance,
-                "child_started": rc != 998,
-                "output": output[-4000:],
+                "started": bool(child.get("started")),
+                "returncode": child.get("returncode"),
+                "timed_out": bool(child.get("timed_out")),
+                "error_kind": child.get("error_kind"),
+                "allowance": child.get("allowance"),
+                "output": str(child.get("output") or "")[-4000:],
             }
         )
-        logs.append(f"formal_batch target_day={target_day} rc={rc} allowance={allowance}")
+        logs.append(
+            "formal_batch target_day="
+            f"{target_day} started={child.get('started')} rc={child.get('returncode')} "
+            f"timed_out={child.get('timed_out')} allowance={child.get('allowance')}"
+        )
         readiness = readiness_for_date(paths.base_dir, target_day, skip_concept=False, include_health_evidence=True)
+        if not bool(readiness["selection_ready"]):
+            if not bool(child.get("started")):
+                reason = str(child.get("error_kind") or "formal_child_not_started")
+            elif bool(child.get("timed_out")):
+                reason = "formal_timeout"
+            elif child.get("returncode") != 0:
+                reason = "formal_child_failed"
+            else:
+                reason = "formal_postcondition_not_ready"
+            return _core_scheduler_result(
+                paths=paths,
+                target_day=target_day,
+                plan=build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
+                logs=logs,
+                commands=commands,
+                phase="formal_failed",
+                reason=reason,
+                timeout_sec=total,
+                formal_reserve_seconds=reserve,
+                revalidations=revalidations,
+                quality_mismatches=quality_mismatches,
+                publish_health=publish_health,
+            )
 
     result = {
         "ok": bool(readiness["screening_ready"]),
@@ -1893,8 +2013,11 @@ def _run_core_offline_update(
         "domains": list(CORE_UPDATE_DOMAINS),
         "readiness": readiness,
         "scheduler_status": {
-            "phase": "complete" if readiness["screening_ready"] else "waiting_for_formal_batch",
+            "phase": "complete" if readiness["screening_ready"] else "formal_failed",
             "target_day": target_day,
+            "market_status": "market_ready" if readiness["market_data_ready"] else "market_failed",
+            "formal_status": "complete" if readiness["selection_ready"] else "formal_failed",
+            "formal_attempt": sum(1 for command in commands if command.get("domain") == "formal_batch"),
             "budget_seconds": total,
             "formal_reserve_seconds": reserve,
             "remaining_budget_seconds": _remaining_budget_seconds(deadline),

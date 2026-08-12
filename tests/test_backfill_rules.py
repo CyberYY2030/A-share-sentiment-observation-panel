@@ -1436,7 +1436,7 @@ class BackfillRuleTests(unittest.TestCase):
             with (
                 mock.patch("offline_daily_update.build_missing_update_plan", return_value=plan),
                 mock.patch("offline_daily_update.readiness_for_date", return_value=readiness),
-                mock.patch("offline_daily_update._run_with_remaining_budget") as child,
+                mock.patch("offline_daily_update._run_child_with_remaining_budget") as child,
                 mock.patch("offline_daily_update._mark_unrecoverable_bad_stock_sessions") as mark_bad,
             ):
                 result = run_offline_update(
@@ -1466,7 +1466,10 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update.build_missing_update_plan", return_value=plan),
                 mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_missing),
                 mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
-                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(998, "deadline", 0)) as child,
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": False, "returncode": None, "timed_out": False, "error_kind": "budget_exhausted", "output": "deadline", "allowance": 0},
+                ) as child,
                 mock.patch("offline_daily_update.readiness_for_date", return_value=readiness),
                 mock.patch("offline_daily_update._mark_unrecoverable_bad_stock_sessions") as mark_bad,
             ):
@@ -1480,8 +1483,8 @@ class BackfillRuleTests(unittest.TestCase):
                     publish_health=False,
                 )
 
-        self.assertEqual(result["scheduler_status"]["phase"], "not_attempted_budget")
-        self.assertFalse(result["commands"][0]["child_started"])
+        self.assertEqual(result["scheduler_status"]["phase"], "no_launch")
+        self.assertFalse(result["commands"][0]["started"])
         child.assert_called_once()
         mark_bad.assert_not_called()
 
@@ -1501,7 +1504,10 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[]),
                 mock.patch("offline_daily_update.readiness_for_date", side_effect=[waiting, complete]),
                 mock.patch("offline_daily_update._find_script", return_value=base / "run_daily.py"),
-                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(0, "{\\\"formal_batch\\\": {\\\"status\\\": \\\"complete\\\"}}", 3000)) as child,
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": True, "returncode": 0, "timed_out": False, "error_kind": None, "output": "{\\\"formal_batch\\\": {\\\"status\\\": \\\"complete\\\"}}", "allowance": 3000},
+                ) as child,
             ):
                 result = run_offline_update(
                     base,
@@ -1536,7 +1542,13 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[]),
                 mock.patch("offline_daily_update.readiness_for_date", side_effect=[waiting, complete]),
                 mock.patch("offline_daily_update._find_script", side_effect=[base / "repair_market_day_akshare.py", base / "run_daily.py"]),
-                mock.patch("offline_daily_update._run_with_remaining_budget", side_effect=[(0, "repair complete", 3360), (0, "formal complete", 3000)]),
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    side_effect=[
+                        {"started": True, "returncode": 0, "timed_out": False, "error_kind": None, "output": "repair complete", "allowance": 3360},
+                        {"started": True, "returncode": 0, "timed_out": False, "error_kind": None, "output": "formal complete", "allowance": 3000},
+                    ],
+                ),
             ):
                 result = run_offline_update(
                     base,
@@ -1552,7 +1564,7 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual([item["domain"] for item in result["commands"]], ["stock_index", "formal_batch"])
         repair, formal = result["commands"]
         self.assertIn("2026-08-11", repair["cmd"])
-        self.assertGreater(repair["timeout_sec"], 0)
+        self.assertGreater(repair["allowance"], 0)
         self.assertEqual(formal["cmd"][-3:], ["--date", "2026-08-11", "--formal-only"])
         joined = " ".join(" ".join(item["cmd"]) for item in result["commands"])
         for forbidden in ("concept", "etf", "--range", "legacy", "outcome", "watchlist", "report"):
@@ -1570,7 +1582,10 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update.build_missing_update_plan", return_value=plan),
                 mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_missing),
                 mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
-                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(1, "repair failed", 3000)) as child,
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": True, "returncode": 1, "timed_out": False, "error_kind": None, "output": "repair failed", "allowance": 3000},
+                ) as child,
                 mock.patch("offline_daily_update.readiness_for_date", side_effect=[not_ready, not_ready]),
                 mock.patch("offline_daily_update._mark_unrecoverable_bad_stock_sessions", return_value=["2026-08-11"]) as mark_bad,
             ):
@@ -1585,7 +1600,7 @@ class BackfillRuleTests(unittest.TestCase):
 
         self.assertEqual(child.call_count, 3)
         mark_bad.assert_called_once()
-        self.assertEqual(result["scheduler_status"]["phase"], "acquisition_blocked")
+        self.assertEqual(result["scheduler_status"]["phase"], "market_failed")
         self.assertFalse(result["readiness"]["screening_ready"])
 
     def test_core_formal_failure_never_marks_screening_ready(self) -> None:
@@ -1601,9 +1616,12 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_ready),
                 mock.patch("offline_daily_update.stock_coverage_for_date", return_value={"stock": True, "index": True}),
                 mock.patch("offline_daily_update._revalidate_attempted_stock_sessions", return_value=[]),
-                mock.patch("offline_daily_update.readiness_for_date", side_effect=[waiting, waiting]),
+                mock.patch("offline_daily_update.readiness_for_date", side_effect=[waiting, waiting, waiting]),
                 mock.patch("offline_daily_update._find_script", return_value=base / "run_daily.py"),
-                mock.patch("offline_daily_update._run_with_remaining_budget", return_value=(1, "formal failed", 3000)),
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": True, "returncode": 1, "timed_out": False, "error_kind": None, "output": "formal failed", "allowance": 3000},
+                ),
             ):
                 result = run_offline_update(
                     base,
@@ -1614,7 +1632,7 @@ class BackfillRuleTests(unittest.TestCase):
                     publish_health=False,
                 )
 
-        self.assertEqual(result["scheduler_status"]["phase"], "waiting_for_formal_batch")
+        self.assertEqual(result["scheduler_status"]["phase"], "formal_failed")
         self.assertFalse(result["readiness"]["screening_ready"])
         self.assertEqual(result["commands"][0]["domain"], "formal_batch")
 
@@ -1655,6 +1673,202 @@ class BackfillRuleTests(unittest.TestCase):
 
         self.assertEqual(result["pid"], 54322)
         self.assertEqual(popen.call_count, 1)
+
+    def test_target_day_market_ready_without_batch_enqueues_formal_only(self) -> None:
+        from app_panel import target_day_core_decision
+
+        decision = target_day_core_decision(
+            {"trade_date": "2026-08-10", "market_data_ready": True, "selection_ready": False, "screening_ready": False}
+        )
+
+        self.assertEqual(decision["action"], "enqueue")
+        self.assertEqual(decision["work_kind"], "formal")
+        self.assertEqual(decision["formal_status"], "formal_running")
+
+    def test_formal_failure_rerun_retries_only_formal_and_stops_after_three_auto_attempts(self) -> None:
+        from app_panel import target_day_core_decision
+
+        readiness = {"trade_date": "2026-08-10", "market_data_ready": True, "selection_ready": False, "screening_ready": False}
+        first_retry = target_day_core_decision(
+            readiness,
+            {"phase": "formal_failed", "formal_attempt": 1, "reason": "formal_child_failed"},
+            page_open=True,
+        )
+        capped = target_day_core_decision(
+            readiness,
+            {"phase": "formal_failed", "formal_attempt": 3, "reason": "formal_child_failed"},
+            page_open=True,
+        )
+        manual = target_day_core_decision(
+            readiness,
+            {"phase": "formal_failed", "formal_attempt": 3},
+            page_open=True,
+            manual_retry=True,
+        )
+
+        self.assertEqual(first_retry["action"], "enqueue")
+        self.assertEqual(first_retry["work_kind"], "formal")
+        self.assertEqual(capped["action"], "manual_retry_required")
+        self.assertEqual(manual["action"], "enqueue")
+        self.assertEqual(manual["work_kind"], "formal")
+
+    def test_file_not_found_is_no_launch_and_never_marks_bad_session(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        plan = {"ok": False, "expected_dates": ["2026-08-11"], "domains": ["stock", "index"]}
+        raw_missing = {"stock": False, "index": False, "session_quality": {"status": "known_bad_session"}}
+        not_ready = {"market_data_ready": False, "selection_ready": False, "screening_ready": False, "domains": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch("offline_daily_update.build_missing_update_plan", return_value=plan),
+                mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_missing),
+                mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": False, "returncode": None, "timed_out": False, "error_kind": "file_not_found", "output": "missing", "allowance": 3000},
+                ),
+                mock.patch("offline_daily_update.readiness_for_date", return_value=not_ready),
+                mock.patch("offline_daily_update._mark_unrecoverable_bad_stock_sessions") as mark_bad,
+            ):
+                result = run_offline_update(base, asof="2026-08-11", target_days=["2026-08-11"], domains=("stock", "index"), publish_health=False)
+
+        self.assertEqual(result["scheduler_status"]["phase"], "no_launch")
+        self.assertEqual(result["commands"][0]["error_kind"], "file_not_found")
+        mark_bad.assert_not_called()
+
+    def test_structured_executor_reports_file_not_found_without_a_started_child(self) -> None:
+        from offline_daily_update import _run_child_with_remaining_budget
+
+        with mock.patch("offline_daily_update.subprocess.run", side_effect=FileNotFoundError("missing worker")):
+            result = _run_child_with_remaining_budget(["missing-worker"], cwd=".", deadline=9_999_999_999.0)
+
+        self.assertFalse(result["started"])
+        self.assertIsNone(result["returncode"])
+        self.assertFalse(result["timed_out"])
+        self.assertEqual(result["error_kind"], "file_not_found")
+        self.assertIn("missing worker", result["output"])
+
+    def test_started_timeout_on_raw_bad_session_may_mark_observed_bad_session(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        plan = {"ok": False, "expected_dates": ["2026-08-11"], "domains": ["stock", "index"]}
+        raw_missing = {"stock": False, "index": False, "session_quality": {"status": "known_bad_session"}}
+        not_ready = {"market_data_ready": False, "selection_ready": False, "screening_ready": False, "domains": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            with (
+                mock.patch("offline_daily_update.build_missing_update_plan", return_value=plan),
+                mock.patch("offline_daily_update.raw_stock_coverage_for_repair", return_value=raw_missing),
+                mock.patch("offline_daily_update._find_script", return_value=base / "repair_market_day_akshare.py"),
+                mock.patch(
+                    "offline_daily_update._run_child_with_remaining_budget",
+                    return_value={"started": True, "returncode": None, "timed_out": True, "error_kind": "timeout", "output": "timeout", "allowance": 3000},
+                ),
+                mock.patch("offline_daily_update.readiness_for_date", return_value=not_ready),
+                mock.patch("offline_daily_update._mark_unrecoverable_bad_stock_sessions", return_value=["2026-08-11"]) as mark_bad,
+            ):
+                result = run_offline_update(base, asof="2026-08-11", target_days=["2026-08-11"], domains=("stock", "index"), publish_health=False)
+
+        self.assertEqual(result["scheduler_status"]["phase"], "market_failed")
+        mark_bad.assert_called_once()
+
+    def test_pidless_reservations_recover_or_block_by_lease_and_corrupt_state(self) -> None:
+        import json
+
+        from backfill_orchestrator import start_background_job
+
+        class FakeProcess:
+            pid = 61234
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "core.active.json"
+            ancient = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=365 * 20)
+            active.write_text(
+                json.dumps({"pid": None, "claim_id": "old", "claimed_at": ancient.isoformat(), "lease_expires_at": (ancient + dt.timedelta(seconds=1)).isoformat()}),
+                encoding="utf-8",
+            )
+            with mock.patch("backfill_orchestrator.subprocess.Popen", return_value=FakeProcess()) as popen:
+                reclaimed = start_background_job(["python", "worker.py"], root, root, "job", exclusive_key="core")
+            self.assertTrue(reclaimed["started"])
+            self.assertEqual(popen.call_count, 1)
+
+            fresh = dt.datetime.now(dt.timezone.utc)
+            active.write_text(
+                json.dumps({"pid": None, "claim_id": "fresh", "claimed_at": fresh.isoformat(), "lease_expires_at": (fresh + dt.timedelta(seconds=120)).isoformat()}),
+                encoding="utf-8",
+            )
+            with mock.patch("backfill_orchestrator.subprocess.Popen") as popen:
+                reused = start_background_job(["python", "worker.py"], root, root, "other", exclusive_key="core")
+            self.assertTrue(reused["reused"])
+            popen.assert_not_called()
+
+            active.write_text("{not-json", encoding="utf-8")
+            with mock.patch("backfill_orchestrator.subprocess.Popen", return_value=FakeProcess()) as popen:
+                recovered_corrupt = start_background_job(["python", "worker.py"], root, root, "third", exclusive_key="core")
+            self.assertTrue(recovered_corrupt["started"])
+            self.assertEqual(popen.call_count, 1)
+
+            active.write_text(
+                json.dumps({"pid": None, "claim_id": "invalid-time", "claimed_at": "not-a-time", "lease_expires_at": "also-not-a-time"}),
+                encoding="utf-8",
+            )
+            with mock.patch("backfill_orchestrator.subprocess.Popen", return_value=FakeProcess()) as popen:
+                recovered_invalid_time = start_background_job(["python", "worker.py"], root, root, "fourth", exclusive_key="core")
+            self.assertTrue(recovered_invalid_time["started"])
+            self.assertEqual(popen.call_count, 1)
+
+    def test_live_pid_reuses_and_popen_failures_are_explicit_not_started(self) -> None:
+        from backfill_orchestrator import start_background_job
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "core.active.json").write_text('{"pid": 99, "phase": "formal_running"}', encoding="utf-8")
+            with mock.patch("backfill_orchestrator._pid_is_running", return_value=True), mock.patch("backfill_orchestrator.subprocess.Popen") as popen:
+                reused = start_background_job(["python", "worker.py"], root, root, "job", exclusive_key="core")
+            self.assertTrue(reused["reused"])
+            popen.assert_not_called()
+
+            (root / "core.active.json").unlink()
+            with mock.patch("backfill_orchestrator.subprocess.Popen", side_effect=FileNotFoundError("missing worker")):
+                failed = start_background_job(["python", "worker.py"], root, root, "job", exclusive_key="core")
+            self.assertFalse(failed["started"])
+            self.assertEqual(failed["error_kind"], "file_not_found")
+
+    def test_all_page_entry_paths_build_the_identical_core_command_and_static_gate_holds(self) -> None:
+        import ast
+
+        from app_panel import build_core_update_command, enqueue_core_update
+
+        auto = build_core_update_command("sandbox", "2026-08-10", script_path="offline_daily_update.py")
+        manual = build_core_update_command("sandbox", "2026-08-10", script_path="offline_daily_update.py")
+        checkbox = build_core_update_command("sandbox", "2026-08-10", script_path="offline_daily_update.py")
+        self.assertEqual(auto, manual)
+        self.assertEqual(auto, checkbox)
+        joined = " ".join(auto)
+        for forbidden in ("concept", "etf", "--range", "legacy", "outcome", "watchlist", "report"):
+            self.assertNotIn(forbidden, joined)
+
+        readiness = {"action": "enqueue", "work_kind": "formal", "formal_attempt": 1, "market_status": "market_ready", "formal_status": "formal_running"}
+        with mock.patch("app_panel.start_background_job", return_value={"started": True, "pid": 1}) as start:
+            enqueue_core_update("sandbox", "2026-08-10", readiness, script_path="offline_daily_update.py")
+            enqueue_core_update("sandbox", "2026-08-10", readiness, script_path="offline_daily_update.py")
+            enqueue_core_update("sandbox", "2026-08-10", readiness, script_path="offline_daily_update.py")
+        self.assertEqual([call.kwargs["cmd"] for call in start.call_args_list], [auto, manual, checkbox])
+        self.assertEqual(len({call.kwargs["exclusive_key"] for call in start.call_args_list}), 1)
+
+        source = Path("app_panel.py").read_text(encoding="utf-8")
+        module = ast.parse(source)
+        main = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+        forbidden_calls = {"maybe_backfill_all", "sync_mining_history_after_close_update", "repair_latest_trade_day_daily", "run_cmd"}
+        found = []
+        for node in ast.walk(main):
+            if isinstance(node, ast.Call):
+                name = node.func.id if isinstance(node.func, ast.Name) else (node.func.attr if isinstance(node.func, ast.Attribute) else "")
+                if name in forbidden_calls:
+                    found.append(name)
+        self.assertEqual(found, [])
 
 
 
