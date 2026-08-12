@@ -831,6 +831,15 @@ $env:SCREENING_ACCEPTANCE_NOW_CN = '2026-08-11T18:00:00+08:00'
 - Evidence: 5,202-code circuit regression, BaoStock complete-field/login-logout regression, four-db online-backup table/row parity, controlled 08-11 sandbox skip/reject/resume evidence, and one 20-code low-frequency BaoStock probe at 20/20 complete. Full test result: 352 passed, 2 skipped; all four production SHA-256 values match Task 0.
 - Next boundary: production activation requires a newly authorized, separately reviewed `OPS-HARDEN-1B.1` task. It must not begin from this card or this session.
 
+## 2026-08-12 OPS-HARDEN-1A.4 single-code timeout isolation
+
+- Status: `ready_for_ops_harden_1b2_review`; source/tests/temporary SQLite evidence only. No provider call, production database write, offline update, formal batch, or Streamlit action ran.
+- A provider worker now reports its active code. On a one-code timeout, the parent flushes accepted rows, terminates that worker, leaves only the timed-out code unresolved for fallback, and starts a new worker for later non-terminal codes. Complete, empty, invalid, guard-rejected, and previously checkpointed codes are not re-fetched by that provider.
+- Timeout is a consecutive provider-error signal. A successful complete row resets it; only the third consecutive active-code timeout opens `timeout_threshold`. Summaries now expose `timeout_codes`, `worker_restarts`, `codes_in`, `unresolved`, and the maximum consecutive error count.
+- Evidence: red Windows-spawn regression failed before the fix because a third-code hang ended the source after two valid rows; green regressions prove 1/2/4/5 continue, fallback sees only 3, separated timeouts do not trip a circuit, three consecutive timeouts preserve the exact tail, and 400 SQLite checkpoint rows survive a restart before `repair_day()` reopens only the true remaining code.
+- Validation: P0/P1 five tests passed; `tests.test_backfill_rules` 76 passed; full suite 361 passed, 2 skipped; `py_compile repair_market_day_akshare.py` and `git diff --check` passed. Current four production SHA-256 values are unchanged during this card.
+- Bound: a failing provider has at most three consecutive 12-second active-call waits (36 seconds of request timeout budget, plus finite worker terminate/spawn overhead) before fallback. It cannot spin indefinitely.
+
 ## 2026-08-12 OPS-HARDEN-1A.3 independent-review correction (P0/P1)
 
 - Status remains `ready_for_ops_harden_1b_1_review`; this correction stops before any production action.

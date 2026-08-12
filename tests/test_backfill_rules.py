@@ -35,8 +35,190 @@ def _a3_one_then_slow_provider(code: str, day_dash: str, day_compact: str) -> di
     return {"source": "never_returns_within_timeout"}
 
 
+def _a4_timeout_on_third_provider(code: str, day_dash: str, day_compact: str) -> dict:
+    if code == "600003":
+        time.sleep(5.0)
+    return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+
+def _a4_timeouts_on_second_and_fourth_provider(code: str, day_dash: str, day_compact: str) -> dict:
+    if code in {"600002", "600004"}:
+        time.sleep(5.0)
+    return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+
+def _a4_three_consecutive_timeouts_provider(code: str, day_dash: str, day_compact: str) -> dict:
+    if code in {"600001", "600002", "600003"}:
+        time.sleep(5.0)
+    return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+
+def _a4_timeout_after_four_hundred_provider(code: str, day_dash: str, day_compact: str) -> dict:
+    if code == "600400":
+        time.sleep(5.0)
+    return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+
 class BackfillRuleTests(unittest.TestCase):
-    def test_provider_timeout_opens_circuit_and_next_pass_receives_remaining_gap(self) -> None:
+    def test_single_code_timeout_restarts_provider_and_fallback_receives_only_timed_out_code(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = [f"600{index:03d}" for index in range(1, 6)]
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[("primary", _a4_timeout_on_third_provider), ("fallback", _a3_complete_stock_provider)],
+            min_request_interval_sec=0.0,
+            provider_timeout_sec=0.75,
+            error_threshold=3,
+            isolate=True,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual({row["sec_code"] for row in rows}, set(codes))
+        self.assertEqual(summaries[0]["provider"], "primary")
+        self.assertEqual(summaries[0]["valid"], 4)
+        self.assertEqual(summaries[0]["timeout_codes"], ["600003"])
+        self.assertEqual(summaries[0]["worker_restarts"], 1)
+        self.assertIsNone(summaries[0]["circuit_reason"])
+        self.assertEqual(summaries[1]["before_missing"], 1)
+        self.assertEqual(summaries[1]["attempted"], 1)
+
+    def test_timeout_success_timeout_does_not_trip_nonconsecutive_circuit(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = [f"600{index:03d}" for index in range(1, 6)]
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[("primary", _a4_timeouts_on_second_and_fourth_provider), ("fallback", _a3_complete_stock_provider)],
+            min_request_interval_sec=0.0,
+            provider_timeout_sec=0.75,
+            error_threshold=3,
+            isolate=True,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual({row["sec_code"] for row in rows}, set(codes))
+        self.assertEqual(summaries[0]["timeout_codes"], ["600002", "600004"])
+        self.assertEqual(summaries[0]["valid"], 3)
+        self.assertEqual(summaries[0]["worker_restarts"], 2)
+        self.assertEqual(summaries[0]["max_consecutive_errors"], 1)
+        self.assertIsNone(summaries[0]["circuit_reason"])
+        self.assertEqual(summaries[1]["before_missing"], 2)
+
+    def test_three_consecutive_timeouts_open_threshold_and_preserve_tail_for_fallback(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = [f"600{index:03d}" for index in range(1, 6)]
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[("primary", _a4_three_consecutive_timeouts_provider), ("fallback", _a3_complete_stock_provider)],
+            min_request_interval_sec=0.0,
+            provider_timeout_sec=0.75,
+            error_threshold=3,
+            isolate=True,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual({row["sec_code"] for row in rows}, set(codes))
+        self.assertEqual(summaries[0]["attempted"], 3)
+        self.assertEqual(summaries[0]["timeout_codes"], ["600001", "600002", "600003"])
+        self.assertEqual(summaries[0]["worker_restarts"], 2)
+        self.assertEqual(summaries[0]["circuit_reason"], "timeout_threshold")
+        self.assertEqual(summaries[1]["before_missing"], 5)
+        self.assertEqual(summaries[1]["attempted"], 5)
+
+    def test_spawn_restart_flushes_four_hundred_checkpoint_rows_and_resume_sees_only_true_gap(self) -> None:
+        import sqlite3
+
+        from repair_market_day_akshare import KLINE_COLS, connect, repair_day, run_stock_provider_passes, upsert_rows
+
+        codes = [f"{600000 + index:06d}" for index in range(451)]
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "a_share_mvp.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE stock_info(sec_code TEXT PRIMARY KEY, bs_code TEXT, name TEXT)")
+                conn.executemany(
+                    "INSERT INTO stock_info(sec_code, bs_code, name) VALUES(?,?,?)",
+                    [(code, f"sh.{code}", code) for code in codes],
+                )
+                conn.execute(
+                    f"CREATE TABLE kline_daily ({','.join(column + ' TEXT' for column in KLINE_COLS)}, "
+                    "PRIMARY KEY (sec_type, sec_code, trade_date))"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            persisted: set[str] = set()
+
+            def checkpoint(rows: list[dict], _provider: str) -> set[str]:
+                codes_from_rows = {str(row["sec_code"]) for row in rows}
+                conn = connect(db_path)
+                try:
+                    upsert_rows(conn, rows)
+                finally:
+                    conn.close()
+                persisted.update(codes_from_rows)
+                return codes_from_rows
+
+            rows, summaries, remaining = run_stock_provider_passes(
+                codes,
+                "2026-05-19",
+                "20260519",
+                sources=[("primary", _a4_timeout_after_four_hundred_provider)],
+                min_request_interval_sec=0.0,
+                provider_timeout_sec=0.75,
+                error_threshold=3,
+                isolate=True,
+                on_checkpoint=checkpoint,
+                checkpoint_size=200,
+            )
+
+            self.assertEqual(summaries[0]["checkpointed"], 450)
+            self.assertEqual(summaries[0]["worker_restarts"], 1)
+            self.assertEqual(summaries[0]["timeout_codes"], ["600400"])
+            self.assertEqual(len(persisted), 450)
+            self.assertEqual(remaining, ["600400"])
+            self.assertEqual({row["sec_code"] for row in rows}, persisted)
+
+            resumed_calls: list[str] = []
+
+            def resumed_baostock(code: str, day_dash: str, day_compact: str) -> dict:
+                resumed_calls.append(code)
+                return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+            def index_fetch(code: str, day_dash: str, day_compact: str) -> dict:
+                return dict(_a3_complete_stock_provider(code, day_dash, day_compact), sec_type="index")
+
+            with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=resumed_baostock),
+                mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_index_sina", side_effect=index_fetch),
+                mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=index_fetch),
+            ):
+                result = repair_day(
+                    db_path,
+                    "2026-05-19",
+                    workers=1,
+                    attempts_per_source=1,
+                    min_request_interval_sec=0.0,
+                    checkpoint_size=200,
+                )
+
+        self.assertEqual(resumed_calls, ["600400"])
+        self.assertEqual(result["skipped_existing"], 450)
+        self.assertEqual(result["stock_count"], 451)
+        self.assertEqual(result["provider_summary"][0]["checkpointed"], 1)
+
+    def test_three_timeout_threshold_opens_circuit_and_next_pass_receives_remaining_gap(self) -> None:
         from repair_market_day_akshare import run_stock_provider_passes
 
         codes = [f"600{index:03d}" for index in range(1, 6)]
@@ -56,8 +238,9 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual(remaining, [])
         self.assertEqual({row["sec_code"] for row in rows}, set(codes))
         self.assertEqual(summaries[0]["provider"], "broken")
-        self.assertEqual(summaries[0]["circuit_reason"], "timeout")
-        self.assertLessEqual(summaries[0]["attempted"], 1)
+        self.assertEqual(summaries[0]["circuit_reason"], "timeout_threshold")
+        self.assertEqual(summaries[0]["attempted"], 3)
+        self.assertEqual(summaries[0]["timeout_codes"], codes[:3])
         self.assertEqual(summaries[0]["saturated"], 0)
         self.assertEqual(summaries[1]["provider"], "next")
         self.assertEqual(summaries[1]["before_missing"], len(codes))
@@ -79,8 +262,9 @@ class BackfillRuleTests(unittest.TestCase):
 
         self.assertEqual(remaining, [])
         self.assertEqual(len(rows), 5202)
-        self.assertEqual(summaries[0]["circuit_reason"], "timeout")
-        self.assertLessEqual(summaries[0]["attempted"], 2)
+        self.assertEqual(summaries[0]["circuit_reason"], "timeout_threshold")
+        self.assertEqual(summaries[0]["attempted"], 4)
+        self.assertEqual(summaries[0]["timeout_codes"], codes[1:4])
         self.assertEqual(summaries[1]["before_missing"], 5201)
         self.assertEqual(summaries[1]["after_missing"], 0)
         self.assertEqual(summaries[1]["attempted"], 5201)

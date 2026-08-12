@@ -469,6 +469,8 @@ def _provider_summary(provider: str, before_missing: int) -> dict[str, Any]:
         "error": 0,
         "invalid": 0,
         "timeout": 0,
+        "timeout_codes": [],
+        "worker_restarts": 0,
         "saturated": 0,
         "circuit_reason": None,
         "circuit_error_mode": "consecutive_provider_errors",
@@ -477,8 +479,10 @@ def _provider_summary(provider: str, before_missing: int) -> dict[str, Any]:
         "guard_rejected": 0,
         "elapsed": 0.0,
         "rows_per_minute": 0.0,
+        "codes_in": int(before_missing),
         "before_missing": int(before_missing),
         "after_missing": int(before_missing),
+        "unresolved": int(before_missing),
         "error_samples": [],
     }
 
@@ -582,8 +586,8 @@ def _run_stock_provider_pass(
     A row is removed from ``pending`` only after the parent process accepts it
     at a checkpoint.  Provider children never receive a database handle.  Row
     quality failures and empty responses remain unresolved for the next source;
-    only consecutive non-empty provider exceptions contribute to the source
-    circuit, and any complete row resets that counter.
+    only consecutive provider exceptions (including per-code timeouts)
+    contribute to the source circuit, and any complete row resets that counter.
     """
     pending = {str(code) for code in codes}
     accepted: list[dict[str, Any]] = []
@@ -593,6 +597,7 @@ def _run_stock_provider_pass(
     threshold = max(1, int(error_threshold))
     batch_size = max(1, int(checkpoint_size))
     consecutive_provider_errors = 0
+    terminal_for_provider: set[str] = set()
 
     def checkpoint_rows() -> None:
         nonlocal checkpoint_buffer
@@ -625,6 +630,7 @@ def _run_stock_provider_pass(
             summary["attempted"] += 1
             return False
         if kind == "row" and code is not None:
+            terminal_for_provider.add(str(code))
             accept_complete_row(code, payload)
             return False
         if kind == "invalid" and code is not None:
@@ -632,11 +638,14 @@ def _run_stock_provider_pass(
             # transport/provider error.  It stays in the gap for a fallback
             # but breaks an exception streak so three scattered bad symbols do
             # not trip a healthy provider's circuit.
+            terminal_for_provider.add(str(code))
             consecutive_provider_errors = 0
             summary["invalid"] += 1
             _add_error_sample(summary, f"{code} invalid {payload}")
         elif kind in {"error", "fatal"}:
             message = str(payload)
+            if code is not None:
+                terminal_for_provider.add(str(code))
             if "empty" in message.lower():
                 # An empty but well-formed provider response also remains
                 # unresolved without being treated as a transport failure.
@@ -681,53 +690,116 @@ def _run_stock_provider_pass(
                         break
         else:
             context = mp.get_context("spawn")
-            queue = context.Queue()
-            process = context.Process(
-                target=_provider_pass_worker,
-                args=(queue, provider, fn, list(codes), day_dash, day_compact, min_request_interval_sec),
-            )
             circuit_open = False
-            last_activity = time.monotonic()
-            try:
-                process.start()
-                while True:
-                    try:
-                        kind, code, payload = queue.get(timeout=0.05)
-                        last_activity = time.monotonic()
-                        if kind == "done":
+            while not circuit_open:
+                # A child receives only codes that have not reached a terminal
+                # outcome in this provider pass.  The active timeout code is
+                # terminal for this source but deliberately remains in
+                # ``pending`` for fallback.
+                worker_codes = [code for code in codes if str(code) not in terminal_for_provider]
+                if not worker_codes:
+                    break
+                queue = context.Queue()
+                process = context.Process(
+                    target=_provider_pass_worker,
+                    args=(queue, provider, fn, worker_codes, day_dash, day_compact, min_request_interval_sec),
+                )
+                active_code: str | None = None
+                worker_finished = False
+                restart_after_timeout = False
+                last_activity = time.monotonic()
+                try:
+                    process.start()
+                    while True:
+                        try:
+                            kind, code, payload = queue.get(timeout=0.05)
+                            last_activity = time.monotonic()
+                            if kind == "done":
+                                worker_finished = True
+                                break
+                            if kind == "started":
+                                active_code = str(code) if code is not None else None
+                            stop = consume(kind, code, payload)
+                            if code is not None and kind in {"row", "invalid", "error"} and active_code == str(code):
+                                active_code = None
+                            if stop:
+                                circuit_open = True
+                                break
+                        except Empty:
+                            if not process.is_alive():
+                                break
+                            if time.monotonic() - last_activity < max(0.1, float(provider_timeout_sec)):
+                                continue
+                            if active_code is None:
+                                summary["error"] += 1
+                                consecutive_provider_errors += 1
+                                summary["max_consecutive_errors"] = max(
+                                    int(summary["max_consecutive_errors"]),
+                                    consecutive_provider_errors,
+                                )
+                                _add_error_sample(summary, f"{provider} worker stalled before an active code")
+                                if consecutive_provider_errors >= threshold:
+                                    summary["circuit_reason"] = "error_threshold"
+                                    circuit_open = True
+                                else:
+                                    # Process setup itself produced no active
+                                    # request code.  Treat it as a bounded
+                                    # worker restart, never as an immediate
+                                    # source-wide timeout circuit.
+                                    restart_after_timeout = True
+                            else:
+                                timeout_code = active_code
+                                terminal_for_provider.add(timeout_code)
+                                summary["timeout"] += 1
+                                summary["timeout_codes"].append(timeout_code)
+                                consecutive_provider_errors += 1
+                                summary["max_consecutive_errors"] = max(
+                                    int(summary["max_consecutive_errors"]),
+                                    consecutive_provider_errors,
+                                )
+                                _add_error_sample(summary, f"{timeout_code} {provider} exceeded {provider_timeout_sec:g}s")
+                                # Parent-owned persistence is safe even while
+                                # the child must be killed for the active call.
+                                checkpoint_rows()
+                                if consecutive_provider_errors >= threshold:
+                                    summary["circuit_reason"] = "timeout_threshold"
+                                    circuit_open = True
+                                else:
+                                    restart_after_timeout = True
                             break
-                        if consume(kind, code, payload):
-                            circuit_open = True
-                            break
-                    except Empty:
-                        if not process.is_alive():
-                            break
-                        if time.monotonic() - last_activity >= max(0.1, float(provider_timeout_sec)):
-                            summary["timeout"] += 1
-                            summary["circuit_reason"] = "timeout"
-                            _add_error_sample(summary, f"{provider} exceeded {provider_timeout_sec:g}s")
-                            circuit_open = True
-                            break
-                if circuit_open:
-                    _terminate_provider_process(process)
-                else:
-                    process.join(1.0)
-                    if process.is_alive():
-                        summary["timeout"] += 1
-                        summary["circuit_reason"] = "timeout"
+                    if circuit_open or restart_after_timeout:
+                        checkpoint_rows()
                         _terminate_provider_process(process)
-                    elif process.exitcode not in (0, None) and summary["circuit_reason"] is None:
-                        summary["circuit_reason"] = "worker_exit"
-                        summary["error"] += 1
-                        _add_error_sample(summary, f"{provider} worker exit={process.exitcode}")
-            except Exception as exc:
-                summary["circuit_reason"] = "process_start_error"
-                summary["error"] += 1
-                _add_error_sample(summary, f"{type(exc).__name__}: {exc}")
-                _terminate_provider_process(process)
-            finally:
-                queue.close()
-                queue.join_thread()
+                    else:
+                        process.join(1.0)
+                        if process.is_alive():
+                            _terminate_provider_process(process)
+                            if not worker_finished:
+                                summary["error"] += 1
+                                consecutive_provider_errors += 1
+                                summary["max_consecutive_errors"] = max(
+                                    int(summary["max_consecutive_errors"]),
+                                    consecutive_provider_errors,
+                                )
+                                summary["circuit_reason"] = "error_threshold" if consecutive_provider_errors >= threshold else "worker_exit"
+                                circuit_open = True
+                        elif process.exitcode not in (0, None) and summary["circuit_reason"] is None:
+                            summary["circuit_reason"] = "worker_exit"
+                            summary["error"] += 1
+                            _add_error_sample(summary, f"{provider} worker exit={process.exitcode}")
+                            circuit_open = True
+                    if restart_after_timeout and not circuit_open:
+                        if any(str(code) not in terminal_for_provider for code in codes):
+                            summary["worker_restarts"] += 1
+                except Exception as exc:
+                    summary["circuit_reason"] = "process_start_error"
+                    summary["error"] += 1
+                    _add_error_sample(summary, f"{type(exc).__name__}: {exc}")
+                    _terminate_provider_process(process)
+                    circuit_open = True
+                finally:
+                    queue.close()
+                    queue.join_thread()
     finally:
         # A completed pass, a circuit, or a Python exception all flush what the
         # parent has already received.  A hard outer kill may skip this final
@@ -801,9 +873,11 @@ def run_stock_provider_passes(
                 if probe_summary["circuit_reason"] is None:
                     probe_summary["circuit_reason"] = "probe_failed"
                 probe_summary["after_missing"] = len(pending)
+                probe_summary["unresolved"] = len(pending)
                 record_summary(probe_summary)
                 continue
             probe_summary["after_missing"] = len(pending)
+            probe_summary["unresolved"] = len(pending)
             record_summary(probe_summary)
             if not pending:
                 break
@@ -823,6 +897,7 @@ def run_stock_provider_passes(
         rows.extend(pass_rows)
         pending = [code for code in pending if code in remaining]
         summary["after_missing"] = len(pending)
+        summary["unresolved"] = len(pending)
         record_summary(summary)
     return rows, summaries, pending
 
