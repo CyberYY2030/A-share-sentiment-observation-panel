@@ -1012,6 +1012,33 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertTrue(missing_requested)
         self.assertEqual(available, [pd.Timestamp("2026-04-21"), pd.Timestamp("2026-04-23")])
 
+    def test_panel_date_and_metric_coverage_exclude_unknown_fields(self) -> None:
+        from app_panel import resolve_available_panel_close_date, sentiment_metric_coverage
+
+        stock_df = pd.DataFrame(
+            {
+                "trade_date": ["2026-04-21", "2026-04-21"],
+                "sec_code": ["600001", "600002"],
+                "change_pct": [1.0, None],
+                "amount": [1000.0, None],
+            }
+        )
+        index_df = pd.DataFrame(
+            [
+                {"trade_date": "2026-04-21", "sec_code": code}
+                for code in ("000001", "399001", "000300", "000852")
+            ]
+        )
+        readiness = {"2026-04-21": {"screening_ready": True}}
+        resolved, missing, available = resolve_available_panel_close_date(
+            "2026-04-21", stock_df, index_df, readiness_by_date=readiness
+        )
+
+        self.assertEqual(resolved, pd.Timestamp("2026-04-21"))
+        self.assertFalse(missing)
+        self.assertEqual(available, [pd.Timestamp("2026-04-21")])
+        self.assertEqual(sentiment_metric_coverage(stock_df, "2026-04-21"), {"valid": 1, "expected": 2, "excluded": 1})
+
     def test_close_mode_opportunity_runtime_follows_selected_close_day(self) -> None:
         from app_panel import resolve_selected_opportunity_runtime
 

@@ -13,8 +13,6 @@ from zoneinfo import ZoneInfo
 
 from mining.data_quality import (
     STATUS_BAD,
-    STATUS_CLEAN,
-    STATUS_USABLE_WITH_QUARANTINE,
     ensure_session_diagnostics_table,
     ensure_session_revalidations_table,
     inspect_stock_session,
@@ -22,6 +20,7 @@ from mining.data_quality import (
     raw_market_postcondition,
     reinspect_stock_session,
     revalidate_known_bad_session,
+    stock_quality_is_screening_ready,
 )
 from runtime_paths import build_runtime_paths
 
@@ -180,7 +179,7 @@ def _stock_coverage_for_date(
         result.update(
             {
                 "stock": (stock_min_rows is None or stock_rows >= int(stock_min_rows))
-                and session_quality["status"] in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE},
+                and stock_quality_is_screening_ready(session_quality),
                 "index": required.issubset(set(index_codes)),
                 "stock_rows": stock_rows,
                 "index_codes": index_codes,
@@ -260,6 +259,29 @@ def concept_coverage_for_date(
                 "concept_expect_source": str(snapshot[1] or "provider_eligible_universe"),
             }
         )
+        # The original A.2 gate protects both the same-day expectation and the
+        # latest trusted prior expectation.  Re-run it read-only here so a
+        # previously shrunken expectation cannot turn an incomplete concept
+        # domain green merely because every code in the smaller set is present.
+        try:
+            from backfill_adata_ths_concept_index_kline_60d import apply_concept_universe_gate
+
+            universe_gate = apply_concept_universe_gate(
+                con,
+                [day],
+                eligible_codes,
+                persist=False,
+            )
+        except Exception as exc:
+            universe_gate = {
+                "ok": False,
+                "reason": "eligible_universe_gate_unavailable",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        result["concept_universe_gate"] = universe_gate
+        if not bool(universe_gate.get("ok")):
+            result["concept"] = False
+            result["concept_reason_codes"] = [str(universe_gate.get("reason") or "eligible_universe_gate_failed")]
         return result
     finally:
         con.close()
@@ -419,6 +441,146 @@ def coverage_for_date(
         result.update(etf_coverage_for_date(paths.etf_db, normalized))
     if "mining" in selected:
         result.update(mining_coverage_for_date(paths.base_dir, normalized))
+    return result
+
+
+def screening_readiness_for_date(base_dir: str | Path, day: str) -> dict[str, Any]:
+    """Return the shared stock/index gate for panels, updater, and selection.
+
+    A complete mining batch is reported independently: stock and the four
+    required indexes decide whether close-data screening may run, while a
+    batch decides only whether persisted results are available to read.
+    """
+    normalized = normalize_day(day)
+    if normalized is None:
+        raise ValueError(f"Invalid day: {day!r}")
+    coverage = coverage_for_date(base_dir, normalized, domains=("stock", "index"))
+    quality = dict(coverage.get("session_quality") or {})
+    stock_ready = bool(coverage.get("stock"))
+    index_ready = bool(coverage.get("index"))
+    return {
+        "trade_date": normalized,
+        "screening_ready": stock_ready and index_ready,
+        "domains": {
+            "stock": {
+                "ready": stock_ready,
+                "status": "ready" if stock_ready else "unavailable",
+                "reason_codes": [str(value) for value in quality.get("reasons", [])],
+                "quality": quality,
+            },
+            "index": {
+                "ready": index_ready,
+                "status": "ready" if index_ready else "unavailable",
+                "reason_codes": [] if index_ready else ["required_index_codes_missing"],
+                "index_codes": list(coverage.get("index_codes") or []),
+            },
+        },
+    }
+
+
+def _stock_quality_health_evidence(stock_db: str | Path, day: str) -> dict[str, Any]:
+    """Expose day-specific quality counts without mixing quality and universe denominators."""
+    coverage = stock_coverage_for_date(stock_db, day)
+    quality = dict(coverage.get("session_quality") or {})
+    present = int(quality.get("distinct_stock_codes", coverage.get("stock_rows", 0)) or 0)
+    expected = quality.get("coverage_baseline")
+    expected_count = int(expected) if expected is not None else None
+    stock_info_expected: int | None = None
+    if Path(stock_db).exists():
+        con = _connect(stock_db)
+        try:
+            if _table_exists(con, "stock_info"):
+                stock_info_expected = int(_scalar(con, "SELECT COUNT(DISTINCT sec_code) FROM stock_info") or 0)
+        finally:
+            con.close()
+    selection_eligible: int | None = None
+    selection_error: str | None = None
+    if Path(stock_db).exists():
+        memory = sqlite3.connect(":memory:")
+        memory.row_factory = sqlite3.Row
+        try:
+            # Windows' SQLite build does not accept a mode=ro URI in ATTACH.
+            # query_only makes the in-memory connection (and its attachment)
+            # reject every write before the source path is attached.
+            memory.execute("PRAGMA query_only = ON")
+            memory.execute("ATTACH DATABASE ? AS ash", (str(Path(stock_db).resolve()),))
+            from mining.selection_context import build_selection_context
+
+            context = build_selection_context(memory, str(day))
+            selection_eligible = int(context.diagnostics.get("eligible_count", len(context.universe)) or 0)
+        except Exception as exc:
+            selection_error = f"{type(exc).__name__}: {exc}"
+        finally:
+            memory.close()
+    return {
+        "valid": int(quality.get("valid_trade_rows", 0) or 0),
+        "present": present,
+        "expected": expected_count,
+        "quarantined": int(quality.get("isolated_rows", 0) or 0),
+        "absent": max(expected_count - present, 0) if expected_count is not None else None,
+        "universe_expected": stock_info_expected,
+        "universe_absent": max(stock_info_expected - present, 0) if stock_info_expected is not None else None,
+        "selection_eligible": selection_eligible,
+        "selection_error": selection_error,
+    }
+
+
+def prototype_readiness_for_date(
+    base_dir: str | Path,
+    day: str,
+    *,
+    skip_concept: bool = False,
+    quality_failures: Iterable[dict[str, Any]] = (),
+    include_health_evidence: bool = False,
+) -> dict[str, Any]:
+    """Apply PROTO-1's optional-domain policy without contacting a provider."""
+    core = screening_readiness_for_date(base_dir, day)
+    normalized = str(core["trade_date"])
+    optional_domains = ("etf", "mining") if skip_concept else ("concept", "etf", "mining")
+    coverage = coverage_for_date(base_dir, normalized, domains=optional_domains)
+    domains = dict(core["domains"])
+    failure_codes = [str(item.get("code")) for item in quality_failures if item.get("code")]
+    concept_reasons = list(coverage.get("concept_reason_codes") or [])
+    if "eligible_universe_regression" in failure_codes and "eligible_universe_regression" not in concept_reasons:
+        concept_reasons.append("eligible_universe_regression")
+    if skip_concept:
+        domains["concept"] = {
+            "ready": False,
+            "status": "optional_skipped",
+            "reason_codes": ["optional_skipped"],
+        }
+    else:
+        concept_ready = bool(coverage.get("concept")) and not concept_reasons
+        domains["concept"] = {
+            "ready": concept_ready,
+            "status": "ready" if concept_ready else "unavailable",
+            "reason_codes": concept_reasons or ([] if concept_ready else ["concept_coverage_incomplete"]),
+            "coverage": {
+                key: coverage.get(key)
+                for key in ("concept_rows", "concept_have", "concept_expect", "concept_missing", "concept_expect_source")
+            },
+        }
+    etf_ready = bool(coverage.get("etf"))
+    domains["etf"] = {
+        "ready": etf_ready,
+        "status": "ready" if etf_ready else "unavailable",
+        "reason_codes": [] if etf_ready else ["etf_coverage_incomplete"],
+    }
+    mining_ready = bool(coverage.get("mining"))
+    domains["mining"] = {
+        "ready": mining_ready,
+        "status": "complete" if mining_ready else "not_run",
+        "reason_codes": [] if mining_ready else ["close_final_batch_unavailable"],
+    }
+    optional_degraded = any(not bool(domains[name]["ready"]) for name in ("concept", "etf", "mining"))
+    result = {
+        **core,
+        "domains": domains,
+        "overall_status": "ready" if core["screening_ready"] and not optional_degraded else "degraded" if core["screening_ready"] else "blocked",
+    }
+    if include_health_evidence:
+        paths = build_runtime_paths(str(base_dir))
+        result["stock_quality"] = _stock_quality_health_evidence(paths.stock_db, normalized)
     return result
 
 
@@ -1056,6 +1218,9 @@ def write_health_summary(base_dir: str | Path, update_result: dict[str, Any] | N
     stock_max = calendar[-1] if calendar else _max_date_from_table(paths.stock_db, "kline_daily", "trade_date", "sec_type='stock'")
     plan_dates = ((update_result or {}).get("plan") or {}).get("expected_dates") or []
     target_date = normalize_day(plan_dates[-1]) if plan_dates else stock_max
+    readiness = (update_result or {}).get("readiness")
+    if not isinstance(readiness, dict) and target_date:
+        readiness = prototype_readiness_for_date(base, target_date, include_health_evidence=True)
 
     domain_dates = {
         "stock": stock_max,
@@ -1127,6 +1292,32 @@ def write_health_summary(base_dir: str | Path, update_result: dict[str, Any] | N
     for domain, info in freshness.items():
         lag = info.get("lag_vs_stock_days")
         lines.append(f"| {domain} | {info.get('max_date') or 'n/a'} | {lag if lag is not None else 'n/a'} |")
+    if isinstance(readiness, dict):
+        stock_quality = readiness.get("stock_quality") or {}
+        lines.extend(
+            [
+                "",
+                "## Screening Readiness",
+                "",
+                f"- screening_ready: {bool(readiness.get('screening_ready'))}",
+                f"- overall_status: {readiness.get('overall_status') or 'n/a'}",
+                "- stock quality: "
+                f"valid={stock_quality.get('valid', 'n/a')} "
+                f"present={stock_quality.get('present', 'n/a')} "
+                f"expected={stock_quality.get('expected', 'n/a')} "
+                f"quarantined={stock_quality.get('quarantined', 'n/a')} "
+                f"absent={stock_quality.get('absent', 'n/a')}",
+                f"- stock universe: expected={stock_quality.get('universe_expected', 'n/a')} "
+                f"absent={stock_quality.get('universe_absent', 'n/a')} "
+                f"selection_eligible={stock_quality.get('selection_eligible', 'n/a')}",
+            ]
+        )
+        for domain in ("stock", "index", "concept", "etf", "mining"):
+            state = (readiness.get("domains") or {}).get(domain) or {}
+            lines.append(
+                f"- {domain}: status={state.get('status', 'n/a')} ready={state.get('ready', 'n/a')} "
+                f"reasons={','.join(state.get('reason_codes') or []) or 'none'}"
+            )
     lines.extend(
         [
             "",
@@ -1167,6 +1358,7 @@ def write_health_summary(base_dir: str | Path, update_result: dict[str, Any] | N
         "complete_delta": complete_delta,
         "alerts": alerts,
         "errors": errors,
+        "readiness": readiness,
     }
 
 
@@ -1371,6 +1563,7 @@ def run_offline_update(
     days: int = 10,
     target_days: Iterable[str] | None = None,
     include_mining: bool = True,
+    include_concept: bool = True,
     publish_health: bool = True,
     dry_run: bool = False,
     timeout_sec: int = 600,
@@ -1382,6 +1575,8 @@ def run_offline_update(
     managed_domains = _existing_domains(paths.base_dir)
     if not include_mining:
         managed_domains = [domain for domain in managed_domains if domain != "mining"]
+    if not include_concept:
+        managed_domains = [domain for domain in managed_domains if domain != "concept"]
 
     def build_plan() -> dict[str, Any]:
         return build_missing_update_plan(paths.base_dir, expected_dates, domains=managed_domains)
@@ -1429,7 +1624,14 @@ def run_offline_update(
             "now_cn": now_cn.isoformat(timespec="seconds"),
             "target_close_date": target_close_date,
             "mining_deferred": not include_mining,
+            "concept_deferred": not include_concept,
         }
+        result["readiness"] = prototype_readiness_for_date(
+            paths.base_dir,
+            expected_dates[-1] if expected_dates else target_close_date,
+            skip_concept=not include_concept,
+            include_health_evidence=True,
+        )
         if publish_health:
             result["health"] = write_health_summary(paths.base_dir, result)
             result["push"] = _send_daily_push(paths.base_dir, result["health"])
@@ -1775,7 +1977,15 @@ def run_offline_update(
         "now_cn": now_cn.isoformat(timespec="seconds"),
         "target_close_date": target_close_date,
         "mining_deferred": not include_mining,
+        "concept_deferred": not include_concept,
     }
+    result["readiness"] = prototype_readiness_for_date(
+        paths.base_dir,
+        expected_dates[-1] if expected_dates else target_close_date,
+        skip_concept=not include_concept,
+        quality_failures=quality_failures,
+        include_health_evidence=True,
+    )
     if publish_health:
         result["health"] = write_health_summary(paths.base_dir, result)
         result["push"] = _send_daily_push(paths.base_dir, result["health"])
@@ -1792,6 +2002,7 @@ def main() -> int:
     parser.add_argument("--days", type=int, default=10)
     parser.add_argument("--target-day", action="append", default=[])
     parser.add_argument("--skip-mining", action="store_true")
+    parser.add_argument("--skip-concept", action="store_true")
     parser.add_argument("--no-health", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--timeout-sec", type=int, default=600)
@@ -1806,6 +2017,7 @@ def main() -> int:
         days=max(1, int(args.days)),
         target_days=args.target_day,
         include_mining=not bool(args.skip_mining),
+        include_concept=not bool(args.skip_concept),
         publish_health=not bool(args.no_health),
         dry_run=bool(args.dry_run),
         timeout_sec=max(30, int(args.timeout_sec)),

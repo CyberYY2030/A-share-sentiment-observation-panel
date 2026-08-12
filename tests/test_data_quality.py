@@ -335,6 +335,63 @@ class DataQualityTests(unittest.TestCase):
         self.assertEqual(duplicate["status"], STATUS_KNOWN_BAD)
         self.assertEqual(duplicate["quarantined_rows"][0]["reason"], "conflicting_duplicate")
 
+    def test_proto1_usable_ratio_and_coverage_boundaries(self) -> None:
+        conn = _connect()
+        try:
+            for day in ("2026-07-01", "2026-07-02", "2026-07-03", "2026-07-04", "2026-07-05"):
+                _insert_clean_day(conn, day, count=100)
+            for index in range(90):
+                _insert_row(conn, "2026-07-06", f"60{index:04d}")
+            for index in range(10):
+                _insert_row(
+                    conn,
+                    "2026-07-06",
+                    f"61{index:04d}",
+                    high=11.0,
+                    close=11.0,
+                    volume=0.0,
+                    amount=0.0,
+                )
+            for index in range(89):
+                _insert_row(conn, "2026-07-07", f"62{index:04d}")
+            for index in range(11):
+                _insert_row(
+                    conn,
+                    "2026-07-07",
+                    f"63{index:04d}",
+                    high=11.0,
+                    close=11.0,
+                    volume=0.0,
+                    amount=0.0,
+                )
+            _insert_clean_day(conn, "2026-07-08", count=94)
+            for index in range(10):
+                _insert_row(
+                    conn,
+                    "2026-07-09",
+                    f"64{index:04d}",
+                    high=11.0,
+                    close=11.0,
+                    volume=0.0,
+                    amount=0.0,
+                )
+            conn.commit()
+            usable = inspect_stock_session(conn, "2026-07-06")
+            partial_usable = inspect_stock_session(conn, "2026-07-07")
+            partial_coverage = inspect_stock_session(conn, "2026-07-08")
+            known_bad = inspect_stock_session(conn, "2026-07-09")
+        finally:
+            conn.close()
+
+        self.assertEqual(usable["status"], STATUS_USABLE_WITH_QUARANTINE)
+        self.assertEqual(usable["usable_ratio"], 0.90)
+        self.assertEqual(partial_usable["status"], STATUS_PARTIAL)
+        self.assertIn("usable_ratio_below_0_90", partial_usable["reasons"])
+        self.assertEqual(partial_coverage["status"], STATUS_PARTIAL)
+        self.assertIn("coverage_ratio_below_0_95", partial_coverage["reasons"])
+        self.assertEqual(known_bad["status"], STATUS_KNOWN_BAD)
+        self.assertIn("no_valid_trade", known_bad["reasons"])
+
     def test_known_bad_session_remains_explicit_and_is_not_calendar_data(self) -> None:
         conn = _connect()
         try:

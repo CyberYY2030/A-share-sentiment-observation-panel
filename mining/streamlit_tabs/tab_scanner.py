@@ -18,7 +18,13 @@ from ..capabilities import (
     formal_definitions,
     visible_strategy_ids,
 )
-from ..data_quality import STATUS_CLEAN, inspect_stock_session, usable_stock_trade_dates
+from ..data_quality import (
+    STATUS_CLEAN,
+    STATUS_USABLE_WITH_QUARANTINE,
+    inspect_stock_session,
+    stock_quality_is_screening_ready,
+    usable_stock_trade_dates,
+)
 from ..features import (
     board_kind,
     change_pct,
@@ -45,6 +51,7 @@ from ..selection_runtime import (
     MODE_DATA_UNAVAILABLE,
     SelectionRuntime,
 )
+from ..selection_context import build_selection_context
 from ..scanners.base_breakout import evaluate_base_breakout
 from ..scanners.counter_trend_rs import evaluate_counter_trend_rs
 from ..scanners.launch_burst import evaluate_compression_launch
@@ -848,7 +855,8 @@ def _formal_capability_view(
     snapshot_source = None
     snapshot_as_of = None
     quote_result = None
-    if str(inspect_stock_session(conn, trade_date).get("status")) != STATUS_CLEAN and snapshot_loader is not None:
+    quality = inspect_stock_session(conn, trade_date)
+    if not stock_quality_is_screening_ready(quality) and snapshot_loader is not None:
         quote_result = _quote_result(snapshot_loader())
         if quote_result.observed_at is None:
             quote_result = replace(quote_result, observed_at=current.isoformat())
@@ -856,6 +864,50 @@ def _formal_capability_view(
             snapshot = quote_result.frame.copy()
             snapshot_source = quote_result.provider
             snapshot_as_of = quote_result.observed_at
+    if str(quality.get("status")) == STATUS_USABLE_WITH_QUARANTINE:
+        # The stock/index close gate already accepted this day.  Build a
+        # read-only formal preview from the quarantined-row-aware context; a
+        # persisted v2.5 batch remains the responsibility of run_daily.py.
+        context = build_selection_context(
+            conn,
+            str(trade_date),
+            mode=MODE_CLOSE_FINAL,
+            as_of=current.isoformat(),
+            price_as_of=str(trade_date),
+        )
+        evidence = _selection_evidence(
+            context,
+            mode=MODE_CLOSE_FINAL,
+            snapshot_source=None,
+            snapshot_coverage=None,
+            quote_result=None,
+        )
+        evidence.update(
+            _date_alignment_evidence(
+                context,
+                selected_trade_date=selected_trade_date or trade_date,
+                formal_trade_date=str(trade_date),
+            )
+        )
+        evidence.update(
+            {
+                "benchmark_status": context.benchmark_status,
+                "benchmark_provider": None,
+                "benchmark_observed_at": None,
+                "benchmark_errors": [],
+                "prototype_formal_preview": True,
+            }
+        )
+        c_history = a_history_coverage(
+            conn,
+            trade_date,
+            usable_dates=context.diagnostics.get("usable_dates"),
+        )
+        rows, status = _live_formal_capability_rows(conn, context)
+        status.attrs["a_history_coverage"] = c_history
+        status.attrs["prototype_formal_preview"] = True
+        return _apply_date_evidence_gate(rows, status, evidence)
+
     result = resolved_runtime.run(
         conn,
         trade_date,

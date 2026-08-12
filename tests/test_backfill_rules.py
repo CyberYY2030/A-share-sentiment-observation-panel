@@ -471,6 +471,67 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual(result["quality_failures"][0]["code"], "eligible_universe_regression")
         self.assertEqual(result["quality_failures"][0]["candidate_count"], 263)
 
+    def test_proto_readiness_keeps_concept_regression_optional(self) -> None:
+        from offline_daily_update import prototype_readiness_for_date
+
+        def coverage(_base, _day, *, domains=None, **_kwargs):
+            selected = set(domains or [])
+            result = {"trade_date": "2026-08-10"}
+            if {"stock", "index"} & selected:
+                result.update(
+                    {
+                        "stock": True,
+                        "index": True,
+                        "index_codes": ["000001", "399001", "000300", "000852"],
+                        "session_quality": {"status": "usable_with_quarantine", "reasons": ["row_quarantine"]},
+                    }
+                )
+            if "concept" in selected:
+                result.update(
+                    {
+                        "concept": False,
+                        "concept_reason_codes": ["eligible_universe_regression"],
+                        "concept_have": 263,
+                        "concept_expect": 349,
+                    }
+                )
+            if "etf" in selected:
+                result["etf"] = True
+            if "mining" in selected:
+                result["mining"] = False
+            return result
+
+        with mock.patch("offline_daily_update.coverage_for_date", side_effect=coverage):
+            readiness = prototype_readiness_for_date(Path("."), "2026-08-10")
+
+        self.assertTrue(readiness["screening_ready"])
+        self.assertEqual(readiness["overall_status"], "degraded")
+        self.assertFalse(readiness["domains"]["concept"]["ready"])
+        self.assertEqual(readiness["domains"]["concept"]["reason_codes"], ["eligible_universe_regression"])
+
+    def test_skip_concept_never_starts_a_provider_child(self) -> None:
+        from offline_daily_update import run_offline_update
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            (base / "ths_concept.db").touch()
+            with (
+                mock.patch("offline_daily_update.resolve_expected_trade_days", return_value=["2026-04-30"]),
+                mock.patch("offline_daily_update._run_with_remaining_budget") as provider_child,
+            ):
+                result = run_offline_update(
+                    base,
+                    asof="2026-04-30",
+                    include_mining=False,
+                    include_concept=False,
+                    publish_health=False,
+                    dry_run=True,
+                )
+
+        provider_child.assert_not_called()
+        self.assertTrue(result["concept_deferred"])
+        self.assertEqual(result["readiness"]["domains"]["concept"]["status"], "optional_skipped")
+
     def test_skip_mining_excludes_mining_from_the_ops1_market_recovery_plan(self) -> None:
         from offline_daily_update import run_offline_update
 

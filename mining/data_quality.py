@@ -21,6 +21,14 @@ STATUS_UNAVAILABLE = "quality_unavailable"
 # now reported with the explicit v2.5 name rather than an ambiguous "bad" label.
 STATUS_BAD = STATUS_KNOWN_BAD
 
+# PROTO-1 freezes the daily stock-quality contract in one place.  Consumers
+# decide readiness from the resulting status rather than carrying their own
+# copies of these numerical boundaries.
+SYSTEMIC_FAILURE_RATIO = 0.80
+PARTIAL_COVERAGE_RATIO = 0.95
+PARTIAL_USABLE_RATIO = 0.90
+SCREENING_READY_SESSION_STATUSES = frozenset({STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE})
+
 ROW_VALID_TRADE = "valid_trade"
 ROW_CONFIRMED_HALT = "confirmed_halt"
 ROW_PROVIDER_HALT = "provider_halt_placeholder"
@@ -364,21 +372,21 @@ def _classify_summary(
     if summary["valid_trade_rows"] == 0:
         result.update(status=STATUS_KNOWN_BAD, reasons=["no_valid_trade"])
         return result
-    if usable_ratio is not None and usable_ratio < 0.80:
+    if usable_ratio is not None and usable_ratio < SYSTEMIC_FAILURE_RATIO:
         result.update(status=STATUS_KNOWN_BAD, reasons=["usable_ratio_below_0_80"])
         return result
-    if coverage_ratio is not None and coverage_ratio < 0.80:
+    if coverage_ratio is not None and coverage_ratio < SYSTEMIC_FAILURE_RATIO:
         result.update(status=STATUS_KNOWN_BAD, reasons=["coverage_ratio_below_0_80"])
         return result
     if coverage_baseline is None:
         result.update(status=STATUS_UNAVAILABLE, reasons=["coverage_baseline_unavailable"])
         return result
-    if coverage_ratio < 0.95 or usable_ratio < 0.98:
+    if coverage_ratio < PARTIAL_COVERAGE_RATIO or usable_ratio < PARTIAL_USABLE_RATIO:
         reasons: list[str] = []
-        if coverage_ratio < 0.95:
+        if coverage_ratio < PARTIAL_COVERAGE_RATIO:
             reasons.append("coverage_ratio_below_0_95")
-        if usable_ratio < 0.98:
-            reasons.append("usable_ratio_below_0_98")
+        if usable_ratio < PARTIAL_USABLE_RATIO:
+            reasons.append("usable_ratio_below_0_90")
         result.update(status=STATUS_PARTIAL, reasons=reasons)
         return result
     if summary["isolated_rows"]:
@@ -393,10 +401,8 @@ def inspect_stock_session(
     trade_date: str,
     *,
     coverage_lookback: int = 20,
-    min_coverage_ratio: float = 0.8,
 ) -> dict[str, Any]:
     """Classify a stock session with independent coverage and usable-row axes."""
-    del min_coverage_ratio  # v2.5 freezes the 0.80/0.95/0.98 state machine.
     if not _has_quality_columns(conn):
         return {
             "trade_date": str(trade_date),
@@ -429,6 +435,11 @@ def inspect_stock_session(
         summary,
         int(median(baseline)) if len(baseline) >= 5 else None,
     )
+
+
+def stock_quality_is_screening_ready(quality: Mapping[str, Any]) -> bool:
+    """Return the only status-based stock gate used by screening consumers."""
+    return str(quality.get("status") or "") in SCREENING_READY_SESSION_STATUSES
 
 
 def reinspect_stock_session(
@@ -484,7 +495,7 @@ def raw_market_postcondition(
 
     index_codes = sorted({canonical_code(row[0]) for row in rows if row and row[0] is not None})
     required = {canonical_code(code) for code in required_index_codes}
-    stock_ok = str(quality.get("status")) in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}
+    stock_ok = stock_quality_is_screening_ready(quality)
     index_ok = required.issubset(set(index_codes))
     return {
         "ok": stock_ok and index_ok,
@@ -510,7 +521,7 @@ def revalidate_known_bad_session(conn: sqlite3.Connection, trade_date: str) -> d
     raw = reinspect_stock_session(conn, trade_date)
     raw_status = str(raw["status"])
     raw_reasons = [str(reason) for reason in raw.get("reasons", [])]
-    raw_is_usable = raw_status in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}
+    raw_is_usable = stock_quality_is_screening_ready(raw)
 
     if raw_is_usable:
         action = "cleared_after_raw_usable" if before is not None else "raw_usable_without_latch"
@@ -626,7 +637,7 @@ def usable_stock_trade_dates(
     usable: list[str] = []
     quarantined: list[dict[str, Any]] = []
     for quality in inspect_stock_sessions(conn, end_date=end_date, include_end=include_end):
-        if quality["status"] in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}:
+        if stock_quality_is_screening_ready(quality):
             usable.append(str(quality["trade_date"]))
             quarantined.extend(quality.get("quarantined_rows", []))
     return usable, quarantined

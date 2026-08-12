@@ -30,7 +30,12 @@ import pandas as pd
 import streamlit as st
 
 from backfill_orchestrator import start_background_job
-from offline_daily_update import build_missing_update_plan, resolve_expected_trade_days
+from offline_daily_update import (
+    build_missing_update_plan,
+    prototype_readiness_for_date,
+    resolve_expected_trade_days,
+    screening_readiness_for_date,
+)
 from runtime_paths import build_runtime_paths, ensure_runtime_dirs
 from mining.streamlit_tabs import render_scanner_tab
 from mining.streamlit_tabs.tab_scanner import ensure_close_history_persisted
@@ -925,13 +930,20 @@ def resolve_available_panel_close_date(
     stock_df: pd.DataFrame,
     index_df: pd.DataFrame,
     required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
+    readiness_by_date: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Optional[pd.Timestamp], bool, List[pd.Timestamp]]:
-    """Resolve the panel close day from actual stock/index row coverage, not max dates."""
+    """Resolve the panel close day from shared stock/index readiness evidence."""
     requested = _day_ts(requested_close_day)
     available = sorted(
         _stock_trade_date_set(stock_df)
         & _index_trade_date_set(index_df, required_index_codes)
     )
+    if readiness_by_date is not None:
+        available = [
+            day
+            for day in available
+            if bool((readiness_by_date.get(str(day.date())) or {}).get("screening_ready"))
+        ]
     if not available:
         return None, bool(requested is not None), []
     if requested is None:
@@ -2225,7 +2237,9 @@ def compute_daily_sentiment(
     df["change_pct"] = pd.to_numeric(df["change_pct"], errors="coerce")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
 
-    df = df.dropna(subset=["trade_date"]).copy()
+    # Every metric below needs both a return and turnover input.  Unknown fields
+    # are removed instead of being treated as a flat/zero observation.
+    df = df.dropna(subset=["trade_date", "change_pct", "amount"]).copy()
     df["is_flat"] = np.isclose(df["change_pct"].fillna(0), 0.0)
 
     g = df.groupby("trade_date")
@@ -2349,6 +2363,25 @@ def compute_daily_sentiment(
     out["sentiment_z"] = zscore(out["sentiment_mom"], 20, 5)
 
     return out.reset_index(), msgs
+
+
+def sentiment_metric_coverage(stock_df: pd.DataFrame, trade_date: Any) -> Dict[str, int]:
+    """Return the visible denominator for close-day sentiment metrics."""
+    if stock_df is None or stock_df.empty:
+        return {"valid": 0, "expected": 0, "excluded": 0}
+    day = _day_ts(trade_date)
+    if day is None or "trade_date" not in stock_df.columns or "sec_code" not in stock_df.columns:
+        return {"valid": 0, "expected": 0, "excluded": 0}
+    frame = stock_df.copy()
+    frame["trade_date"] = _ensure_trade_dates(frame["trade_date"])
+    frame = frame[frame["trade_date"] == day].copy()
+    expected = int(frame["sec_code"].astype(str).nunique())
+    if frame.empty:
+        return {"valid": 0, "expected": expected, "excluded": expected}
+    for column in ("change_pct", "amount"):
+        frame[column] = pd.to_numeric(frame.get(column), errors="coerce")
+    valid = int(frame.dropna(subset=["change_pct", "amount"])["sec_code"].astype(str).nunique())
+    return {"valid": valid, "expected": expected, "excluded": max(expected - valid, 0)}
 
 
 # ----------------------------
@@ -3701,6 +3734,8 @@ def ak_fetch_index_min_em(code: str) -> pd.DataFrame:
 
 def ak_fetch_500etf_qvix_min() -> pd.DataFrame:
     """500ETF QVIX intraday series (AkShare)."""
+    if os.environ.get(SCREENING_BASE_DIR_ENV, "").strip():
+        return pd.DataFrame()
     ak, err = try_import_akshare()
     if ak is None:
         raise RuntimeError(f"akshare not available: {err}")
@@ -3711,6 +3746,8 @@ def ak_fetch_500etf_qvix_min() -> pd.DataFrame:
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def ak_fetch_500etf_qvix_daily() -> pd.DataFrame:
     """500ETF QVIX daily series (AkShare)."""
+    if os.environ.get(SCREENING_BASE_DIR_ENV, "").strip():
+        return pd.DataFrame()
     ak, err = try_import_akshare()
     if ak is None:
         raise RuntimeError(f"akshare not available: {err}")
@@ -4241,7 +4278,13 @@ def main():
             asof=remote_stock_day,
             days=10,
         )
-        offline_plan = build_missing_update_plan(runtime_paths.base_dir, offline_expected_dates)
+        # PROTO-1 treats concept/ETF as optional display domains. The startup
+        # worker repairs only the stock/index core after an A.2 refusal.
+        offline_plan = build_missing_update_plan(
+            runtime_paths.base_dir,
+            offline_expected_dates,
+            domains=("stock", "index"),
+        )
     except Exception as exc:
         offline_expected_dates = []
         offline_plan = {"ok": True, "missing_by_day": {}, "missing_by_domain": {}, "error": str(exc)}
@@ -4270,6 +4313,7 @@ def main():
                         str(remote_stock_day or ""),
                         "--days",
                         "10",
+                        "--skip-concept",
                         "--timeout-sec",
                         "180",
                     ],
@@ -4588,14 +4632,43 @@ def main():
         db_latest_index_dt,
         db_latest_concept_dt,
     )
+    raw_panel_dates = sorted(
+        _stock_trade_date_set(stock_df) & _index_trade_date_set(index_df, REQUIRED_INDEX_CODES)
+    )
+    readiness_by_date: Dict[str, Dict[str, Any]] = {}
+    requested_readiness_day = _day_ts(requested_close_dt0) if requested_close_dt0 else None
+    if requested_readiness_day is not None:
+        readiness_candidates = [
+            day for day in reversed(raw_panel_dates) if day <= requested_readiness_day
+        ]
+        if not readiness_candidates:
+            readiness_candidates = list(reversed(raw_panel_dates))
+    else:
+        readiness_candidates = list(reversed(raw_panel_dates))
+    for candidate_day in readiness_candidates:
+        day_key = str(candidate_day.date())
+        try:
+            readiness_by_date[day_key] = screening_readiness_for_date(runtime_paths.base_dir, day_key)
+        except Exception as exc:
+            readiness_by_date[day_key] = {"screening_ready": False, "error": type(exc).__name__}
+        if readiness_by_date[day_key].get("screening_ready"):
+            break
     panel_close_dt, missing_requested_close, available_panel_close_dates = resolve_available_panel_close_date(
         requested_close_dt0,
         stock_df,
         index_df,
         REQUIRED_INDEX_CODES,
+        readiness_by_date,
     )
     if panel_close_dt is None:
         panel_close_dt = panel_close_dt_by_latest
+    panel_readiness = readiness_by_date.get(str(panel_close_dt.date())) if panel_close_dt is not None else None
+    panel_optional_readiness: Dict[str, Any] = {}
+    if panel_close_dt is not None:
+        try:
+            panel_optional_readiness = prototype_readiness_for_date(runtime_paths.base_dir, str(panel_close_dt.date()))
+        except Exception as exc:
+            panel_optional_readiness = {"error": type(exc).__name__}
     if missing_requested_close and requested_close_dt0 is not None:
         st.sidebar.warning(
             f"本地 stock/index 未覆盖所选日期 {pd.Timestamp(requested_close_dt0).date()}，"
@@ -4684,26 +4757,26 @@ def main():
                 msgs.append(mm)
     daily = daily.sort_values("trade_date")
 
-    # export last 40
-    try:
-        daily.tail(40).to_csv(runtime_paths.metrics_csv, index=False, encoding="utf-8-sig")
-    except Exception as e:
-        st.warning(f"写出 {runtime_paths.metrics_csv} 失败：{e}")
+    if not isolated_screening:
+        # export last 40
+        try:
+            daily.tail(40).to_csv(runtime_paths.metrics_csv, index=False, encoding="utf-8-sig")
+        except Exception as e:
+            st.warning(f"写出 {runtime_paths.metrics_csv} 失败：{e}")
 
+        # 额外输出：保存到本程序同目录（方便其他脚本读取）
+        try:
+            daily.tail(40).to_csv(runtime_paths.legacy_metrics_csv, index=False, encoding="utf-8-sig")
+        except Exception:
+            pass
 
-    # 额外输出：保存到本程序同目录（方便其他脚本读取）
-    try:
-        daily.tail(40).to_csv(runtime_paths.legacy_metrics_csv, index=False, encoding="utf-8-sig")
-    except Exception:
-        pass
-
-    # 同步写入 daily_matrics 表（存在则 upsert；不存在则创建/补列）
-    try:
-        con_metrics = _raw_db_connect(stock_db)
-        _ = upsert_daily_matrics(con_metrics, daily)
-        con_metrics.close()
-    except Exception as e:
-        st.warning(f"写入 daily_matrics 失败：{e}")
+        # 同步写入 daily_matrics 表（存在则 upsert；不存在则创建/补列）
+        try:
+            con_metrics = _raw_db_connect(stock_db)
+            _ = upsert_daily_matrics(con_metrics, daily)
+            con_metrics.close()
+        except Exception as e:
+            st.warning(f"写入 daily_matrics 失败：{e}")
 
     if msgs:
         with st.expander("缺失/提示", expanded=True):
@@ -4876,6 +4949,11 @@ def main():
 
 
     c1, c2, c3, c4, c5 = st.columns(5)
+    metric_coverage = sentiment_metric_coverage(stock_df, last.get("trade_date"))
+    st.caption(
+        f"Metric coverage ({pd.Timestamp(last.get('trade_date')).date()}): "
+        f"valid={metric_coverage['valid']} / expected={metric_coverage['expected']} / excluded={metric_coverage['excluded']}"
+    )
     rt_prefix = '🟢' if (intraday_row is not None) else ''
     c1.metric("情绪总分（0-100）", f"{safe_to_float(last.get('sentiment_score')):.2f}" if np.isfinite(safe_to_float(last.get("sentiment_score"))) else "—")
     c2.metric("动量(EMA3-EMA10)", f"{safe_to_float(last.get('sentiment_mom')):.2f}" if np.isfinite(safe_to_float(last.get("sentiment_mom"))) else "—")
@@ -4945,6 +5023,11 @@ def main():
 
     # ---- Theme Cycle ----
     st.markdown("---")
+    concept_state = ((panel_optional_readiness or {}).get("domains") or {}).get("concept") or {}
+    if concept_state and not bool(concept_state.get("ready")):
+        reasons = ", ".join(str(value) for value in concept_state.get("reason_codes", [])) or "concept_coverage_incomplete"
+        st.warning(f"Concept domain unavailable: {concept_state.get('status', 'unavailable')} ({reasons})")
+        return
     st.subheader("指标体系B：同花顺概念板块（Theme Cycle）")
     if concept_df.empty:
         st.warning("题材数据缺失：concept_kline_ths 为空或不可用。")

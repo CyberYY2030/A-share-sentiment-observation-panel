@@ -5,6 +5,7 @@ import sqlite3
 import datetime as dt
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 import pandas as pd
@@ -136,5 +137,33 @@ class ScreeningCapabilityRegistryTests(unittest.TestCase):
 
         self.assertEqual(evidence["mode"], MODE_INTRADAY)
         self.assertEqual(set(status["strategy_id"]), set(formal_strategy_ids()))
+        self.assertEqual(before, after)
+        self.assertTrue(rows.empty or set(rows["strategy_id"]).issubset(set(formal_strategy_ids())))
+
+    def test_quarantined_close_uses_read_only_formal_preview_without_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base)
+            try:
+                before = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+                with mock.patch(
+                    "mining.streamlit_tabs.tab_scanner.inspect_stock_session",
+                    return_value={"status": "usable_with_quarantine", "reasons": ["row_quarantine"]},
+                ):
+                    rows, status, evidence = _formal_capability_view(
+                        conn,
+                        dates["target_trade_date"],
+                        selected_trade_date=dates["target_trade_date"],
+                        snapshot_loader=lambda: (_ for _ in ()).throw(AssertionError("snapshot must not be called")),
+                        now=dt.datetime(2026, 4, 20, 18, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    )
+                after = conn.execute("SELECT COUNT(*) FROM candidates").fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertTrue(evidence["prototype_formal_preview"])
+        self.assertEqual(evidence["date_status"], "aligned")
+        self.assertTrue(status.attrs["prototype_formal_preview"])
         self.assertEqual(before, after)
         self.assertTrue(rows.empty or set(rows["strategy_id"]).issubset(set(formal_strategy_ids())))
