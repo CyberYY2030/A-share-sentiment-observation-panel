@@ -29,7 +29,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from backfill_orchestrator import start_background_job
+from backfill_orchestrator import background_job_status, start_background_job
 from offline_daily_update import (
     build_missing_update_plan,
     readiness_for_date,
@@ -932,7 +932,7 @@ def resolve_available_panel_close_date(
     required_index_codes: Iterable[str] = REQUIRED_INDEX_CODES,
     readiness_by_date: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Tuple[Optional[pd.Timestamp], bool, List[pd.Timestamp]]:
-    """Resolve the panel close day from shared stock/index readiness evidence."""
+    """Resolve a persisted close day with stock/index coverage and a formal batch."""
     requested = _day_ts(requested_close_day)
     available = sorted(
         _stock_trade_date_set(stock_df)
@@ -942,7 +942,7 @@ def resolve_available_panel_close_date(
         available = [
             day
             for day in available
-            if bool((readiness_by_date.get(str(day.date())) or {}).get("market_data_ready"))
+            if bool((readiness_by_date.get(str(day.date())) or {}).get("screening_ready"))
         ]
     if not available:
         return None, bool(requested is not None), []
@@ -4217,7 +4217,7 @@ def main():
     force_intraday = False
 
     st.sidebar.caption(
-        f"接口最新收盘：stock={remote_bundle.get('remote_latest_stock_close_day')}｜concept={remote_bundle.get('remote_latest_concept_close_day')}｜"
+        f"目标/应有收盘日：stock={remote_bundle.get('remote_latest_stock_close_day')}｜concept={remote_bundle.get('remote_latest_concept_close_day')}｜"
         f"aligned(T-1)={t1_close}｜T-2={t2_close or 'N/A'}"
     )
 
@@ -4253,30 +4253,13 @@ def main():
                     f"target_close_day={requested_close_day}",
                     "[ISOLATED_SCREENING] close-data repair is disabled during browser acceptance",
                 ]
-            elif can_use_snapshot_for_close_target(requested_close_day):
-                with st.spinner(f"正在用收盘快照补齐 {requested_close_day} 数据..."):
-                    local_after_required, required_logs = maybe_backfill_to_close_day(
-                        stock_db=stock_db,
-                        concept_db=concept_db,
-                        etf_db=etf_db,
-                        target_day=requested_close_day,
-                        local_dates=local_before,
-                        include_concept=False,
-                        include_etf=False,
-                    )
-                mining_sync = sync_mining_history_after_close_update(runtime_paths.base_dir, local_after_required.get("stock"))
-                required_logs = list(required_logs) + [
-                    f"mining history sync target={local_after_required.get('stock')}, processed={mining_sync.get('processed', [])}, "
-                    f"latest_persisted={mining_sync.get('latest_persisted')}"
-                    + (f", error={mining_sync.get('error')}" if mining_sync.get("error") else "")
-                ]
             else:
                 local_after_required = local_before
                 required_logs = [
                     f"target_close_day={requested_close_day}",
                     f"local_before={local_before}",
                     f"missing_domains={required_close_missing}",
-                    "[TARGET_CLOSE_DEFER_OFFLINE] historical stock/index gaps are handled by offline_daily_update background job",
+                    "[TARGET_CLOSE_DEFER_OFFLINE] render never writes or waits; the bounded core job owns stock/index and formal activation",
                 ]
             local_before = local_after_required
             still_missing_required = close_target_missing_domains(
@@ -4302,7 +4285,7 @@ def main():
         offline_expected_dates = resolve_expected_trade_days(
             runtime_paths.stock_db,
             asof=remote_stock_day,
-            days=10,
+            days=1,
         )
         # PROTO-1 treats concept/ETF as optional display domains. The startup
         # worker repairs only the stock/index core after an A.2 refusal.
@@ -4320,7 +4303,7 @@ def main():
         st.sidebar.warning(f"DB date gaps detected: {offline_missing}")
         if isolated_screening:
             st.sidebar.caption("隔离验收模式不启动 offline_daily_update；数据库副本保持冻结。")
-        offline_key = str(offline_plan.get("missing_by_day") or {})
+        offline_key = str(remote_stock_day or "")
         offline_state = st.session_state.get("offline_daily_update_state") or {}
         offline_throttled = bool(
             offline_state.get("target") == offline_key
@@ -4337,21 +4320,37 @@ def main():
                         runtime_paths.base_dir,
                         "--asof",
                         str(remote_stock_day or ""),
-                        "--days",
-                        "10",
-                        "--skip-concept",
+                        "--target-day",
+                        str(remote_stock_day or ""),
+                        "--domains",
+                        "stock",
+                        "index",
                         "--timeout-sec",
-                        "180",
+                        "3600",
                     ],
                     cwd=app_dir(),
                     log_dir=Path(app_dir()) / "output" / "backfill_jobs",
                     name=f"offline_daily_update_{remote_stock_day or 'latest'}",
+                    exclusive_key=f"offline_daily_update_core_{Path(runtime_paths.base_dir).resolve()}",
+                    metadata={
+                        "target_day": remote_stock_day,
+                        "phase": "queued",
+                        "budget_seconds": 3600,
+                        "remaining_budget_seconds": 3600,
+                        "last_structured_result": None,
+                    },
                 )
                 st.session_state["offline_daily_update_state"] = {
                     "target": offline_key,
                     "ts": now_ts,
                     "pid": job.get("pid"),
                     "log_path": job.get("log_path"),
+                    "started_at": job.get("started_at"),
+                    "phase": job.get("phase", "running"),
+                    "budget_seconds": job.get("budget_seconds", 3600),
+                    "remaining_budget_seconds": job.get("remaining_budget_seconds", 3600),
+                    "last_structured_result": job.get("last_structured_result"),
+                    "reused": bool(job.get("reused")),
                 }
                 st.session_state["catchup_log"] = (
                     [
@@ -4363,6 +4362,30 @@ def main():
                 )[-200:]
             else:
                 st.sidebar.warning("offline_daily_update.py not found; DB gaps cannot be auto-filled.")
+
+    offline_state = st.session_state.get("offline_daily_update_state") or {}
+    if offline_state:
+        live_status = background_job_status(
+            Path(app_dir()) / "output" / "backfill_jobs",
+            f"offline_daily_update_{remote_stock_day or 'latest'}",
+            exclusive_key=f"offline_daily_update_core_{Path(runtime_paths.base_dir).resolve()}",
+        )
+        if live_status.get("phase") != "idle":
+            offline_state = {**offline_state, **live_status}
+            st.session_state["offline_daily_update_state"] = offline_state
+    if offline_state.get("pid"):
+        elapsed = "N/A"
+        try:
+            elapsed = f"{int(offline_state.get('elapsed_seconds'))}s"
+        except Exception:
+            pass
+        st.sidebar.caption(
+            "核心补齐任务："
+            f"PID={offline_state.get('pid')}｜target={offline_state.get('target')}｜"
+            f"phase={offline_state.get('phase')}｜elapsed={elapsed}｜"
+            f"remaining={offline_state.get('remaining_budget_seconds')}s｜"
+            f"last={offline_state.get('last_structured_result') or 'pending'}"
+        )
 
     auto_catchup = st.sidebar.checkbox("自动追平（DB落后时自动更新）", value=False)
     force_backfill = st.sidebar.checkbox("强制全量 backfill（60日）", value=False)
@@ -4677,8 +4700,6 @@ def main():
             readiness_by_date[day_key] = screening_readiness_for_date(runtime_paths.base_dir, day_key)
         except Exception as exc:
             readiness_by_date[day_key] = {"screening_ready": False, "error": type(exc).__name__}
-        if readiness_by_date[day_key].get("market_data_ready"):
-            break
     panel_close_dt, missing_requested_close, available_panel_close_dates = resolve_available_panel_close_date(
         requested_close_dt0,
         stock_df,
@@ -4686,8 +4707,8 @@ def main():
         REQUIRED_INDEX_CODES,
         readiness_by_date,
     )
-    if panel_close_dt is None:
-        panel_close_dt = panel_close_dt_by_latest
+    # A close dashboard is only allowed to render a persisted formal batch.
+    # Do not silently mix a market-ready newer day with an older A-E result.
     panel_readiness = readiness_by_date.get(str(panel_close_dt.date())) if panel_close_dt is not None else None
     panel_optional_readiness: Dict[str, Any] = {}
     if panel_close_dt is not None:
@@ -4697,9 +4718,16 @@ def main():
             panel_optional_readiness = {"error": type(exc).__name__}
     if missing_requested_close and requested_close_dt0 is not None:
         st.sidebar.warning(
-            f"本地 stock/index 未覆盖所选日期 {pd.Timestamp(requested_close_dt0).date()}，"
-            f"本次先显示最近可用日 {panel_close_dt.date() if panel_close_dt is not None else 'N/A'}。"
+            f"所选日期 {pd.Timestamp(requested_close_dt0).date()} 尚无 persisted close_final/complete batch，"
+            f"本次显示最近正式日 {panel_close_dt.date() if panel_close_dt is not None else 'N/A'}。"
         )
+    if requested_readiness_day is not None:
+        requested_readiness = readiness_by_date.get(str(requested_readiness_day.date())) or {}
+        if requested_readiness.get("market_data_ready") and not requested_readiness.get("screening_ready"):
+            st.sidebar.info(
+                f"目标日 {requested_readiness_day.date()} 市场收盘数据已就绪，等待正式批次；"
+                f"当前保持读取 {panel_close_dt.date() if panel_close_dt is not None else 'N/A'} 的 persisted batch。"
+            )
 
     # 盘中快照的目标交易日：仅在交易日使用“今天”，否则回退到 panel_close_dt
     snapshot_trade_dt = today_ts if _today_trade_date_cn(now_cn2, int(tz_offset)) is not None else None

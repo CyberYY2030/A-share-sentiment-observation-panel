@@ -28,6 +28,10 @@ from runtime_paths import build_runtime_paths
 
 REQUIRED_INDEX_CODES = ("000001", "399001", "000300", "000852")
 MAX_INTERFACE_ATTEMPTS = 3
+CORE_UPDATE_DOMAINS = ("stock", "index")
+DEFAULT_CORE_TIMEOUT_SECONDS = 3600
+DEFAULT_FORMAL_RESERVE_SECONDS = 240
+MIN_CHILD_TIMEOUT_SECONDS = 30
 KLINE_COLS = (
     "sec_type",
     "sec_code",
@@ -475,6 +479,7 @@ def screening_readiness_for_date(base_dir: str | Path, day: str) -> dict[str, An
     return {
         "trade_date": normalized,
         "market_data_ready": market_data_ready,
+        "market_close_ready": market_data_ready,
         "selection_ready": selection_ready,
         "screening_ready": selection_ready,
         "domains": {
@@ -823,7 +828,7 @@ def _mark_unrecoverable_bad_stock_sessions(
     attempted = {
         str(arg)
         for command in commands
-        if command.get("domain") == "stock_index"
+        if command.get("domain") == "stock_index" and bool(command.get("child_started"))
         for arg in (command.get("cmd") or [])
     }
     marked: list[str] = []
@@ -841,7 +846,9 @@ def _mark_unrecoverable_bad_stock_sessions(
             errors = [
                 str(command.get("output") or "")[-1000:]
                 for command in commands
-                if command.get("domain") == "stock_index" and day in [str(arg) for arg in (command.get("cmd") or [])]
+                if command.get("domain") == "stock_index"
+                and bool(command.get("child_started"))
+                and day in [str(arg) for arg in (command.get("cmd") or [])]
             ]
             source_errors = "\n".join(errors)
             existing = con.execute(
@@ -1580,6 +1587,333 @@ def akshare_stock_index_backfill(
         con.close()
 
 
+def _core_scheduler_result(
+    *,
+    paths: Any,
+    target_day: str,
+    plan: dict[str, Any],
+    logs: list[str],
+    commands: list[dict[str, Any]],
+    phase: str,
+    reason: str,
+    timeout_sec: int,
+    formal_reserve_seconds: int,
+    revalidations: list[dict[str, Any]] | None = None,
+    quality_mismatches: list[dict[str, Any]] | None = None,
+    publish_health: bool,
+) -> dict[str, Any]:
+    """Return a structured no-launch/fail-closed core scheduler outcome."""
+    readiness = readiness_for_date(
+        paths.base_dir,
+        target_day,
+        skip_concept=False,
+        include_health_evidence=True,
+    )
+    result = {
+        "ok": False,
+        "plan": plan,
+        "initial_plan": plan,
+        "logs": logs,
+        "commands": commands,
+        "target_close_date": target_day,
+        "target_day": target_day,
+        "domains": list(CORE_UPDATE_DOMAINS),
+        "readiness": readiness,
+        "scheduler_status": {
+            "phase": phase,
+            "reason": reason,
+            "target_day": target_day,
+            "budget_seconds": int(timeout_sec),
+            "formal_reserve_seconds": int(formal_reserve_seconds),
+            "remaining_budget_seconds": max(0, int(timeout_sec) - int(formal_reserve_seconds)),
+        },
+        "revalidations": list(revalidations or []),
+        "quality_mismatches": list(quality_mismatches or []),
+        "quality_failures": [],
+        "mining_deferred": False,
+        "concept_deferred": True,
+    }
+    if publish_health:
+        result["health"] = write_health_summary(paths.base_dir, result)
+        result["push"] = _send_daily_push(paths.base_dir, result["health"])
+    else:
+        result["health"] = {"status": "not_published"}
+        result["push"] = {"status": "disabled"}
+    return result
+
+
+def _run_core_offline_update(
+    base_dir: str | Path,
+    *,
+    asof: str | None,
+    target_days: Iterable[str] | None,
+    publish_health: bool,
+    dry_run: bool,
+    timeout_sec: int,
+    market_workers: int,
+    market_min_request_interval_sec: float,
+    use_remote_calendar: bool,
+    formal_reserve_seconds: int,
+) -> dict[str, Any]:
+    """Run the only startup writer flow: one stock/index close, then formal A-E."""
+    paths = build_runtime_paths(str(base_dir))
+    now_cn = dt.datetime.now(CN_TZ)
+    close_cap = resolve_target_close_date(asof, now_cn=now_cn)
+    explicit_targets = sorted({day for value in (target_days or []) if (day := normalize_day(value))})
+    if explicit_targets:
+        invalid_targets = [day for day in explicit_targets if day > close_cap]
+        if invalid_targets:
+            raise ValueError(f"target days are not close-ready: {invalid_targets}")
+        target_day = explicit_targets[-1]
+    else:
+        resolved = resolve_expected_trade_days(
+            paths.stock_db,
+            asof=close_cap,
+            days=1,
+            use_baostock=bool(use_remote_calendar),
+        )
+        target_day = resolved[-1] if resolved else close_cap
+
+    plan = build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS)
+    logs = [
+        f"core_domains={list(CORE_UPDATE_DOMAINS)}",
+        f"target_day={target_day}",
+        f"close_cap={close_cap}",
+        f"missing_by_domain={plan.get('missing_by_domain')}",
+    ]
+    commands: list[dict[str, Any]] = []
+    reserve = int(formal_reserve_seconds)
+    total = int(timeout_sec)
+    if total <= 0 or reserve < 0 or reserve >= total:
+        logs.append(
+            "configuration_error: formal reserve must leave a positive core-child allowance "
+            f"(total={total}, formal_reserve={reserve})"
+        )
+        return _core_scheduler_result(
+            paths=paths,
+            target_day=target_day,
+            plan=plan,
+            logs=logs,
+            commands=commands,
+            phase="configuration_error",
+            reason="budget_reserve_exhausts_core_child",
+            timeout_sec=total,
+            formal_reserve_seconds=reserve,
+            publish_health=publish_health,
+        )
+
+    if dry_run:
+        readiness = readiness_for_date(paths.base_dir, target_day, skip_concept=False, include_health_evidence=True)
+        return {
+            "ok": bool(readiness["screening_ready"]),
+            "plan": plan,
+            "initial_plan": plan,
+            "logs": logs + ["dry_run=true; no child or database write started"],
+            "commands": [],
+            "target_close_date": target_day,
+            "target_day": target_day,
+            "domains": list(CORE_UPDATE_DOMAINS),
+            "readiness": readiness,
+            "scheduler_status": {"phase": "dry_run", "target_day": target_day},
+            "revalidations": [],
+            "quality_mismatches": [],
+            "quality_failures": [],
+            "health": {"status": "not_published"},
+            "push": {"status": "disabled"},
+            "mining_deferred": False,
+            "concept_deferred": True,
+        }
+
+    deadline = time.monotonic() + total
+    revalidations: list[dict[str, Any]] = []
+    quality_mismatches: list[dict[str, Any]] = []
+    raw_before = raw_stock_coverage_for_repair(paths.stock_db, target_day)
+    raw_ready = bool(raw_before.get("stock")) and bool(raw_before.get("index"))
+    market_ready = False
+
+    if raw_ready:
+        audited = _revalidate_attempted_stock_sessions(paths.stock_db, [target_day])
+        revalidations.extend(audited)
+        market = stock_coverage_for_date(paths.stock_db, target_day)
+        market_ready = bool(market.get("stock")) and bool(market.get("index"))
+        logs.append(f"core_market_revalidate target_day={target_day} ready={market_ready}")
+    else:
+        repair_script = _find_script(paths.base_dir, SCRIPT_REPAIR_MARKET_DAY_CANDIDATES)
+        if repair_script is None:
+            return _core_scheduler_result(
+                paths=paths,
+                target_day=target_day,
+                plan=plan,
+                logs=logs + ["acquisition_blocked: repair_market_day_akshare.py not found"],
+                commands=commands,
+                phase="acquisition_blocked",
+                reason="repair_script_missing",
+                timeout_sec=total,
+                formal_reserve_seconds=reserve,
+                publish_health=publish_health,
+            )
+        for attempt in range(1, MAX_INTERFACE_ATTEMPTS + 1):
+            cmd = [
+                sys.executable,
+                str(repair_script),
+                "--db",
+                paths.stock_db,
+                "--date",
+                target_day,
+                "--workers",
+                str(max(1, int(market_workers))),
+                "--attempts-per-source",
+                "1",
+                "--min-request-interval-sec",
+                format(max(0.0, float(market_min_request_interval_sec)), "g"),
+            ]
+            rc, output, allowance = _run_with_remaining_budget(
+                cmd,
+                cwd=paths.base_dir,
+                deadline=deadline,
+                reserve_seconds=reserve,
+            )
+            child_started = rc != 998
+            raw_after = raw_stock_coverage_for_repair(paths.stock_db, target_day)
+            parent_ready = bool(raw_after.get("stock")) and bool(raw_after.get("index"))
+            mismatch = None
+            if child_started and (rc == 0) != parent_ready:
+                mismatch = {
+                    "code": "child_parent_quality_mismatch",
+                    "child_ok": rc == 0,
+                    "parent_ok": parent_ready,
+                    "returncode": rc,
+                    "raw_status": (raw_after.get("session_quality") or {}).get("status"),
+                }
+                quality_mismatches.append(mismatch)
+            commands.append(
+                {
+                    "domain": "stock_index",
+                    "interface": "repair_market_day_akshare",
+                    "cmd": cmd,
+                    "returncode": rc,
+                    "attempts": attempt,
+                    "timeout_sec": allowance,
+                    "child_started": child_started,
+                    "raw_before_quality": raw_before,
+                    "raw_after_quality": raw_after,
+                    "quality_mismatch": mismatch,
+                    "output": output[-4000:],
+                }
+            )
+            if not child_started:
+                logs.append(f"not_attempted_budget target_day={target_day} allowance={allowance}")
+                return _core_scheduler_result(
+                    paths=paths,
+                    target_day=target_day,
+                    plan=plan,
+                    logs=logs,
+                    commands=commands,
+                    phase="not_attempted_budget",
+                    reason="core_child_deadline_exhausted",
+                    timeout_sec=total,
+                    formal_reserve_seconds=reserve,
+                    publish_health=publish_health,
+                )
+            if mismatch is not None:
+                logs.append(f"child_parent_quality_mismatch target_day={target_day}")
+                break
+            if parent_ready:
+                audited = _revalidate_attempted_stock_sessions(paths.stock_db, [target_day])
+                revalidations.extend(audited)
+                market = stock_coverage_for_date(paths.stock_db, target_day)
+                market_ready = bool(market.get("stock")) and bool(market.get("index"))
+                break
+            raw_before = raw_after
+
+        if not market_ready and not quality_mismatches:
+            # This is the only path that may write an observed-bad latch: a
+            # repair child actually started and the raw postcondition remained bad.
+            marked = _mark_unrecoverable_bad_stock_sessions(paths.stock_db, [target_day], commands)
+            if marked:
+                logs.append(f"known_bad_sessions={marked}")
+
+    readiness = readiness_for_date(paths.base_dir, target_day, skip_concept=False, include_health_evidence=True)
+    market_ready = bool(readiness["market_data_ready"]) and not quality_mismatches
+    if not market_ready:
+        return _core_scheduler_result(
+            paths=paths,
+            target_day=target_day,
+            plan=build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
+            logs=logs + ["acquisition_blocked: stock/index raw postcondition remains unavailable"],
+            commands=commands,
+            phase="acquisition_blocked",
+            reason="market_close_not_ready",
+            timeout_sec=total,
+            formal_reserve_seconds=reserve,
+            revalidations=revalidations,
+            quality_mismatches=quality_mismatches,
+            publish_health=publish_health,
+        )
+
+    if not bool(readiness["selection_ready"]):
+        formal_script = _find_script(paths.base_dir, ("run_daily.py",))
+        if formal_script is None:
+            return _core_scheduler_result(
+                paths=paths,
+                target_day=target_day,
+                plan=build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
+                logs=logs + ["acquisition_blocked: run_daily.py not found"],
+                commands=commands,
+                phase="acquisition_blocked",
+                reason="formal_script_missing",
+                timeout_sec=total,
+                formal_reserve_seconds=reserve,
+                revalidations=revalidations,
+                publish_health=publish_health,
+            )
+        cmd = [sys.executable, str(formal_script), "--base-dir", paths.base_dir, "--date", target_day, "--formal-only"]
+        rc, output, allowance = _run_with_remaining_budget(cmd, cwd=paths.base_dir, deadline=deadline)
+        commands.append(
+            {
+                "domain": "formal_batch",
+                "cmd": cmd,
+                "returncode": rc,
+                "timeout_sec": allowance,
+                "child_started": rc != 998,
+                "output": output[-4000:],
+            }
+        )
+        logs.append(f"formal_batch target_day={target_day} rc={rc} allowance={allowance}")
+        readiness = readiness_for_date(paths.base_dir, target_day, skip_concept=False, include_health_evidence=True)
+
+    result = {
+        "ok": bool(readiness["screening_ready"]),
+        "plan": build_missing_update_plan(paths.base_dir, [target_day], domains=CORE_UPDATE_DOMAINS),
+        "initial_plan": plan,
+        "logs": logs,
+        "commands": commands,
+        "target_close_date": target_day,
+        "target_day": target_day,
+        "domains": list(CORE_UPDATE_DOMAINS),
+        "readiness": readiness,
+        "scheduler_status": {
+            "phase": "complete" if readiness["screening_ready"] else "waiting_for_formal_batch",
+            "target_day": target_day,
+            "budget_seconds": total,
+            "formal_reserve_seconds": reserve,
+            "remaining_budget_seconds": _remaining_budget_seconds(deadline),
+        },
+        "revalidations": revalidations,
+        "quality_mismatches": quality_mismatches,
+        "quality_failures": [],
+        "mining_deferred": False,
+        "concept_deferred": True,
+    }
+    if publish_health:
+        result["health"] = write_health_summary(paths.base_dir, result)
+        result["push"] = _send_daily_push(paths.base_dir, result["health"])
+    else:
+        result["health"] = {"status": "not_published"}
+        result["push"] = {"status": "disabled"}
+    return result
+
+
 def run_offline_update(
     base_dir: str | Path,
     *,
@@ -1594,7 +1928,25 @@ def run_offline_update(
     market_workers: int = 12,
     market_min_request_interval_sec: float = 0.0,
     use_remote_calendar: bool = False,
+    domains: Iterable[str] | None = None,
+    formal_reserve_seconds: int = DEFAULT_FORMAL_RESERVE_SECONDS,
 ) -> dict[str, Any]:
+    selected_domains = tuple(str(domain).strip().lower() for domain in (domains or ()))
+    if selected_domains:
+        if tuple(selected_domains) != CORE_UPDATE_DOMAINS:
+            raise ValueError(f"OPS-HARDEN-1A only permits domains {CORE_UPDATE_DOMAINS}; got {selected_domains}")
+        return _run_core_offline_update(
+            base_dir,
+            asof=asof,
+            target_days=target_days,
+            publish_health=publish_health,
+            dry_run=dry_run,
+            timeout_sec=timeout_sec,
+            market_workers=market_workers,
+            market_min_request_interval_sec=market_min_request_interval_sec,
+            use_remote_calendar=use_remote_calendar,
+            formal_reserve_seconds=formal_reserve_seconds,
+        )
     paths = build_runtime_paths(str(base_dir))
     managed_domains = _existing_domains(paths.base_dir)
     if not include_mining:
@@ -1960,14 +2312,16 @@ def run_offline_update(
         if script is None:
             _emit(logs, "run_daily.py not found")
         else:
+            # Legacy callers are still routed through a bounded one-day formal
+            # activation rather than a historical batch expansion.
             cmd = [
                 sys.executable,
                 str(script),
                 "--base-dir",
                 paths.base_dir,
-                "--range",
-                mining_days[0],
+                "--date",
                 mining_days[-1],
+                "--formal-only",
             ]
             rc, out, attempts = _run_with_retries(
                 cmd,
@@ -1976,7 +2330,7 @@ def run_offline_update(
                 runner=run_with_remaining_budget,
             )
             commands.append({"domain": "mining", "cmd": cmd, "returncode": rc, "attempts": attempts, "output": out[-4000:]})
-            _emit(logs, f"mining rc={rc} attempts={attempts} range={mining_days[0]}..{mining_days[-1]}")
+            _emit(logs, f"mining rc={rc} attempts={attempts} formal_day={mining_days[-1]}")
 
     final_plan = build_plan()
     unresolved_bad_days = [
@@ -2023,13 +2377,15 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Check missing local daily data and run daily update scripts.")
     parser.add_argument("--base-dir", default=str(Path.cwd()))
     parser.add_argument("--asof", default=None)
-    parser.add_argument("--days", type=int, default=10)
+    parser.add_argument("--days", type=int, default=1)
     parser.add_argument("--target-day", action="append", default=[])
+    parser.add_argument("--domains", nargs="+", choices=CORE_UPDATE_DOMAINS, default=list(CORE_UPDATE_DOMAINS))
     parser.add_argument("--skip-mining", action="store_true")
     parser.add_argument("--skip-concept", action="store_true")
     parser.add_argument("--no-health", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--timeout-sec", type=int, default=600)
+    parser.add_argument("--timeout-sec", type=int, default=DEFAULT_CORE_TIMEOUT_SECONDS)
+    parser.add_argument("--formal-reserve-sec", type=int, default=DEFAULT_FORMAL_RESERVE_SECONDS)
     parser.add_argument("--use-remote-calendar", action="store_true")
     parser.add_argument("--market-workers", type=int, default=12)
     parser.add_argument("--market-min-request-interval-sec", type=float, default=0.0)
@@ -2044,10 +2400,12 @@ def main() -> int:
         include_concept=not bool(args.skip_concept),
         publish_health=not bool(args.no_health),
         dry_run=bool(args.dry_run),
-        timeout_sec=max(30, int(args.timeout_sec)),
+        timeout_sec=int(args.timeout_sec),
         use_remote_calendar=bool(args.use_remote_calendar),
         market_workers=max(1, int(args.market_workers)),
         market_min_request_interval_sec=max(0.0, float(args.market_min_request_interval_sec)),
+        domains=args.domains,
+        formal_reserve_seconds=int(args.formal_reserve_sec),
     )
     for line in result.get("logs", []):
         print(line)
@@ -2059,6 +2417,7 @@ def main() -> int:
     health = result.get("health") or {}
     if health.get("path"):
         print(f"health={health.get('path')}")
+    print("scheduler_status=" + json.dumps(result.get("scheduler_status") or {}, ensure_ascii=False, sort_keys=True))
     print(f"ok={bool(result.get('ok'))}")
     return 0 if result.get("ok") or args.dry_run else 1
 

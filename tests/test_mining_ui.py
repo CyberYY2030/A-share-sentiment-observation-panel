@@ -1182,13 +1182,39 @@ class MiningUiSmokeTests(unittest.TestCase):
             "2026-04-21", stock_df, index_df, readiness_by_date=readiness
         )
 
-        self.assertEqual(resolved, pd.Timestamp("2026-04-21"))
-        self.assertFalse(missing)
-        self.assertEqual(available, [pd.Timestamp("2026-04-21")])
+        self.assertIsNone(resolved)
+        self.assertTrue(missing)
+        self.assertEqual(available, [])
         self.assertEqual(
             sentiment_metric_coverage(stock_df, "2026-04-21"),
             {"return_valid": 1, "amount_valid": 1, "hot_valid": 1, "expected": 2, "excluded": 1},
         )
+
+    def test_panel_keeps_latest_persisted_batch_when_newer_market_day_waits_for_formal_batch(self) -> None:
+        from app_panel import resolve_available_panel_close_date
+
+        stock_df = pd.DataFrame(
+            {"trade_date": ["2026-08-10", "2026-08-11"], "sec_code": ["600001", "600001"]}
+        )
+        index_df = pd.DataFrame(
+            [
+                {"trade_date": day, "sec_code": code}
+                for day in ("2026-08-10", "2026-08-11")
+                for code in ("000001", "399001", "000300", "000852")
+            ]
+        )
+        readiness = {
+            "2026-08-10": {"market_data_ready": True, "screening_ready": True},
+            "2026-08-11": {"market_data_ready": True, "screening_ready": False},
+        }
+
+        resolved, missing, available = resolve_available_panel_close_date(
+            "2026-08-11", stock_df, index_df, readiness_by_date=readiness
+        )
+
+        self.assertEqual(resolved, pd.Timestamp("2026-08-10"))
+        self.assertTrue(missing)
+        self.assertEqual(available, [pd.Timestamp("2026-08-10")])
 
     def test_metric_denominators_keep_return_amount_and_hot_inputs_separate(self) -> None:
         from app_panel import compute_daily_sentiment, sentiment_metric_coverage

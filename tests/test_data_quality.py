@@ -485,12 +485,12 @@ class DataQualityTests(unittest.TestCase):
             marked = _mark_unrecoverable_bad_stock_sessions(
                 stock_path,
                 ["2026-07-13"],
-                [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "output": "AkShare timeout"}],
+                [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "child_started": True, "output": "AkShare timeout"}],
             )
             repeated = _mark_unrecoverable_bad_stock_sessions(
                 stock_path,
                 ["2026-07-13"],
-                [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "output": "AkShare timeout"}],
+                [{"domain": "stock_index", "cmd": ["repair", "--date", "2026-07-13"], "child_started": True, "output": "AkShare timeout"}],
             )
             conn = sqlite3.connect(stock_path)
             conn.row_factory = sqlite3.Row
