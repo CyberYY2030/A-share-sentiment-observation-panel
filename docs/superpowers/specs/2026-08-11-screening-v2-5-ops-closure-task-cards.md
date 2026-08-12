@@ -131,7 +131,7 @@
 |---|---|---:|---|
 | `PROTO-1` | 统一原型门禁、可选域降级、health/UI/日期合同；测试和生产副本验收 | 禁止 | **已完成**，最终 commit `7fd57fc` |
 | `PROTO-2` | 用冻结 commit 做 08-10 原子 revalidation、正式 v2.5 batch、只读浏览器验收 | 仅 a_share/mining | **08-10 canary 已完成**；历史报告状态保留，不能外推为最新日闭环 |
-| `OPS-HARDEN-1A` | 修复核心域选择、180/240 预算死锁、no-launch 误诊、旧 `--range`、日期交集与全局互斥 | 禁止，先副本 | **OPS-HARDEN-1A.1 已完成：`ready_for_ops_harden_1b_review`，独立 commit 后停止；OPS-HARDEN-1B 仍须另行授权** |
+| `OPS-HARDEN-1A` | 修复核心域选择、180/240 预算死锁、no-launch 误诊、旧 `--range`、日期交集与全局互斥 | 禁止，先副本 | **历史：OPS-HARDEN-1A.1 已完成并停在 `ready_for_ops_harden_1b_review`；2026-08-12 更正：OPS-HARDEN-1A.2 补齐 worker 生命周期和 08-11 副本闭环后同样为 `ready_for_ops_harden_1b_review`。OPS-HARDEN-1B 仍须另行授权。** |
 | `OPS-HARDEN-1B` | 用冻结 1A commit 受控补齐 08-11，并生成/复验单日 formal batch | 另行授权，仅 a_share/mining | 08-11 指标与选股同日后，最新日闭环才可收口 |
 | `OPS-HARDEN` | 历史缺口、可选域恢复、batch id=3 清理评估与长期完整性 | 另行规划 | 不阻断核心原型；不得混入 1A/1B |
 

@@ -10,6 +10,17 @@ from typing import Any
 
 
 LAUNCH_LEASE_SECONDS = 120
+ORPHAN_GRACE_SECONDS = 120
+TERMINAL_PHASES = frozenset(
+    {
+        "complete",
+        "configuration_error",
+        "no_launch",
+        "market_failed",
+        "formal_failed",
+        "orphaned_manual_intervention",
+    }
+)
 
 
 def _safe_job_name(name: str) -> str:
@@ -86,7 +97,60 @@ def _launch_lease_is_live(active: dict[str, Any], *, now: dt.datetime | None = N
     return expires_at > (now or _utcnow())
 
 
+def _scheduler_status_from_log(active: dict[str, Any]) -> tuple[dict[str, Any] | None, float | None]:
+    """Return the final child status when the worker has published one."""
+    log_path = active.get("log_path")
+    if not log_path:
+        return None, None
+    try:
+        path = Path(str(log_path))
+        tail = path.read_bytes()[-16_384:].decode("utf-8", errors="replace")
+        for line in reversed(tail.splitlines()):
+            if line.startswith("scheduler_status="):
+                parsed = json.loads(line.split("=", 1)[1])
+                return (parsed if isinstance(parsed, dict) else None), path.stat().st_mtime
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    return None, None
+
+
+def _is_terminal_phase(phase: Any) -> bool:
+    return str(phase or "") in TERMINAL_PHASES
+
+
+def _nonnegative_int(value: Any, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _elapsed_seconds(active: dict[str, Any], *, now: dt.datetime | None = None) -> int | None:
+    started = _parse_utc(active.get("started_at"))
+    if started is None:
+        return None
+    return max(0, int(((now or _utcnow()) - started).total_seconds()))
+
+
+def _is_orphaned(active: dict[str, Any], *, now: dt.datetime | None = None) -> bool:
+    """A timed-out writer without a terminal log must be manually resolved."""
+    scheduler_status, _ = _scheduler_status_from_log(active)
+    if scheduler_status and _is_terminal_phase(scheduler_status.get("phase")):
+        return False
+    try:
+        budget = int(active.get("budget_seconds"))
+    except (TypeError, ValueError):
+        return False
+    elapsed = _elapsed_seconds(active, now=now)
+    return budget > 0 and elapsed is not None and elapsed > budget + ORPHAN_GRACE_SECONDS
+
+
 def _active_blocks_new_start(active: dict[str, Any], *, now: dt.datetime | None = None) -> bool:
+    scheduler_status, _ = _scheduler_status_from_log(active)
+    if scheduler_status and _is_terminal_phase(scheduler_status.get("phase")):
+        return False
+    if _is_orphaned(active, now=now):
+        return True
     if _launch_lease_is_live(active, now=now):
         return True
     return _pid_is_running(active.get("pid"))
@@ -113,13 +177,17 @@ def _remove_claim_if_owned(active_path: Path, claim_id: str) -> None:
 
 
 def _reused_active_result(active: dict[str, Any], cmd: list[str], active_path: Path) -> dict[str, Any]:
+    scheduler_status, _ = _scheduler_status_from_log(active)
+    phase = str((scheduler_status or {}).get("phase") or active.get("phase") or "running")
+    if _is_orphaned(active):
+        phase = "orphaned_manual_intervention"
     return {
         "pid": active.get("pid"),
         "log_path": active.get("log_path"),
         "cmd": active.get("cmd") or list(cmd),
         "started_at": active.get("started_at"),
         "target_day": active.get("target_day"),
-        "phase": active.get("phase", "running"),
+        "phase": phase,
         "budget_seconds": active.get("budget_seconds"),
         "status_path": active.get("status_path"),
         "active_path": str(active_path),
@@ -130,6 +198,7 @@ def _reused_active_result(active: dict[str, Any], cmd: list[str], active_path: P
         "output": "",
         "allowance": None,
         "reused": True,
+        "terminal": _is_terminal_phase(phase),
     }
 
 
@@ -165,42 +234,47 @@ def background_job_status(
     active = _load_active_job(active_path)
     if not active:
         return {"phase": "idle", "active_path": str(active_path)}
-    running = _active_blocks_new_start(active)
+    scheduler_status, completed_at = _scheduler_status_from_log(active)
+    terminal_phase = str((scheduler_status or {}).get("phase") or "")
+    terminal = bool(scheduler_status and _is_terminal_phase(terminal_phase))
+    orphaned = not terminal and _is_orphaned(active)
+    running = not terminal and not orphaned and _active_blocks_new_start(active)
     status: dict[str, Any] = {
         **active,
         "active_path": str(active_path),
-        "phase": active.get("phase", "running") if running else "finished",
+        "phase": terminal_phase if terminal else ("orphaned_manual_intervention" if orphaned else (active.get("phase", "running") if running else "finished")),
         "running": running,
+        "terminal": terminal or orphaned,
     }
-    log_path = active.get("log_path")
-    if log_path:
-        try:
-            tail = Path(str(log_path)).read_bytes()[-16_384:].decode("utf-8", errors="replace")
-            for line in reversed(tail.splitlines()):
-                if line.startswith("scheduler_status="):
-                    status["last_structured_result"] = json.loads(line.split("=", 1)[1])
-                    status["phase"] = str(status["last_structured_result"].get("phase") or status["phase"])
-                    if status["phase"] == "formal_failed":
-                        retry_after = status["last_structured_result"].get("retry_after_seconds")
-                        try:
-                            completed_at = Path(str(log_path)).stat().st_mtime
-                            status["completed_at"] = completed_at
-                            status["next_retry_at"] = completed_at + max(0, int(retry_after or 0))
-                        except (OSError, TypeError, ValueError):
-                            pass
-                    break
-        except (OSError, ValueError, json.JSONDecodeError):
-            pass
-    try:
-        started = _parse_utc(status.get("started_at"))
-        if started is None:
-            raise ValueError("invalid started_at")
-        elapsed = max(0, int((_utcnow() - started).total_seconds()))
+    if scheduler_status:
+        status["last_structured_result"] = scheduler_status
+        if completed_at is not None:
+            status["completed_at"] = completed_at
+        for key in ("target_day", "market_status", "formal_status"):
+            if scheduler_status.get(key) is not None:
+                status[key] = scheduler_status[key]
+        for key in ("market_attempts", "formal_attempt"):
+            parent = _nonnegative_int(active.get(key))
+            base = _nonnegative_int(active.get(f"{key}_base"))
+            child = _nonnegative_int(scheduler_status.get(key))
+            status[key] = max(parent, base + child)
+        status["last_error"] = scheduler_status.get("reason") or active.get("last_error")
+        status["next_retry_at"] = scheduler_status.get("next_retry_at") or active.get("next_retry_at")
+    if orphaned:
+        status["last_error"] = "worker_exceeded_budget_without_terminal_status"
+    elapsed = _elapsed_seconds(status)
+    if elapsed is not None:
         status["elapsed_seconds"] = elapsed
-        if running and status.get("budget_seconds") is not None:
-            status["remaining_budget_seconds"] = max(0, int(status["budget_seconds"]) - elapsed)
-    except (TypeError, ValueError):
-        pass
+        try:
+            status["remaining_budget_seconds"] = max(0, int(status.get("budget_seconds")) - elapsed)
+        except (TypeError, ValueError):
+            pass
+    status.setdefault("target_day", active.get("target_day"))
+    status.setdefault("generation", max(1, _nonnegative_int(active.get("generation"), 1)))
+    status.setdefault("market_attempts", _nonnegative_int(active.get("market_attempts")))
+    status.setdefault("formal_attempt", _nonnegative_int(active.get("formal_attempt")))
+    status.setdefault("next_retry_at", active.get("next_retry_at"))
+    status.setdefault("last_error", active.get("last_error"))
     return status
 
 
@@ -309,6 +383,27 @@ def start_background_job(
     result.update(dict(metadata or {}))
     try:
         _atomic_write_json(active_path, result)
-    except Exception:
-        pass
+    except Exception as exc:
+        # A writer without a published ownership record can neither be safely
+        # reused nor recovered. Stop it before releasing the launch claim.
+        try:
+            proc.terminate()
+        finally:
+            try:
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+        _remove_claim_if_owned(active_path, str(active["claim_id"]))
+        return {
+            "started": False,
+            "pid": None,
+            "returncode": getattr(proc, "returncode", None),
+            "timed_out": False,
+            "error_kind": "state_publish_failed",
+            "output": str(exc),
+            "allowance": None,
+            "active_path": str(active_path),
+            "claim_id": active["claim_id"],
+            "reused": False,
+        }
     return result

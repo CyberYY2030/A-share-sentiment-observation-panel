@@ -415,3 +415,11 @@
 - The worker reports structured launch facts; background state uses a reclaimable claim/lease and atomic post-Popen replacement. Formal failure is visible and capped rather than re-labeled as waiting.
 - Evidence: focused 154 tests OK; full 341 tests OK (2 skipped); py_compile and diff check passed; SQLite online-backup sandbox formal batch reused with zero growth; isolated browser showed metric coverage, persisted same-day A-E data, optional concept unavailable state, and zero console errors.
 - All four production SHA-256 values remained unchanged. Report: `ops-harden-1a1-report.md` and `.json`.
+
+## 2026-08-12 OPS-HARDEN-1A.2 core worker lifecycle and 08-11 sandbox closure
+
+- Status: `ready_for_ops_harden_1b_review`; stopped before OPS-HARDEN-1B. This appends a correction to the 1A.1 conclusion rather than replacing it: 1A.1 closed the single-entry control plane, while 1A.2 closes the remaining cross-process lifecycle evidence.
+- The target-day decision now preserves the larger parent/child attempt totals, requires explicit manual retry after terminal `market_failed` or `formal_failed`, observes `next_retry_at`, and creates one new generation only for that explicit retry. A page rerun neither bypasses backoff nor waits for a worker.
+- Scheduler terminal evidence in the log wins over a subsequently reused live PID. An over-budget worker without terminal evidence is `orphaned_manual_intervention` and keeps the exclusive key closed. A post-Popen state-publish failure terminates and waits for the child before returning `state_publish_failed`.
+- SQLite online-backup sandboxes proved the three UI states and a controlled-flow-only 08-11 fixture. The fixture copied the 08-10 stock/four-index shape into the sandbox, was explicitly marked non-real market data, made zero provider calls, and produced a `v2.5/close_final/complete` 08-11 batch with six formal runs. Its identical core-worker rerun grew no batch/run/candidate/pullback rows.
+- Evidence: focused 161 tests OK; full 348 tests OK (2 skipped); py_compile and diff check passed; browser console errors 0. Four production SHA-256 values equal their pre-task values. Report: `ops-harden-1a2-report.md` and `.json`.

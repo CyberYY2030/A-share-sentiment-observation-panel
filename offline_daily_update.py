@@ -1689,6 +1689,7 @@ def _core_scheduler_result(
         "complete": ("market_ready", "complete"),
     }
     market_status, formal_status = status_by_phase.get(phase, (phase, "not_run"))
+    market_attempts = sum(1 for command in commands if command.get("domain") == "stock_index")
     formal_attempt = sum(1 for command in commands if command.get("domain") == "formal_batch")
     result = {
         "ok": False,
@@ -1706,8 +1707,11 @@ def _core_scheduler_result(
             "target_day": target_day,
             "market_status": market_status,
             "formal_status": formal_status,
+            "market_attempts": market_attempts,
             "formal_attempt": formal_attempt,
-            "retry_after_seconds": 300 if phase == "formal_failed" else None,
+            "terminal": phase in {"configuration_error", "no_launch", "market_failed", "formal_failed", "complete"},
+            "manual_retry_required": phase in {"market_failed", "formal_failed"},
+            "next_retry_at": None,
             "budget_seconds": int(timeout_sec),
             "formal_reserve_seconds": int(formal_reserve_seconds),
             "remaining_budget_seconds": max(0, int(timeout_sec) - int(formal_reserve_seconds)),
@@ -2017,7 +2021,11 @@ def _run_core_offline_update(
             "target_day": target_day,
             "market_status": "market_ready" if readiness["market_data_ready"] else "market_failed",
             "formal_status": "complete" if readiness["selection_ready"] else "formal_failed",
+            "market_attempts": sum(1 for command in commands if command.get("domain") == "stock_index"),
             "formal_attempt": sum(1 for command in commands if command.get("domain") == "formal_batch"),
+            "terminal": True,
+            "manual_retry_required": not bool(readiness["screening_ready"]),
+            "next_retry_at": None,
             "budget_seconds": total,
             "formal_reserve_seconds": reserve,
             "remaining_budget_seconds": _remaining_budget_seconds(deadline),

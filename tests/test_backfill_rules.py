@@ -1685,32 +1685,22 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual(decision["work_kind"], "formal")
         self.assertEqual(decision["formal_status"], "formal_running")
 
-    def test_formal_failure_rerun_retries_only_formal_and_stops_after_three_auto_attempts(self) -> None:
+    def test_formal_failure_requires_explicit_retry_and_only_adds_one_generation(self) -> None:
         from app_panel import target_day_core_decision
 
         readiness = {"trade_date": "2026-08-10", "market_data_ready": True, "selection_ready": False, "screening_ready": False}
-        first_retry = target_day_core_decision(
-            readiness,
-            {"phase": "formal_failed", "formal_attempt": 1, "reason": "formal_child_failed"},
-            page_open=True,
-        )
-        capped = target_day_core_decision(
-            readiness,
-            {"phase": "formal_failed", "formal_attempt": 3, "reason": "formal_child_failed"},
-            page_open=True,
-        )
+        failed = {"phase": "formal_failed", "formal_attempt": 1, "generation": 4, "reason": "formal_child_failed"}
+        first_retry = target_day_core_decision(readiness, failed)
         manual = target_day_core_decision(
             readiness,
-            {"phase": "formal_failed", "formal_attempt": 3},
-            page_open=True,
+            failed,
             manual_retry=True,
         )
 
-        self.assertEqual(first_retry["action"], "enqueue")
-        self.assertEqual(first_retry["work_kind"], "formal")
-        self.assertEqual(capped["action"], "manual_retry_required")
+        self.assertEqual(first_retry["action"], "manual_retry_required")
         self.assertEqual(manual["action"], "enqueue")
         self.assertEqual(manual["work_kind"], "formal")
+        self.assertEqual(manual["generation"], 5)
 
     def test_file_not_found_is_no_launch_and_never_marks_bad_session(self) -> None:
         from offline_daily_update import run_offline_update
@@ -1836,10 +1826,168 @@ class BackfillRuleTests(unittest.TestCase):
             self.assertFalse(failed["started"])
             self.assertEqual(failed["error_kind"], "file_not_found")
 
+    def test_formal_failure_ten_page_reruns_never_start_a_second_worker(self) -> None:
+        from app_panel import enqueue_core_update, target_day_core_decision
+
+        readiness = {"trade_date": "2026-08-11", "market_data_ready": True, "selection_ready": False, "screening_ready": False}
+        failed = {"phase": "formal_failed", "generation": 1, "formal_attempt": 1, "last_error": "deterministic formal failure"}
+        with mock.patch("app_panel.start_background_job") as popen:
+            for _ in range(10):
+                decision = target_day_core_decision(readiness, failed, now_ts=1_000.0)
+                if decision["action"] == "enqueue":
+                    enqueue_core_update("sandbox", "2026-08-11", decision, script_path="offline_daily_update.py")
+
+        self.assertEqual(decision["action"], "manual_retry_required")
+        popen.assert_not_called()
+
+    def test_market_failure_ten_page_reruns_never_start_a_second_worker(self) -> None:
+        from app_panel import enqueue_core_update, target_day_core_decision
+
+        readiness = {"trade_date": "2026-08-11", "market_data_ready": False, "selection_ready": False, "screening_ready": False}
+        failed = {"phase": "market_failed", "generation": 1, "market_attempts": 3, "last_error": "provider quality failed"}
+        with mock.patch("app_panel.start_background_job") as popen:
+            for _ in range(10):
+                decision = target_day_core_decision(readiness, failed, now_ts=1_000.0)
+                if decision["action"] == "enqueue":
+                    enqueue_core_update("sandbox", "2026-08-11", decision, script_path="offline_daily_update.py")
+
+        self.assertEqual(decision["action"], "manual_retry_required")
+        popen.assert_not_called()
+
+    def test_next_retry_at_in_the_future_never_enqueues(self) -> None:
+        from app_panel import target_day_core_decision
+
+        decision = target_day_core_decision(
+            {"trade_date": "2026-08-11", "market_data_ready": False, "selection_ready": False, "screening_ready": False},
+            {"phase": "market_failed", "next_retry_at": 1_001.0},
+            now_ts=1_000.0,
+        )
+
+        self.assertEqual(decision["action"], "defer")
+
+    def test_terminal_log_overrides_reused_pid_and_preserves_larger_parent_counts(self) -> None:
+        import json
+
+        from backfill_orchestrator import background_job_status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            log_path = root / "worker.log"
+            log_path.write_text(
+                'scheduler_status=' + json.dumps(
+                    {
+                        "phase": "formal_failed",
+                        "target_day": "2026-08-11",
+                        "market_status": "market_ready",
+                        "formal_status": "formal_failed",
+                        "market_attempts": 1,
+                        "formal_attempt": 1,
+                        "reason": "formal_child_failed",
+                    }
+                ) + "\n",
+                encoding="utf-8",
+            )
+            (root / "core.active.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 777,
+                        "claim_id": "claim",
+                        "started_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                        "log_path": str(log_path),
+                        "target_day": "2026-08-11",
+                        "generation": 4,
+                        "budget_seconds": 3600,
+                        "market_attempts": 2,
+                        "formal_attempt": 2,
+                        "market_attempts_base": 0,
+                        "formal_attempt_base": 0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch("backfill_orchestrator._pid_is_running", return_value=True):
+                status = background_job_status(root, "ignored", exclusive_key="core")
+
+        self.assertEqual(status["phase"], "formal_failed")
+        self.assertTrue(status["terminal"])
+        self.assertFalse(status["running"])
+        self.assertEqual(status["market_attempts"], 2)
+        self.assertEqual(status["formal_attempt"], 2)
+        for field in ("target_day", "generation", "market_attempts", "formal_attempt", "phase", "terminal", "next_retry_at", "last_error", "claim_id"):
+            self.assertIn(field, status)
+
+    def test_publish_failure_terminates_and_waits_for_unowned_child(self) -> None:
+        from backfill_orchestrator import start_background_job
+
+        proc = mock.Mock(pid=101, returncode=-15)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with (
+                mock.patch("backfill_orchestrator.subprocess.Popen", return_value=proc),
+                mock.patch("backfill_orchestrator._atomic_write_json", side_effect=OSError("disk full")),
+            ):
+                result = start_background_job(["python", "worker.py"], root, root, "job", exclusive_key="core")
+            active = root / "core.active.json"
+            self.assertFalse(active.exists())
+
+        self.assertFalse(result["started"])
+        self.assertEqual(result["error_kind"], "state_publish_failed")
+        proc.terminate.assert_called_once_with()
+        proc.wait.assert_called_once_with(timeout=10)
+
+    def test_orphaned_worker_blocks_all_dates_without_a_second_popen(self) -> None:
+        import json
+
+        from backfill_orchestrator import background_job_status, start_background_job
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=3600 + 121)
+            (root / "core.active.json").write_text(
+                json.dumps(
+                    {
+                        "pid": 888,
+                        "claim_id": "orphan",
+                        "started_at": old.isoformat(),
+                        "budget_seconds": 3600,
+                        "target_day": "2026-08-11",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch("backfill_orchestrator._pid_is_running", return_value=True),
+                mock.patch("backfill_orchestrator.subprocess.Popen") as popen,
+            ):
+                status = background_job_status(root, "job", exclusive_key="core")
+                first = start_background_job(["python", "worker.py", "--date", "2026-08-11"], root, root, "job_11", exclusive_key="core")
+                second = start_background_job(["python", "worker.py", "--date", "2026-08-12"], root, root, "job_12", exclusive_key="core")
+
+        self.assertEqual(status["phase"], "orphaned_manual_intervention")
+        self.assertTrue(status["terminal"])
+        self.assertEqual(first["phase"], "orphaned_manual_intervention")
+        self.assertTrue(second["reused"])
+        popen.assert_not_called()
+
+    def test_manual_retry_increments_exactly_one_generation(self) -> None:
+        from app_panel import target_day_core_decision
+
+        decision = target_day_core_decision(
+            {"trade_date": "2026-08-11", "market_data_ready": True, "selection_ready": False, "screening_ready": False},
+            {"phase": "formal_failed", "generation": 8, "formal_attempt": 2},
+            manual_retry=True,
+        )
+
+        self.assertEqual(decision["action"], "enqueue")
+        self.assertEqual(decision["generation"], 9)
+        self.assertEqual(decision["formal_attempt"], 3)
+        self.assertEqual(decision["formal_attempt_base"], 2)
+
     def test_all_page_entry_paths_build_the_identical_core_command_and_static_gate_holds(self) -> None:
         import ast
+        import inspect
 
-        from app_panel import build_core_update_command, enqueue_core_update
+        from app_panel import build_core_update_command, enqueue_core_update, target_day_core_decision
 
         auto = build_core_update_command("sandbox", "2026-08-10", script_path="offline_daily_update.py")
         manual = build_core_update_command("sandbox", "2026-08-10", script_path="offline_daily_update.py")
@@ -1857,6 +2005,7 @@ class BackfillRuleTests(unittest.TestCase):
             enqueue_core_update("sandbox", "2026-08-10", readiness, script_path="offline_daily_update.py")
         self.assertEqual([call.kwargs["cmd"] for call in start.call_args_list], [auto, manual, checkbox])
         self.assertEqual(len({call.kwargs["exclusive_key"] for call in start.call_args_list}), 1)
+        self.assertNotIn("page_open", inspect.signature(target_day_core_decision).parameters)
 
         source = Path("app_panel.py").read_text(encoding="utf-8")
         module = ast.parse(source)

@@ -71,8 +71,6 @@ CATCHUP_THROTTLE_SECONDS = 1800.0
 SCREENING_BASE_DIR_ENV = "SCREENING_BASE_DIR"
 SCREENING_ACCEPTANCE_NOW_CN_ENV = "SCREENING_ACCEPTANCE_NOW_CN"
 CORE_UPDATE_TIMEOUT_SECONDS = 3600
-CORE_FORMAL_MAX_ATTEMPTS = 3
-CORE_FORMAL_RETRY_SECONDS = 300
 
 
 # Backfill scripts (place them in the same folder as this Streamlit app)
@@ -169,6 +167,7 @@ def build_core_update_command(
         "index",
         "--timeout-sec",
         str(CORE_UPDATE_TIMEOUT_SECONDS),
+        "--no-health",
     ]
 
 
@@ -188,23 +187,38 @@ def _retry_timestamp(value: Any) -> float | None:
     return parsed.timestamp()
 
 
+def _core_attempt(value: Any) -> int:
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merged_core_state(previous: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Keep parent cumulative counters when a child emits per-worker counts."""
+    parent = dict(previous or {})
+    child = parent.get("last_structured_result")
+    if not isinstance(child, dict):
+        return parent
+    merged = {**parent, **child}
+    for key in ("market_attempts", "formal_attempt"):
+        merged[key] = max(_core_attempt(parent.get(key)), _core_attempt(child.get(key)))
+    return merged
+
+
 def target_day_core_decision(
     readiness: Dict[str, Any],
     previous: Optional[Dict[str, Any]] = None,
     *,
     now_ts: Optional[float] = None,
-    page_open: bool = False,
     manual_retry: bool = False,
 ) -> Dict[str, Any]:
     """Choose one fail-closed target-day action without touching a database."""
-    previous = dict(previous or {})
-    status = previous.get("last_structured_result")
-    if isinstance(status, dict):
-        merged = {**previous, **status}
-    else:
-        merged = previous
+    merged = _merged_core_state(previous)
     now_value = float(now_ts if now_ts is not None else dt.datetime.now().timestamp())
-    prior_attempt = max(0, int(merged.get("formal_attempt") or 0))
+    generation = max(1, _core_attempt(merged.get("generation")) or 1)
+    market_attempts = _core_attempt(merged.get("market_attempts"))
+    formal_attempt = _core_attempt(merged.get("formal_attempt"))
     target = str(readiness.get("trade_date") or readiness.get("target_day") or merged.get("target_day") or "")
     if bool(readiness.get("screening_ready")):
         return {
@@ -212,49 +226,123 @@ def target_day_core_decision(
             "target_day": target,
             "market_status": "market_ready",
             "formal_status": "complete",
-            "formal_attempt": prior_attempt,
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "formal_attempt": formal_attempt,
         }
+    phase = str(merged.get("phase") or "")
+    if phase == "orphaned_manual_intervention":
+        return {
+            "action": "manual_intervention_required",
+            "target_day": target,
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "formal_attempt": formal_attempt,
+            "market_status": merged.get("market_status") or "market_failed",
+            "formal_status": merged.get("formal_status") or "not_run",
+            "last_error": merged.get("last_error") or "worker_exceeded_budget_without_terminal_status",
+        }
+    if bool(merged.get("running")):
+        return {
+            "action": "reuse",
+            "target_day": target,
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "formal_attempt": formal_attempt,
+            "market_status": merged.get("market_status") or "market_running",
+            "formal_status": merged.get("formal_status") or "not_run",
+        }
+
+    retry_at = _retry_timestamp(merged.get("next_retry_at") or merged.get("retry_at"))
+    if retry_at is not None and now_value < retry_at:
+        return {
+            "action": "defer",
+            "target_day": target,
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "formal_attempt": formal_attempt,
+            "market_status": merged.get("market_status") or "market_failed",
+            "formal_status": merged.get("formal_status") or "not_run",
+            "last_error": merged.get("last_error") or merged.get("reason"),
+            "next_retry_at": retry_at,
+        }
+
+    if phase == "market_failed":
+        if not manual_retry:
+            return {
+                "action": "manual_retry_required",
+                "target_day": target,
+                "generation": generation,
+                "market_attempts": market_attempts,
+                "formal_attempt": formal_attempt,
+                "market_status": "market_failed",
+                "formal_status": "not_run",
+                "last_error": merged.get("last_error") or merged.get("reason"),
+            }
+        generation += 1
+        return {
+            "action": "enqueue",
+            "target_day": target,
+            "work_kind": "market",
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "market_attempts_base": market_attempts,
+            "formal_attempt": formal_attempt,
+            "formal_attempt_base": formal_attempt,
+            "market_status": "market_running",
+            "formal_status": "not_run",
+        }
+
+    if phase == "formal_failed":
+        if not manual_retry:
+            return {
+                "action": "manual_retry_required",
+                "target_day": target,
+                "generation": generation,
+                "market_attempts": market_attempts,
+                "formal_attempt": formal_attempt,
+                "market_status": "market_ready",
+                "formal_status": "formal_failed",
+                "last_error": merged.get("last_error") or merged.get("reason"),
+            }
+        generation += 1
+        return {
+            "action": "enqueue",
+            "target_day": target,
+            "work_kind": "formal",
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "market_attempts_base": market_attempts,
+            "formal_attempt": formal_attempt + 1,
+            "formal_attempt_base": formal_attempt,
+            "market_status": "market_ready",
+            "formal_status": "formal_running",
+        }
+
     if not bool(readiness.get("market_data_ready")):
         return {
             "action": "enqueue",
             "target_day": target,
             "work_kind": "market",
+            "generation": generation,
+            "market_attempts": market_attempts,
+            "market_attempts_base": market_attempts,
+            "formal_attempt": formal_attempt,
+            "formal_attempt_base": formal_attempt,
             "market_status": "market_running",
             "formal_status": "not_run",
-            "formal_attempt": prior_attempt,
-        }
-
-    prior_failed = str(merged.get("formal_status") or merged.get("phase") or "") == "formal_failed"
-    retry_at = _retry_timestamp(merged.get("next_retry_at") or merged.get("retry_at"))
-    if prior_failed and prior_attempt >= CORE_FORMAL_MAX_ATTEMPTS and not manual_retry:
-        return {
-            "action": "manual_retry_required",
-            "target_day": target,
-            "work_kind": "formal",
-            "market_status": "market_ready",
-            "formal_status": "formal_failed",
-            "formal_attempt": prior_attempt,
-            "last_error": merged.get("reason") or merged.get("last_error"),
-            "next_retry_at": retry_at,
-        }
-    if prior_failed and not manual_retry and not page_open and retry_at is not None and now_value < retry_at:
-        return {
-            "action": "defer",
-            "target_day": target,
-            "work_kind": "formal",
-            "market_status": "market_ready",
-            "formal_status": "formal_failed",
-            "formal_attempt": prior_attempt,
-            "last_error": merged.get("reason") or merged.get("last_error"),
-            "next_retry_at": retry_at,
         }
     return {
         "action": "enqueue",
         "target_day": target,
         "work_kind": "formal",
+        "generation": generation,
+        "market_attempts": market_attempts,
+        "market_attempts_base": market_attempts,
         "market_status": "market_ready",
         "formal_status": "formal_running",
-        "formal_attempt": prior_attempt + 1,
+        "formal_attempt": formal_attempt + 1,
+        "formal_attempt_base": formal_attempt,
     }
 
 
@@ -279,12 +367,19 @@ def enqueue_core_update(
         exclusive_key=core_update_exclusive_key(base_dir),
         metadata={
             "target_day": target,
+            "generation": int(decision.get("generation") or 1),
             "phase": decision.get("market_status") if decision.get("work_kind") == "market" else "formal_running",
             "market_status": decision.get("market_status"),
             "formal_status": decision.get("formal_status"),
+            "market_attempts": int(decision.get("market_attempts") or 0),
+            "market_attempts_base": int(decision.get("market_attempts_base") or decision.get("market_attempts") or 0),
             "formal_attempt": int(decision.get("formal_attempt") or 0),
+            "formal_attempt_base": int(decision.get("formal_attempt_base") or 0),
             "budget_seconds": CORE_UPDATE_TIMEOUT_SECONDS,
             "remaining_budget_seconds": CORE_UPDATE_TIMEOUT_SECONDS,
+            "terminal": False,
+            "next_retry_at": decision.get("next_retry_at"),
+            "last_error": decision.get("last_error"),
             "last_structured_result": None,
         },
     )
@@ -4509,8 +4604,7 @@ def main():
             core_readiness,
             prior_core_state,
             now_ts=now_ts,
-            page_open=True,
-            manual_retry=bool(retry_formal_batch),
+            manual_retry=bool(manual_core_update or retry_formal_batch),
         )
         if not isolated_screening and (auto_catchup or manual_core_update or retry_formal_batch):
             if core_decision.get("action") == "enqueue":
@@ -4522,16 +4616,24 @@ def main():
                     + list(st.session_state.get("catchup_log", []))
                 )[-200:]
             elif core_decision.get("action") == "manual_retry_required":
-                st.sidebar.warning("正式批次已用尽自动重试次数，请使用“重试正式批次”。")
+                st.sidebar.warning("核心 worker 已以失败终态结束；请使用“更新目标日 core worker”或“重试正式批次”明确重试。")
+            elif core_decision.get("action") == "manual_intervention_required":
+                st.sidebar.error("核心 worker 超过预算且没有终态证据；请先执行维护处置，不会自动启动第二个 writer。")
         elif isolated_screening:
             st.sidebar.caption("隔离验收为只读模式，已禁用目标日 core worker。")
 
         effective_state = offline_state.get("last_structured_result") if isinstance(offline_state.get("last_structured_result"), dict) else offline_state
+        display_formal_status = effective_state.get("formal_status", core_decision.get("formal_status"))
+        if isolated_screening and core_decision.get("action") == "enqueue" and core_decision.get("work_kind") == "formal":
+            display_formal_status = "waiting_for_formal_batch"
         st.sidebar.caption(
             "Core worker: "
             f"target={core_target_day}; market={effective_state.get('market_status', core_decision.get('market_status'))}; "
-            f"formal={effective_state.get('formal_status', core_decision.get('formal_status'))}; "
-            f"attempt={effective_state.get('formal_attempt', core_decision.get('formal_attempt'))}; "
+            f"formal={display_formal_status}; "
+            f"generation={effective_state.get('generation', core_decision.get('generation'))}; "
+            f"market_attempts={effective_state.get('market_attempts', core_decision.get('market_attempts'))}; "
+            f"formal_attempt={effective_state.get('formal_attempt', core_decision.get('formal_attempt'))}; "
+            f"terminal={effective_state.get('terminal', False)}; "
             f"last_error={effective_state.get('reason') or effective_state.get('last_error') or 'none'}; "
             f"next_retry={offline_state.get('next_retry_at') or core_decision.get('next_retry_at') or 'none'}; "
             f"elapsed={offline_state.get('elapsed_seconds', 0)}s; "

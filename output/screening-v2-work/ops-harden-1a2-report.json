@@ -1,0 +1,66 @@
+{
+  "task": "OPS-HARDEN-1A.2",
+  "status": "ready_for_ops_harden_1b_review",
+  "start_commit": "e4691a6f02325f67c2a4ae0ded796b56ce9474f1",
+  "scope": "source/tests/task-card/progress/isolated SQLite copies only; no OPS-HARDEN-1B",
+  "passed": {
+    "lifecycle": [
+      "one exclusive writer per resolved base_dir",
+      "three market attempts maximum in one 3600-second worker",
+      "market and formal terminal failures require explicit manual retry",
+      "monotonic parent/child attempt counters",
+      "scheduler terminal log takes priority over reused PID",
+      "state publication failure terminates and waits for child",
+      "orphaned worker blocks concurrent replacement"
+    ],
+    "tests": {
+      "targeted": "161 passed",
+      "full": "348 passed, 2 skipped",
+      "py_compile": "passed",
+      "git_diff_check": "passed"
+    },
+    "sandbox": {
+      "path": "output/screening-v2-work/ops-harden-1a2-sandbox-20260812-1531",
+      "backup": "SQLite online backups of all four databases",
+      "fixture": {
+        "kind": "control_flow_fixture",
+        "not_real_market_data": true,
+        "trade_date": "2026-08-11",
+        "valid_rows": 5018,
+        "quarantined_rows": 164,
+        "required_indices": 4,
+        "provider_calls": 0
+      },
+      "formal_first": {
+        "batch_id": 4,
+        "status": "complete",
+        "definition_version": "v2.5",
+        "mode": "close_final",
+        "fingerprint": "e02d53fbca06b27da153ef708888f3cd733b2d4338976698f44d7243eb7d40f4",
+        "formal_runs": 6,
+        "partial_batches": 0,
+        "deltas": {"selection_batches": 1, "strategy_runs": 6, "candidates": 319, "pullback_state_history": 297}
+      },
+      "formal_second_deltas": {"selection_batches": 0, "strategy_runs": 0, "candidates": 0, "pullback_state_history": 0}
+    },
+    "browser": {
+      "market_missing": "08-11 rolls back to 08-10",
+      "formal_missing": "08-11 market ready still rolls back to 08-10; waiting_for_formal_batch visible",
+      "complete": "selected/effective/formal all 08-11",
+      "console_errors": 0,
+      "market_provider_requests": 0
+    },
+    "production_sha256_unchanged": {
+      "a_share_mvp.db": "1E83DA69B6BC3284AE3062524FB4EF789AF68D67CC3565D6C7FADCEFDD4AE51D",
+      "mining_mvp.db": "B390562F13301CDEAA07A99F009F292EB8537885691C5EF5B6707D9F43C0278E",
+      "ths_concept.db": "837DB4226AB1AB1F807163D8CEC99AB35211E1D64371E682B7DE30315F323B65",
+      "etf_mvp.db": "721ED4A41372B582189E93BD9363F343FC4EB9314AAED9F5A9A3005251A1BF28"
+    }
+  },
+  "failed": [],
+  "environment_blocked": [],
+  "Lessons": [
+    "A single UI entry point still needs cross-process terminal evidence and explicit retry ownership.",
+    "An online-backup sandbox plus a clearly non-real control-flow fixture proves lifecycle without claiming real market recovery."
+  ]
+}
