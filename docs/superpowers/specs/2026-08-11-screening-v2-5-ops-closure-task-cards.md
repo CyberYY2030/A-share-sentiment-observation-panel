@@ -822,3 +822,20 @@ $env:SCREENING_ACCEPTANCE_NOW_CN = '2026-08-11T18:00:00+08:00'
 5. **Opus 把早盘 08-11 零行列为缺口不成立。** close-ready helper 必须先排除未收盘当日，避免未来自动写入错误闩锁。
 6. **Opus 建议用 history bootstrap 实跑生产批次不成立。** 该模块代码明确为 shadow-only；已改为 `run_daily.py --range day day`。
 7. **Opus 的单一 health 四态会丢信息。** 超时与部分增长、覆盖不完整可以同时发生，已改为 writer/coverage/selection/reader 四条正交状态轴。
+
+## 2026-08-12 OPS-HARDEN-1A.3 provider circuit-breaker and low-frequency repair
+
+- Status: `ready_for_ops_harden_1b_1_review`. This card completed source, tests, SQLite online-backup copies, and one bounded BaoStock read-only sample only; it did not run a production repair, formal batch, browser, or OPS-HARDEN-1B.
+- Closure: stock repair is provider-stage and dynamic-gap based: BaoStock, then Sina, then Eastmoney only after its same-run probe succeeds. Complete existing rows are skipped. A timeout or error threshold opens that provider's circuit and transfers the remaining codes to the next source without the former daemon-thread semaphore saturation.
+- Defaults: one worker and a 0.45-second request-start interval. The parent starts one repair child; up to three distinct provider passes live inside that child. `PROVIDER_SUMMARY` is compact and `remaining_budget_seconds` is actual remaining budget.
+- Evidence: 5,202-code circuit regression, BaoStock complete-field/login-logout regression, four-db online-backup table/row parity, controlled 08-11 sandbox skip/reject/resume evidence, and one 20-code low-frequency BaoStock probe at 20/20 complete. Full test result: 352 passed, 2 skipped; all four production SHA-256 values match Task 0.
+- Next boundary: production activation requires a newly authorized, separately reviewed `OPS-HARDEN-1B.1` task. It must not begin from this card or this session.
+
+## 2026-08-12 OPS-HARDEN-1A.3 independent-review correction (P0/P1)
+
+- Status remains `ready_for_ops_harden_1b_1_review`; this correction stops before any production action.
+- P0 fixed: a successful Eastmoney one-code probe now removes only the actually persisted probe code. The subsequent Eastmoney full pass receives every remaining unresolved code; a failed probe preserves the complete dynamic gap. The regression proves exact five-code conservation across BaoStock/Sina circuits, probe, and full pass.
+- P1 fixed: `repair_day()` now owns bounded SQLite checkpoints (default 200 accepted rows). Provider children return rows only; after every checkpoint, pass end, or circuit end the next source sees the true unresolved set. Guard-rejected rows are retained for later sources or a later invocation.
+- Each provider pass/circuit now emits `PROVIDER_SUMMARY` immediately. Circuit accounting is explicitly consecutive provider-call errors: a complete row resets it, while empty and invalid rows are tracked separately and do not accumulate the error threshold.
+- New forced-interruption regression checkpoints 400 rows of a 450-code pass before interruption, then proves the resumed invocation skips those 400 and requests only the remaining 50 codes.
+- Correction validation: `tests.test_backfill_rules` 72 passed; five P0/P1-focused tests 5 passed; full `python -m unittest` 357 passed, 2 skipped; `py_compile` and `git diff --check` passed. Production SHA-256 values remained unchanged.

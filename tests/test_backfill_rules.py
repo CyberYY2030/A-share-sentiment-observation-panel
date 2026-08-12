@@ -1,11 +1,442 @@
 import unittest
 import datetime as dt
 import tempfile
+import time
 from pathlib import Path
 from unittest import mock
 
 
+def _a3_permanently_slow_provider(_code: str, _day_dash: str, _day_compact: str) -> dict:
+    time.sleep(5.0)
+    return {"source": "never_returns_within_timeout"}
+
+
+def _a3_complete_stock_provider(code: str, day_dash: str, _day_compact: str) -> dict:
+    return {
+        "sec_type": "stock",
+        "sec_code": code,
+        "trade_date": day_dash,
+        "open": 10.0,
+        "high": 11.0,
+        "low": 9.0,
+        "close": 10.5,
+        "pre_close": 10.0,
+        "volume": 1_000.0,
+        "amount": 100_000.0,
+        "source": "a3_complete_fixture",
+    }
+
+
+def _a3_one_then_slow_provider(code: str, day_dash: str, day_compact: str) -> dict:
+    """Give one complete row, then deliberately block the source process."""
+    if code == "600000":
+        return _a3_complete_stock_provider(code, day_dash, day_compact)
+    time.sleep(5.0)
+    return {"source": "never_returns_within_timeout"}
+
+
 class BackfillRuleTests(unittest.TestCase):
+    def test_provider_timeout_opens_circuit_and_next_pass_receives_remaining_gap(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = [f"600{index:03d}" for index in range(1, 6)]
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[("broken", _a3_permanently_slow_provider), ("next", _a3_complete_stock_provider)],
+            min_request_interval_sec=0.0,
+            # Windows process startup is itself asynchronous; leave enough
+            # room for the healthy child to publish its first event while the
+            # deliberately slow source still crosses the hard timeout.
+            provider_timeout_sec=0.5,
+            isolate=True,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual({row["sec_code"] for row in rows}, set(codes))
+        self.assertEqual(summaries[0]["provider"], "broken")
+        self.assertEqual(summaries[0]["circuit_reason"], "timeout")
+        self.assertLessEqual(summaries[0]["attempted"], 1)
+        self.assertEqual(summaries[0]["saturated"], 0)
+        self.assertEqual(summaries[1]["provider"], "next")
+        self.assertEqual(summaries[1]["before_missing"], len(codes))
+        self.assertEqual(summaries[1]["after_missing"], 0)
+
+    def test_large_gap_circuits_broken_provider_and_only_passes_residual_forward(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = ["600000", *[f"{600000 + index:06d}" for index in range(1, 5202)]]
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[("broken", _a3_one_then_slow_provider), ("recovery", _a3_complete_stock_provider)],
+            min_request_interval_sec=0.0,
+            provider_timeout_sec=0.5,
+            isolate=True,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual(len(rows), 5202)
+        self.assertEqual(summaries[0]["circuit_reason"], "timeout")
+        self.assertLessEqual(summaries[0]["attempted"], 2)
+        self.assertEqual(summaries[1]["before_missing"], 5201)
+        self.assertEqual(summaries[1]["after_missing"], 0)
+        self.assertEqual(summaries[1]["attempted"], 5201)
+
+    def test_eastmoney_probe_success_keeps_unprobed_gap_for_full_pass(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        codes = [f"600{index:03d}" for index in range(1, 6)]
+        full_pass_codes: list[str] = []
+        emitted: list[dict] = []
+
+        def broken_provider(_code: str, _day_dash: str, _day_compact: str) -> dict:
+            raise RuntimeError("provider unavailable")
+
+        def eastmoney_provider(code: str, day_dash: str, day_compact: str) -> dict:
+            full_pass_codes.append(code)
+            return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+        rows, summaries, remaining = run_stock_provider_passes(
+            codes,
+            "2026-05-19",
+            "20260519",
+            sources=[
+                ("baostock", broken_provider),
+                ("ak_sina", broken_provider),
+                ("ak_em", eastmoney_provider),
+            ],
+            min_request_interval_sec=0.0,
+            error_threshold=3,
+            isolate=False,
+            on_summary=emitted.append,
+        )
+
+        self.assertEqual(remaining, [])
+        self.assertEqual({row["sec_code"] for row in rows}, set(codes))
+        self.assertEqual(len(rows), len(codes))
+        self.assertEqual([summary["provider"] for summary in summaries], ["baostock", "ak_sina", "ak_em", "ak_em"])
+        self.assertTrue(summaries[2]["probe"])
+        self.assertEqual(summaries[2]["after_missing"], 4)
+        self.assertEqual(summaries[3]["before_missing"], 4)
+        self.assertEqual(summaries[3]["after_missing"], 0)
+        self.assertEqual(full_pass_codes, codes)
+        self.assertEqual(emitted, summaries)
+
+    def test_provider_success_resets_consecutive_error_circuit_counter(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        calls = 0
+
+        def intermittent_provider(code: str, day_dash: str, day_compact: str) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls in {1, 3}:
+                raise RuntimeError("transient provider error")
+            return _a3_complete_stock_provider(code, day_dash, day_compact)
+
+        rows, summaries, remaining = run_stock_provider_passes(
+            ["600001", "600002", "600003", "600004"],
+            "2026-05-19",
+            "20260519",
+            sources=[("baostock", intermittent_provider)],
+            min_request_interval_sec=0.0,
+            error_threshold=2,
+            isolate=False,
+        )
+
+        self.assertEqual([row["sec_code"] for row in rows], ["600002", "600004"])
+        self.assertEqual(remaining, ["600001", "600003"])
+        self.assertIsNone(summaries[0]["circuit_reason"])
+
+    def test_invalid_or_empty_row_does_not_accumulate_provider_error_circuit(self) -> None:
+        from repair_market_day_akshare import run_stock_provider_passes
+
+        calls = 0
+
+        def mixed_provider(code: str, day_dash: str, day_compact: str) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls in {1, 3}:
+                raise RuntimeError("transient provider error")
+            if calls == 2:
+                return dict(_a3_complete_stock_provider(code, day_dash, day_compact), amount=None)
+            raise RuntimeError("empty dataframe")
+
+        rows, summaries, remaining = run_stock_provider_passes(
+            ["600001", "600002", "600003", "600004"],
+            "2026-05-19",
+            "20260519",
+            sources=[("baostock", mixed_provider)],
+            min_request_interval_sec=0.0,
+            error_threshold=2,
+            isolate=False,
+        )
+
+        self.assertEqual(rows, [])
+        self.assertEqual(remaining, ["600001", "600002", "600003", "600004"])
+        self.assertIsNone(summaries[0]["circuit_reason"])
+        self.assertEqual(summaries[0]["invalid"], 1)
+        self.assertEqual(summaries[0]["empty"], 1)
+        self.assertEqual(summaries[0]["max_consecutive_errors"], 1)
+
+    def test_repair_checkpoints_before_interruption_and_resume_only_fetches_gap(self) -> None:
+        import sqlite3
+
+        from repair_market_day_akshare import KLINE_COLS, repair_day
+
+        day = "2026-05-19"
+        codes = [f"{600000 + index:06d}" for index in range(450)]
+
+        def row(sec_type: str, code: str, trade_date: str) -> dict:
+            return {
+                "sec_type": sec_type,
+                "sec_code": code,
+                "trade_date": trade_date,
+                "open": 10.0,
+                "high": 11.0,
+                "low": 9.0,
+                "close": 10.5,
+                "pre_close": 10.0,
+                "change": 0.5,
+                "change_pct": 5.0,
+                "volume": 1_000.0,
+                "amount": 100_000.0,
+                "turnover_ratio": 1.0,
+                "source": "checkpoint_fixture",
+                "updated_at": "2026-05-20T00:00:00",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "a_share_mvp.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE stock_info(sec_code TEXT PRIMARY KEY, bs_code TEXT, name TEXT)")
+                conn.executemany(
+                    "INSERT INTO stock_info(sec_code, bs_code, name) VALUES(?,?,?)",
+                    [(code, f"sh.{code}", code) for code in codes],
+                )
+                conn.execute(
+                    f"CREATE TABLE kline_daily ({','.join(column + ' TEXT' for column in KLINE_COLS)}, "
+                    "PRIMARY KEY (sec_type, sec_code, trade_date))"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            first_calls: list[str] = []
+
+            def interrupted_baostock(code: str, day_dash: str, day_compact: str) -> dict:
+                del day_compact
+                first_calls.append(code)
+                if len(first_calls) == 401:
+                    raise KeyboardInterrupt("simulated outer deadline after two checkpoints")
+                return row("stock", code, day_dash)
+
+            def index_fetch(code: str, day_dash: str, _day_compact: str) -> dict:
+                return row("index", code, day_dash)
+
+            with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=interrupted_baostock),
+                mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_index_sina", side_effect=index_fetch),
+                mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=index_fetch),
+            ):
+                with self.assertRaisesRegex(KeyboardInterrupt, "simulated outer deadline"):
+                    repair_day(
+                        db_path,
+                        day,
+                        workers=1,
+                        attempts_per_source=1,
+                        min_request_interval_sec=0.0,
+                        checkpoint_size=200,
+                    )
+
+            conn = sqlite3.connect(db_path)
+            try:
+                checkpointed = conn.execute(
+                    "SELECT COUNT(*) FROM kline_daily WHERE sec_type='stock' AND trade_date=?",
+                    (day,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            resumed_calls: list[str] = []
+
+            def resumed_baostock(code: str, day_dash: str, day_compact: str) -> dict:
+                del day_compact
+                resumed_calls.append(code)
+                return row("stock", code, day_dash)
+
+            with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=resumed_baostock),
+                mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=AssertionError("fallback must not run")),
+                mock.patch("repair_market_day_akshare.fetch_index_sina", side_effect=index_fetch),
+                mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=index_fetch),
+            ):
+                result = repair_day(
+                    db_path,
+                    day,
+                    workers=1,
+                    attempts_per_source=1,
+                    min_request_interval_sec=0.0,
+                    checkpoint_size=200,
+                )
+
+        self.assertEqual(checkpointed, 400)
+        self.assertEqual(len(first_calls), 401)
+        self.assertEqual(result["skipped_existing"], 400)
+        self.assertEqual(resumed_calls, codes[400:])
+        self.assertEqual(result["stock_count"], 450)
+        self.assertEqual(result["provider_summary"][0]["checkpointed"], 50)
+
+    def test_guard_rejected_checkpoint_stays_in_gap_for_next_provider(self) -> None:
+        import sqlite3
+
+        from repair_market_day_akshare import KLINE_COLS, repair_day
+
+        day = "2026-05-19"
+
+        def row(code: str, trade_date: str, close: float, source: str) -> dict:
+            return {
+                "sec_type": "stock",
+                "sec_code": code,
+                "trade_date": trade_date,
+                "open": close,
+                "high": close,
+                "low": close,
+                "close": close,
+                "pre_close": 10.0,
+                "change": close - 10.0,
+                "change_pct": 0.0,
+                "volume": 1_000.0,
+                "amount": 100_000.0,
+                "turnover_ratio": 1.0,
+                "source": source,
+                "updated_at": "2026-05-20T00:00:00",
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "a_share_mvp.db"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.execute("CREATE TABLE stock_info(sec_code TEXT PRIMARY KEY, bs_code TEXT, name TEXT)")
+                conn.execute("INSERT INTO stock_info VALUES ('600001', 'sh.600001', 'fixture')")
+                conn.execute(
+                    f"CREATE TABLE kline_daily ({','.join(column + ' TEXT' for column in KLINE_COLS)}, "
+                    "PRIMARY KEY (sec_type, sec_code, trade_date))"
+                )
+                prior = row("600001", "2026-05-18", 10.0, "prior")
+                conn.execute(
+                    f"INSERT INTO kline_daily ({','.join(KLINE_COLS)}) VALUES ({','.join('?' for _ in KLINE_COLS)})",
+                    tuple(prior[column] for column in KLINE_COLS),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+            calls: list[str] = []
+
+            def baostock(code: str, day_dash: str, _day_compact: str) -> dict:
+                calls.append("baostock")
+                return row(code, day_dash, 20.0, "baostock_guard_rejected")
+
+            def sina(code: str, day_dash: str, _day_compact: str) -> dict:
+                calls.append("ak_sina")
+                return row(code, day_dash, 10.0, "sina_accepted")
+
+            def index_fetch(code: str, day_dash: str, _day_compact: str) -> dict:
+                return dict(row(code, day_dash, 10.0, "index"), sec_type="index")
+
+            with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=baostock),
+                mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=sina),
+                mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=AssertionError("Eastmoney must not run")),
+                mock.patch("repair_market_day_akshare.fetch_index_sina", side_effect=index_fetch),
+                mock.patch("repair_market_day_akshare.fetch_index_tx", side_effect=index_fetch),
+            ):
+                result = repair_day(db_path, day, workers=1, attempts_per_source=1, min_request_interval_sec=0.0)
+
+            conn = sqlite3.connect(db_path)
+            try:
+                source = conn.execute(
+                    "SELECT source FROM kline_daily WHERE sec_type='stock' AND sec_code='600001' AND trade_date=?",
+                    (day,),
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(calls, ["baostock", "ak_sina"])
+        self.assertEqual(source, "sina_accepted")
+        self.assertEqual(result["provider_summary"][0]["guard_rejected"], 1)
+        self.assertEqual(result["provider_summary"][1]["checkpointed"], 1)
+
+    def test_baostock_pass_maps_complete_fields_and_logs_out_once(self) -> None:
+        import pandas as pd
+
+        import repair_market_day_akshare as repair
+        from mining.data_quality import classify_stock_row
+
+        class Queue:
+            def __init__(self) -> None:
+                self.events: list[tuple] = []
+
+            def put(self, event: tuple) -> None:
+                self.events.append(event)
+
+        class Legacy:
+            def __init__(self) -> None:
+                self.logins = 0
+                self.logouts = 0
+                self.codes: list[str] = []
+
+            def bs_login(self) -> None:
+                self.logins += 1
+
+            def bs_logout(self) -> None:
+                self.logouts += 1
+
+            def fetch_kline_baostock(self, code: str, _start: str, _end: str):
+                self.codes.append(code)
+                return pd.DataFrame(
+                    [
+                        {
+                            "open": 10.0,
+                            "high": 11.0,
+                            "low": 9.0,
+                            "close": 10.5,
+                            "pre_close": 10.0,
+                            "change": 0.5,
+                            "change_pct": 5.0,
+                            "volume": 1_000.0,
+                            "amount": 100_000.0,
+                            "turnover_ratio": 1.2,
+                        }
+                    ]
+                )
+
+        queue = Queue()
+        legacy = Legacy()
+        with mock.patch("repair_market_day_akshare.importlib.import_module", return_value=legacy):
+            repair._provider_pass_worker(
+                queue,
+                "baostock",
+                repair.fetch_stock_baostock,
+                ["600001"],
+                "2026-05-19",
+                "20260519",
+                0.0,
+            )
+
+        row = next(event[2] for event in queue.events if event[0] == "row")
+        self.assertTrue(classify_stock_row(row)["complete"])
+        self.assertEqual(legacy.codes, ["sh.600001"])
+        self.assertEqual((legacy.logins, legacy.logouts), (1, 1))
+
     def test_close_ready_target_excludes_pre_cutoff_current_day_and_asof_cannot_bypass(self) -> None:
         from offline_daily_update import resolve_target_close_date
 
@@ -97,7 +528,7 @@ class BackfillRuleTests(unittest.TestCase):
         self.assertEqual([command["attempts"] for command in result["commands"]], [1])
         self.assertEqual(result["revalidations"], [revalidation])
 
-    def test_market_repair_caps_total_child_starts_at_three(self) -> None:
+    def test_market_repair_delegates_all_provider_passes_to_one_child(self) -> None:
         from offline_daily_update import run_offline_update
 
         unresolved_plan = {
@@ -127,9 +558,9 @@ class BackfillRuleTests(unittest.TestCase):
                     timeout_sec=3_600,
                 )
 
-        self.assertEqual(run_child.call_count, 3)
-        self.assertEqual([command["attempts"] for command in result["commands"]], [1, 2, 3])
-        self.assertIn("stock_index give_up asof=2026-04-30 reason=max_attempts", result["logs"])
+        self.assertEqual(run_child.call_count, 1)
+        self.assertEqual([command["attempts"] for command in result["commands"]], [1])
+        self.assertIn("stock_index give_up asof=2026-04-30 reason=provider_pipeline_completed", result["logs"])
 
     def test_global_request_pacer_spaces_provider_attempts(self) -> None:
         from repair_market_day_akshare import GlobalRequestPacer
@@ -145,42 +576,45 @@ class BackfillRuleTests(unittest.TestCase):
         sleep.assert_called_once()
         self.assertAlmostEqual(sleep.call_args.args[0], 0.15, places=6)
 
-    def test_provider_timeout_releases_repair_worker_to_try_next_source(self) -> None:
-        import threading
+    def test_daily_repair_defaults_are_single_worker_and_low_frequency(self) -> None:
+        import inspect
 
-        from repair_market_day_akshare import ProviderCallLimiter, fetch_with_sources
+        from offline_daily_update import (
+            DEFAULT_MARKET_MIN_REQUEST_INTERVAL_SEC,
+            DEFAULT_MARKET_WORKERS,
+            run_offline_update,
+        )
+        from repair_market_day_akshare import (
+            DEFAULT_STOCK_REQUEST_INTERVAL_SEC,
+            DEFAULT_STOCK_WORKERS,
+            repair_day,
+        )
 
-        started = threading.Event()
-        release = threading.Event()
+        self.assertEqual((DEFAULT_STOCK_WORKERS, DEFAULT_MARKET_WORKERS), (1, 1))
+        self.assertEqual((DEFAULT_STOCK_REQUEST_INTERVAL_SEC, DEFAULT_MARKET_MIN_REQUEST_INTERVAL_SEC), (0.45, 0.45))
+        self.assertEqual(inspect.signature(repair_day).parameters["workers"].default, 1)
+        self.assertEqual(inspect.signature(run_offline_update).parameters["market_workers"].default, 1)
 
-        def stalled_sina(_code: str, _day_dash: str, _day_compact: str) -> dict:
-            started.set()
-            release.wait(1.0)
-            return {"source": "sina"}
+    def test_fetch_with_sources_direct_error_falls_through_without_saturation_state(self) -> None:
+        from repair_market_day_akshare import fetch_with_sources
 
-        def tx_fallback(_code: str, _day_dash: str, _day_compact: str) -> dict:
-            return {"source": "tx"}
+        def broken_sina(_code: str, _day_dash: str, _day_compact: str) -> dict:
+            raise RuntimeError("source unavailable")
 
-        limiter = ProviderCallLimiter(max_inflight=1, timeout_sec=0.01)
-        try:
-            row, errors = fetch_with_sources(
-                "600001",
-                "2026-05-19",
-                "20260519",
-                [("ak_sina", stalled_sina), ("ak_tx", tx_fallback)],
-                attempts_per_source=1,
-                provider_calls=limiter,
-            )
-            with self.assertRaisesRegex(TimeoutError, "ak_sina in-flight limit reached"):
-                limiter.call("ak_sina", stalled_sina, "600002", "2026-05-19", "20260519")
-        finally:
-            release.set()
+        def fallback(_code: str, _day_dash: str, _day_compact: str) -> dict:
+            return {"source": "fallback"}
 
-        self.assertTrue(started.is_set())
-        self.assertEqual(row, {"source": "tx"})
-        self.assertEqual(limiter.timed_out_calls, 1)
-        self.assertEqual(limiter.saturated_calls, 1)
-        self.assertTrue(any("ak_sina attempt 1: TimeoutError" in error for error in errors))
+        row, errors = fetch_with_sources(
+            "600001",
+            "2026-05-19",
+            "20260519",
+            [("ak_sina", broken_sina), ("ak_tx", fallback)],
+            attempts_per_source=1,
+        )
+
+        self.assertEqual(row, {"source": "fallback"})
+        self.assertGreaterEqual(len(errors), 1)
+        self.assertIn("ak_sina attempt 1: RuntimeError", errors[0])
 
     def test_concept_and_etf_coverage_use_explicit_eligible_universes(self) -> None:
         import json
@@ -1014,6 +1448,7 @@ class BackfillRuleTests(unittest.TestCase):
                 conn.close()
 
             with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=fake_stock_fetch),
                 mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=fake_stock_fetch),
                 mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=fake_stock_fetch),
                 mock.patch("repair_market_day_akshare.fetch_stock_tx", side_effect=fake_stock_fetch),
@@ -1144,6 +1579,7 @@ class BackfillRuleTests(unittest.TestCase):
             invalid_provider = lambda code, day, _compact: row("stock", code, day, amount=None, source="invalid_fixture")
             valid_index = lambda code, day, _compact: row("index", code, day, amount=None, source="index_fixture")
             with (
+                mock.patch("repair_market_day_akshare.fetch_stock_baostock", side_effect=invalid_provider),
                 mock.patch("repair_market_day_akshare.fetch_stock_em", side_effect=invalid_provider),
                 mock.patch("repair_market_day_akshare.fetch_stock_sina", side_effect=invalid_provider),
                 mock.patch("repair_market_day_akshare.fetch_stock_tx", side_effect=invalid_provider),
@@ -1484,6 +1920,7 @@ class BackfillRuleTests(unittest.TestCase):
                 )
 
         self.assertEqual(result["scheduler_status"]["phase"], "no_launch")
+        self.assertEqual(result["scheduler_status"]["market_attempts"], 0)
         self.assertFalse(result["commands"][0]["started"])
         child.assert_called_once()
         mark_bad.assert_not_called()
@@ -1545,7 +1982,17 @@ class BackfillRuleTests(unittest.TestCase):
                 mock.patch(
                     "offline_daily_update._run_child_with_remaining_budget",
                     side_effect=[
-                        {"started": True, "returncode": 0, "timed_out": False, "error_kind": None, "output": "repair complete", "allowance": 3360},
+                        {
+                            "started": True,
+                            "returncode": 0,
+                            "timed_out": False,
+                            "error_kind": None,
+                            "output": (
+                                'PROVIDER_SUMMARY={"provider":"baostock","attempted":3}\n'
+                                'PROVIDER_SUMMARY={"provider":"ak_sina","attempted":1}'
+                            ),
+                            "allowance": 3360,
+                        },
                         {"started": True, "returncode": 0, "timed_out": False, "error_kind": None, "output": "formal complete", "allowance": 3000},
                     ],
                 ),
@@ -1565,6 +2012,7 @@ class BackfillRuleTests(unittest.TestCase):
         repair, formal = result["commands"]
         self.assertIn("2026-08-11", repair["cmd"])
         self.assertGreater(repair["allowance"], 0)
+        self.assertEqual(result["scheduler_status"]["market_attempts"], 2)
         self.assertEqual(formal["cmd"][-3:], ["--date", "2026-08-11", "--formal-only"])
         joined = " ".join(" ".join(item["cmd"]) for item in result["commands"])
         for forbidden in ("concept", "etf", "--range", "legacy", "outcome", "watchlist", "report"):
@@ -1598,7 +2046,9 @@ class BackfillRuleTests(unittest.TestCase):
                     publish_health=False,
                 )
 
-        self.assertEqual(child.call_count, 3)
+        # The repair child owns the provider passes and circuit breaker.  The
+        # parent must not restart the same broken source three times.
+        self.assertEqual(child.call_count, 1)
         mark_bad.assert_called_once()
         self.assertEqual(result["scheduler_status"]["phase"], "market_failed")
         self.assertFalse(result["readiness"]["screening_ready"])

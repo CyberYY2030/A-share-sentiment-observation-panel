@@ -32,6 +32,8 @@ CORE_UPDATE_DOMAINS = ("stock", "index")
 DEFAULT_CORE_TIMEOUT_SECONDS = 3600
 DEFAULT_FORMAL_RESERVE_SECONDS = 240
 MIN_CHILD_TIMEOUT_SECONDS = 30
+DEFAULT_MARKET_WORKERS = 1
+DEFAULT_MARKET_MIN_REQUEST_INTERVAL_SEC = 0.45
 KLINE_COLS = (
     "sec_type",
     "sec_code",
@@ -1051,6 +1053,36 @@ def _structured_events_from_output(output: str, event: str) -> list[dict[str, An
     return events
 
 
+def _provider_summaries_from_output(output: str) -> list[dict[str, Any]]:
+    """Read the compact per-provider records emitted by the repair child."""
+    prefix = "PROVIDER_SUMMARY="
+    summaries: list[dict[str, Any]] = []
+    for line in str(output or "").splitlines():
+        marker = line.find(prefix)
+        if marker < 0:
+            continue
+        try:
+            value = json.loads(line[marker + len(prefix) :])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            summaries.append(value)
+    return summaries
+
+
+def _market_provider_pass_count(commands: Iterable[dict[str, Any]]) -> int:
+    """Count started distinct provider passes, never parent-child launch attempts."""
+    providers: set[str] = set()
+    for command in commands:
+        if command.get("domain") != "stock_index" or not bool(command.get("started")):
+            continue
+        for summary in command.get("provider_summary") or []:
+            provider = str(summary.get("provider") or "")
+            if provider and int(summary.get("attempted", 0)) > 0:
+                providers.add(provider)
+    return len(providers)
+
+
 def _missing_window_size(expected_dates: list[str], missing_days: list[str]) -> int:
     if not missing_days:
         return 0
@@ -1669,6 +1701,7 @@ def _core_scheduler_result(
     formal_reserve_seconds: int,
     revalidations: list[dict[str, Any]] | None = None,
     quality_mismatches: list[dict[str, Any]] | None = None,
+    remaining_budget_seconds: int | None = None,
     publish_health: bool,
 ) -> dict[str, Any]:
     """Return a structured no-launch/fail-closed core scheduler outcome."""
@@ -1689,7 +1722,7 @@ def _core_scheduler_result(
         "complete": ("market_ready", "complete"),
     }
     market_status, formal_status = status_by_phase.get(phase, (phase, "not_run"))
-    market_attempts = sum(1 for command in commands if command.get("domain") == "stock_index")
+    market_attempts = _market_provider_pass_count(commands)
     formal_attempt = sum(1 for command in commands if command.get("domain") == "formal_batch")
     result = {
         "ok": False,
@@ -1714,7 +1747,11 @@ def _core_scheduler_result(
             "next_retry_at": None,
             "budget_seconds": int(timeout_sec),
             "formal_reserve_seconds": int(formal_reserve_seconds),
-            "remaining_budget_seconds": max(0, int(timeout_sec) - int(formal_reserve_seconds)),
+            "remaining_budget_seconds": (
+                max(0, int(timeout_sec) - int(formal_reserve_seconds))
+                if remaining_budget_seconds is None
+                else max(0, int(remaining_budget_seconds))
+            ),
         },
         "revalidations": list(revalidations or []),
         "quality_mismatches": list(quality_mismatches or []),
@@ -1841,85 +1878,91 @@ def _run_core_offline_update(
                 formal_reserve_seconds=reserve,
                 publish_health=publish_health,
             )
-        for attempt in range(1, MAX_INTERFACE_ATTEMPTS + 1):
-            cmd = [
-                sys.executable,
-                str(repair_script),
-                "--db",
-                paths.stock_db,
-                "--date",
-                target_day,
-                "--workers",
-                str(max(1, int(market_workers))),
-                "--attempts-per-source",
-                "1",
-                "--min-request-interval-sec",
-                format(max(0.0, float(market_min_request_interval_sec)), "g"),
-            ]
-            child = _run_child_with_remaining_budget(
-                cmd,
-                cwd=paths.base_dir,
-                deadline=deadline,
-                reserve_seconds=reserve,
+        # One child owns up to three *distinct provider passes* (BaoStock,
+        # Sina, then a successfully probed Eastmoney).  Re-launching this
+        # script three times restarts the same failing source and defeats the
+        # circuit breaker, so the parent must never loop the repair command.
+        cmd = [
+            sys.executable,
+            str(repair_script),
+            "--db",
+            paths.stock_db,
+            "--date",
+            target_day,
+            "--workers",
+            str(max(1, int(market_workers))),
+            "--attempts-per-source",
+            "1",
+            "--min-request-interval-sec",
+            format(max(0.0, float(market_min_request_interval_sec)), "g"),
+        ]
+        child = _run_child_with_remaining_budget(
+            cmd,
+            cwd=paths.base_dir,
+            deadline=deadline,
+            reserve_seconds=reserve,
+        )
+        child_started = bool(child.get("started"))
+        returncode = child.get("returncode")
+        child_output = str(child.get("output") or "")
+        provider_summary = _provider_summaries_from_output(child_output)
+        raw_after = raw_stock_coverage_for_repair(paths.stock_db, target_day)
+        parent_ready = bool(raw_after.get("stock")) and bool(raw_after.get("index"))
+        mismatch = None
+        if child_started and not bool(child.get("timed_out")) and (returncode == 0) != parent_ready:
+            mismatch = {
+                "code": "child_parent_quality_mismatch",
+                "child_ok": returncode == 0,
+                "parent_ok": parent_ready,
+                "returncode": returncode,
+                "raw_status": (raw_after.get("session_quality") or {}).get("status"),
+            }
+            quality_mismatches.append(mismatch)
+        commands.append(
+            {
+                "domain": "stock_index",
+                "interface": "repair_market_day_akshare",
+                "cmd": cmd,
+                "started": child_started,
+                "returncode": returncode,
+                "timed_out": bool(child.get("timed_out")),
+                "error_kind": child.get("error_kind"),
+                "allowance": child.get("allowance"),
+                "attempts": _market_provider_pass_count(
+                    [{"domain": "stock_index", "started": child_started, "provider_summary": provider_summary}]
+                ),
+                "provider_summary": provider_summary,
+                "raw_before_quality": raw_before,
+                "raw_after_quality": raw_after,
+                "quality_mismatch": mismatch,
+                "output": child_output[-4000:],
+            }
+        )
+        if not child_started:
+            logs.append(
+                "no_launch target_day="
+                f"{target_day} error_kind={child.get('error_kind')} allowance={child.get('allowance')}"
             )
-            child_started = bool(child.get("started"))
-            returncode = child.get("returncode")
-            raw_after = raw_stock_coverage_for_repair(paths.stock_db, target_day)
-            parent_ready = bool(raw_after.get("stock")) and bool(raw_after.get("index"))
-            mismatch = None
-            if child_started and not bool(child.get("timed_out")) and (returncode == 0) != parent_ready:
-                mismatch = {
-                    "code": "child_parent_quality_mismatch",
-                    "child_ok": returncode == 0,
-                    "parent_ok": parent_ready,
-                    "returncode": returncode,
-                    "raw_status": (raw_after.get("session_quality") or {}).get("status"),
-                }
-                quality_mismatches.append(mismatch)
-            commands.append(
-                {
-                    "domain": "stock_index",
-                    "interface": "repair_market_day_akshare",
-                    "cmd": cmd,
-                    "started": child_started,
-                    "returncode": returncode,
-                    "timed_out": bool(child.get("timed_out")),
-                    "error_kind": child.get("error_kind"),
-                    "allowance": child.get("allowance"),
-                    "attempts": attempt,
-                    "raw_before_quality": raw_before,
-                    "raw_after_quality": raw_after,
-                    "quality_mismatch": mismatch,
-                    "output": str(child.get("output") or "")[-4000:],
-                }
+            return _core_scheduler_result(
+                paths=paths,
+                target_day=target_day,
+                plan=plan,
+                logs=logs,
+                commands=commands,
+                phase="no_launch",
+                reason=str(child.get("error_kind") or "core_child_not_started"),
+                timeout_sec=total,
+                formal_reserve_seconds=reserve,
+                remaining_budget_seconds=_remaining_budget_seconds(deadline, reserve_seconds=reserve),
+                publish_health=publish_health,
             )
-            if not child_started:
-                logs.append(
-                    "no_launch target_day="
-                    f"{target_day} error_kind={child.get('error_kind')} allowance={child.get('allowance')}"
-                )
-                return _core_scheduler_result(
-                    paths=paths,
-                    target_day=target_day,
-                    plan=plan,
-                    logs=logs,
-                    commands=commands,
-                    phase="no_launch",
-                    reason=str(child.get("error_kind") or "core_child_not_started"),
-                    timeout_sec=total,
-                    formal_reserve_seconds=reserve,
-                    publish_health=publish_health,
-                )
-            if mismatch is not None:
-                logs.append(f"child_parent_quality_mismatch target_day={target_day}")
-                break
-            if parent_ready:
-                audited = _revalidate_attempted_stock_sessions(paths.stock_db, [target_day])
-                revalidations.extend(audited)
-                market = stock_coverage_for_date(paths.stock_db, target_day)
-                market_ready = bool(market.get("stock")) and bool(market.get("index"))
-                break
-            raw_before = raw_after
+        if mismatch is not None:
+            logs.append(f"child_parent_quality_mismatch target_day={target_day}")
+        elif parent_ready:
+            audited = _revalidate_attempted_stock_sessions(paths.stock_db, [target_day])
+            revalidations.extend(audited)
+            market = stock_coverage_for_date(paths.stock_db, target_day)
+            market_ready = bool(market.get("stock")) and bool(market.get("index"))
 
         if not market_ready and not quality_mismatches:
             # This is the only path that may write an observed-bad latch: a
@@ -1943,6 +1986,7 @@ def _run_core_offline_update(
             formal_reserve_seconds=reserve,
             revalidations=revalidations,
             quality_mismatches=quality_mismatches,
+            remaining_budget_seconds=_remaining_budget_seconds(deadline),
             publish_health=publish_health,
         )
 
@@ -1957,10 +2001,11 @@ def _run_core_offline_update(
                 commands=commands,
                 phase="configuration_error",
                 reason="formal_script_missing",
-                timeout_sec=total,
-                formal_reserve_seconds=reserve,
-                revalidations=revalidations,
-                publish_health=publish_health,
+            timeout_sec=total,
+            formal_reserve_seconds=reserve,
+            revalidations=revalidations,
+            remaining_budget_seconds=_remaining_budget_seconds(deadline),
+            publish_health=publish_health,
             )
         cmd = [sys.executable, str(formal_script), "--base-dir", paths.base_dir, "--date", target_day, "--formal-only"]
         child = _run_child_with_remaining_budget(cmd, cwd=paths.base_dir, deadline=deadline)
@@ -2003,6 +2048,7 @@ def _run_core_offline_update(
                 formal_reserve_seconds=reserve,
                 revalidations=revalidations,
                 quality_mismatches=quality_mismatches,
+                remaining_budget_seconds=_remaining_budget_seconds(deadline),
                 publish_health=publish_health,
             )
 
@@ -2021,7 +2067,7 @@ def _run_core_offline_update(
             "target_day": target_day,
             "market_status": "market_ready" if readiness["market_data_ready"] else "market_failed",
             "formal_status": "complete" if readiness["selection_ready"] else "formal_failed",
-            "market_attempts": sum(1 for command in commands if command.get("domain") == "stock_index"),
+            "market_attempts": _market_provider_pass_count(commands),
             "formal_attempt": sum(1 for command in commands if command.get("domain") == "formal_batch"),
             "terminal": True,
             "manual_retry_required": not bool(readiness["screening_ready"]),
@@ -2056,8 +2102,8 @@ def run_offline_update(
     publish_health: bool = True,
     dry_run: bool = False,
     timeout_sec: int = 600,
-    market_workers: int = 12,
-    market_min_request_interval_sec: float = 0.0,
+    market_workers: int = DEFAULT_MARKET_WORKERS,
+    market_min_request_interval_sec: float = DEFAULT_MARKET_MIN_REQUEST_INTERVAL_SEC,
     use_remote_calendar: bool = False,
     domains: Iterable[str] | None = None,
     formal_reserve_seconds: int = DEFAULT_FORMAL_RESERVE_SECONDS,
@@ -2195,7 +2241,11 @@ def run_offline_update(
                     continue
 
                 raw_after = raw_before
-                for attempt in range(1, MAX_INTERFACE_ATTEMPTS + 1):
+                # The repair child contains the bounded BaoStock/Sina/Eastmoney
+                # provider pipeline.  Repeating this command would restart a
+                # previously opened circuit and multiply the same interface
+                # budget, so legacy callers receive the same single launch.
+                for attempt in range(1, 2):
                     reserve_seconds = 120 * (
                         len(later_domains) + max(0, len(market_days) - market_position - 1)
                     )
@@ -2277,7 +2327,7 @@ def run_offline_update(
                         break
                     raw_before = raw_after
                 else:
-                    _emit(logs, f"stock_index give_up asof={market_day} reason=max_attempts")
+                    _emit(logs, f"stock_index give_up asof={market_day} reason=provider_pipeline_completed")
 
                 # Retain an audit trail for a failed repair without allowing a fourth start.
                 if not market_day_mismatch:
@@ -2518,8 +2568,12 @@ def main() -> int:
     parser.add_argument("--timeout-sec", type=int, default=DEFAULT_CORE_TIMEOUT_SECONDS)
     parser.add_argument("--formal-reserve-sec", type=int, default=DEFAULT_FORMAL_RESERVE_SECONDS)
     parser.add_argument("--use-remote-calendar", action="store_true")
-    parser.add_argument("--market-workers", type=int, default=12)
-    parser.add_argument("--market-min-request-interval-sec", type=float, default=0.0)
+    parser.add_argument("--market-workers", type=int, default=DEFAULT_MARKET_WORKERS)
+    parser.add_argument(
+        "--market-min-request-interval-sec",
+        type=float,
+        default=DEFAULT_MARKET_MIN_REQUEST_INTERVAL_SEC,
+    )
     args = parser.parse_args()
 
     result = run_offline_update(

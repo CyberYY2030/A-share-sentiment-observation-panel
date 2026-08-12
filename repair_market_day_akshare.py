@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import importlib
+import json
+import multiprocessing as mp
 import sqlite3
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, Callable
+from queue import Empty
+from typing import Any, Callable, Iterable
 
 import pandas as pd
 
@@ -34,6 +37,9 @@ KLINE_COLS = [
 REQUIRED_INDEX_CODES = ("000001", "399001", "000300", "000852")
 MAX_FALLBACK_CLOSE_JUMP = 0.30
 PROVIDER_CALL_TIMEOUT_SEC = 12.0
+DEFAULT_STOCK_WORKERS = 1
+DEFAULT_STOCK_REQUEST_INTERVAL_SEC = 0.45
+PROVIDER_ERROR_CIRCUIT_THRESHOLD = 3
 
 
 class GlobalRequestPacer:
@@ -53,68 +59,6 @@ class GlobalRequestPacer:
             self._next_start = max(self._next_start, now) + self._interval
         if delay > 0.0:
             time.sleep(delay)
-
-
-class ProviderCallLimiter:
-    """Bound one provider call without allowing a stalled fallback to block repair workers."""
-
-    def __init__(self, *, max_inflight: int, timeout_sec: float) -> None:
-        self._max_inflight = max(1, int(max_inflight))
-        self._timeout_sec = max(0.1, float(timeout_sec))
-        self._lock = threading.Lock()
-        self._slots: dict[str, threading.BoundedSemaphore] = {}
-        self._timed_out_calls = 0
-        self._saturated_calls = 0
-
-    @property
-    def timed_out_calls(self) -> int:
-        with self._lock:
-            return self._timed_out_calls
-
-    @property
-    def saturated_calls(self) -> int:
-        with self._lock:
-            return self._saturated_calls
-
-    def call(
-        self,
-        source_name: str,
-        fn: Callable[[str, str, str], dict[str, Any]],
-        code: str,
-        day_dash: str,
-        day_compact: str,
-        *,
-        pacer: GlobalRequestPacer | None = None,
-    ) -> dict[str, Any]:
-        with self._lock:
-            slot = self._slots.setdefault(source_name, threading.BoundedSemaphore(self._max_inflight))
-        if not slot.acquire(blocking=False):
-            with self._lock:
-                self._saturated_calls += 1
-            raise TimeoutError(f"{source_name} in-flight limit reached")
-
-        state: dict[str, Any] = {}
-
-        def invoke() -> None:
-            try:
-                if pacer is not None:
-                    pacer.wait()
-                state["row"] = fn(code, day_dash, day_compact)
-            except BaseException as exc:
-                state["error"] = exc
-            finally:
-                slot.release()
-
-        worker = threading.Thread(target=invoke, daemon=True)
-        worker.start()
-        worker.join(self._timeout_sec)
-        if worker.is_alive():
-            with self._lock:
-                self._timed_out_calls += 1
-            raise TimeoutError(f"{source_name} exceeded {self._timeout_sec:g}s")
-        if "error" in state:
-            raise state["error"]
-        return state["row"]
 
 
 def now_iso() -> str:
@@ -359,6 +303,44 @@ def fetch_stock_tx(code: str, day_dash: str, day_compact: str) -> dict[str, Any]
     }
 
 
+_BAOSTOCK_LEGACY: Any | None = None
+
+
+def fetch_stock_baostock(code: str, day_dash: str, _day_compact: str) -> dict[str, Any]:
+    """Map the existing BaoStock backfill row contract into one repair row.
+
+    ``_provider_pass_worker`` owns one BaoStock login/logout for the entire
+    pass.  The mapping intentionally reuses ``fetch_kline_baostock`` from the
+    existing backfill script so its OHLC, preclose, volume and amount semantics
+    remain identical to the established source.
+    """
+    legacy = _BAOSTOCK_LEGACY
+    if legacy is None:
+        raise RuntimeError("baostock session is not active for this provider pass")
+    bs_code = f"{market_prefix(code)}.{code}"
+    frame = legacy.fetch_kline_baostock(bs_code, day_dash, day_dash)
+    if frame is None or frame.empty:
+        raise RuntimeError("empty dataframe")
+    row = frame.iloc[-1]
+    return {
+        "sec_type": "stock",
+        "sec_code": code,
+        "trade_date": day_dash,
+        "open": _num(row, "open"),
+        "high": _num(row, "high"),
+        "low": _num(row, "low"),
+        "close": _num(row, "close"),
+        "pre_close": _num(row, "pre_close"),
+        "change": _num(row, "change"),
+        "change_pct": _num(row, "change_pct"),
+        "volume": _num(row, "volume"),
+        "amount": _num(row, "amount"),
+        "turnover_ratio": _num(row, "turnover_ratio"),
+        "source": "baostock",
+        "updated_at": now_iso(),
+    }
+
+
 def fetch_index_sina(code: str, day_dash: str, day_compact: str) -> dict[str, Any]:
     import akshare as ak  # type: ignore
 
@@ -478,6 +460,373 @@ def _filter_continuous_stock_rows(
     return accepted, rejected
 
 
+def _provider_summary(provider: str, before_missing: int) -> dict[str, Any]:
+    return {
+        "provider": provider,
+        "attempted": 0,
+        "valid": 0,
+        "empty": 0,
+        "error": 0,
+        "invalid": 0,
+        "timeout": 0,
+        "saturated": 0,
+        "circuit_reason": None,
+        "circuit_error_mode": "consecutive_provider_errors",
+        "max_consecutive_errors": 0,
+        "checkpointed": 0,
+        "guard_rejected": 0,
+        "elapsed": 0.0,
+        "rows_per_minute": 0.0,
+        "before_missing": int(before_missing),
+        "after_missing": int(before_missing),
+        "error_samples": [],
+    }
+
+
+def _add_error_sample(summary: dict[str, Any], message: str) -> None:
+    samples = summary["error_samples"]
+    if len(samples) < 8:
+        samples.append(str(message)[:220])
+
+
+def _stock_row_is_complete(row: dict[str, Any]) -> tuple[bool, str]:
+    classification = classify_stock_row(row)
+    if bool(classification["complete"]):
+        return True, ""
+    return False, f"{classification['row_status']}:{classification['reason']}"
+
+
+def _provider_pass_worker(
+    queue: Any,
+    source_name: str,
+    fn: Callable[[str, str, str], dict[str, Any]],
+    codes: list[str],
+    day_dash: str,
+    day_compact: str,
+    min_request_interval_sec: float,
+) -> None:
+    """Run one provider pass in a killable child process.
+
+    A timeout is observed by the parent and terminates this whole process.  No
+    provider call is left in a daemon thread, and no retained semaphore can
+    cascade into a false `in-flight limit reached` storm.
+    """
+    global _BAOSTOCK_LEGACY
+    legacy = None
+    try:
+        if source_name == "baostock":
+            legacy = importlib.import_module("backfill_baostock_hsA_60d_v2")
+            legacy.bs_login()
+            _BAOSTOCK_LEGACY = legacy
+        pacer = GlobalRequestPacer(min_request_interval_sec)
+        for code in codes:
+            queue.put(("started", code, None))
+            try:
+                pacer.wait()
+                row = fn(code, day_dash, day_compact)
+                complete, detail = _stock_row_is_complete(row)
+                if complete:
+                    queue.put(("row", code, row))
+                else:
+                    queue.put(("invalid", code, detail))
+            except BaseException as exc:
+                queue.put(("error", code, f"{type(exc).__name__}: {exc}"))
+        queue.put(("done", None, None))
+    except BaseException as exc:
+        queue.put(("fatal", None, f"{type(exc).__name__}: {exc}"))
+    finally:
+        if legacy is not None:
+            try:
+                legacy.bs_logout()
+            finally:
+                _BAOSTOCK_LEGACY = None
+
+
+def _terminate_provider_process(process: Any) -> None:
+    if process.is_alive():
+        process.terminate()
+        process.join(1.0)
+    if process.is_alive():
+        process.kill()
+        process.join(1.0)
+
+
+def _should_isolate_provider(
+    fn: Callable[[str, str, str], dict[str, Any]],
+    isolate: bool | None,
+) -> bool:
+    if isolate is not None:
+        return bool(isolate)
+    # Production fetchers are top-level functions in this module.  Unit tests
+    # commonly inject local mocks, which cannot be pickled by Windows spawn and
+    # are intentionally executed synchronously inside the test process.
+    return getattr(fn, "__module__", "") == __name__ and "<locals>" not in getattr(fn, "__qualname__", "")
+
+
+def _run_stock_provider_pass(
+    codes: list[str],
+    day_dash: str,
+    day_compact: str,
+    *,
+    provider: str,
+    fn: Callable[[str, str, str], dict[str, Any]],
+    min_request_interval_sec: float,
+    provider_timeout_sec: float,
+    error_threshold: int,
+    isolate: bool | None,
+    on_checkpoint: Callable[[list[dict[str, Any]], str], Iterable[str]] | None = None,
+    checkpoint_size: int = 200,
+) -> tuple[list[dict[str, Any]], set[str], dict[str, Any]]:
+    """Fetch one provider stage and return checkpointed rows plus its remaining gap.
+
+    A row is removed from ``pending`` only after the parent process accepts it
+    at a checkpoint.  Provider children never receive a database handle.  Row
+    quality failures and empty responses remain unresolved for the next source;
+    only consecutive non-empty provider exceptions contribute to the source
+    circuit, and any complete row resets that counter.
+    """
+    pending = {str(code) for code in codes}
+    accepted: list[dict[str, Any]] = []
+    checkpoint_buffer: list[dict[str, Any]] = []
+    summary = _provider_summary(provider, len(pending))
+    started = time.monotonic()
+    threshold = max(1, int(error_threshold))
+    batch_size = max(1, int(checkpoint_size))
+    consecutive_provider_errors = 0
+
+    def checkpoint_rows() -> None:
+        nonlocal checkpoint_buffer
+        if not checkpoint_buffer:
+            return
+        rows = checkpoint_buffer
+        checkpoint_buffer = []
+        candidate_codes = {str(row.get("sec_code") or "") for row in rows}
+        if on_checkpoint is None:
+            persisted_codes = candidate_codes
+        else:
+            persisted_codes = {str(code) for code in on_checkpoint(rows, provider)}
+            persisted_codes &= candidate_codes
+        accepted.extend(row for row in rows if str(row.get("sec_code") or "") in persisted_codes)
+        pending.difference_update(persisted_codes)
+        summary["checkpointed"] += len(persisted_codes)
+        summary["guard_rejected"] += len(candidate_codes - persisted_codes)
+
+    def accept_complete_row(code: str, row: dict[str, Any]) -> None:
+        nonlocal consecutive_provider_errors
+        checkpoint_buffer.append(row)
+        summary["valid"] += 1
+        consecutive_provider_errors = 0
+        if len(checkpoint_buffer) >= batch_size:
+            checkpoint_rows()
+
+    def consume(kind: str, code: str | None, payload: Any) -> bool:
+        nonlocal consecutive_provider_errors
+        if kind == "started":
+            summary["attempted"] += 1
+            return False
+        if kind == "row" and code is not None:
+            accept_complete_row(code, payload)
+            return False
+        if kind == "invalid" and code is not None:
+            # A response that fails the row-quality contract is not a source
+            # transport/provider error.  It stays in the gap for a fallback
+            # but breaks an exception streak so three scattered bad symbols do
+            # not trip a healthy provider's circuit.
+            consecutive_provider_errors = 0
+            summary["invalid"] += 1
+            _add_error_sample(summary, f"{code} invalid {payload}")
+        elif kind in {"error", "fatal"}:
+            message = str(payload)
+            if "empty" in message.lower():
+                # An empty but well-formed provider response also remains
+                # unresolved without being treated as a transport failure.
+                consecutive_provider_errors = 0
+                summary["empty"] += 1
+            else:
+                summary["error"] += 1
+                consecutive_provider_errors += 1
+                summary["max_consecutive_errors"] = max(
+                    int(summary["max_consecutive_errors"]),
+                    consecutive_provider_errors,
+                )
+            _add_error_sample(summary, f"{code or provider} {message}")
+            if kind == "fatal":
+                summary["circuit_reason"] = "worker_error"
+                return True
+        if consecutive_provider_errors >= threshold:
+            summary["circuit_reason"] = "error_threshold"
+            return True
+        return False
+
+    if not pending:
+        return accepted, pending, summary
+
+    try:
+        if not _should_isolate_provider(fn, isolate):
+            # Test-injected non-picklable callables never use a thread timeout.
+            # Production fetchers always use the killable process boundary below.
+            pacer = GlobalRequestPacer(min_request_interval_sec)
+            for code in list(codes):
+                summary["attempted"] += 1
+                try:
+                    pacer.wait()
+                    row = fn(code, day_dash, day_compact)
+                    complete, detail = _stock_row_is_complete(row)
+                    if complete:
+                        accept_complete_row(code, row)
+                    elif consume("invalid", code, detail):
+                        break
+                except Exception as exc:
+                    if consume("error", code, f"{type(exc).__name__}: {exc}"):
+                        break
+        else:
+            context = mp.get_context("spawn")
+            queue = context.Queue()
+            process = context.Process(
+                target=_provider_pass_worker,
+                args=(queue, provider, fn, list(codes), day_dash, day_compact, min_request_interval_sec),
+            )
+            circuit_open = False
+            last_activity = time.monotonic()
+            try:
+                process.start()
+                while True:
+                    try:
+                        kind, code, payload = queue.get(timeout=0.05)
+                        last_activity = time.monotonic()
+                        if kind == "done":
+                            break
+                        if consume(kind, code, payload):
+                            circuit_open = True
+                            break
+                    except Empty:
+                        if not process.is_alive():
+                            break
+                        if time.monotonic() - last_activity >= max(0.1, float(provider_timeout_sec)):
+                            summary["timeout"] += 1
+                            summary["circuit_reason"] = "timeout"
+                            _add_error_sample(summary, f"{provider} exceeded {provider_timeout_sec:g}s")
+                            circuit_open = True
+                            break
+                if circuit_open:
+                    _terminate_provider_process(process)
+                else:
+                    process.join(1.0)
+                    if process.is_alive():
+                        summary["timeout"] += 1
+                        summary["circuit_reason"] = "timeout"
+                        _terminate_provider_process(process)
+                    elif process.exitcode not in (0, None) and summary["circuit_reason"] is None:
+                        summary["circuit_reason"] = "worker_exit"
+                        summary["error"] += 1
+                        _add_error_sample(summary, f"{provider} worker exit={process.exitcode}")
+            except Exception as exc:
+                summary["circuit_reason"] = "process_start_error"
+                summary["error"] += 1
+                _add_error_sample(summary, f"{type(exc).__name__}: {exc}")
+                _terminate_provider_process(process)
+            finally:
+                queue.close()
+                queue.join_thread()
+    finally:
+        # A completed pass, a circuit, or a Python exception all flush what the
+        # parent has already received.  A hard outer kill may skip this final
+        # flush, but bounded earlier checkpoints remain durable.
+        checkpoint_rows()
+        summary["elapsed"] = round(time.monotonic() - started, 3)
+        summary["rows_per_minute"] = round(
+            (60.0 * float(summary["valid"]) / summary["elapsed"]) if summary["elapsed"] else 0.0,
+            3,
+        )
+    return accepted, pending, summary
+
+
+def run_stock_provider_passes(
+    codes: list[str],
+    day_dash: str,
+    day_compact: str,
+    *,
+    sources: list[tuple[str, Callable[[str, str, str], dict[str, Any]]]],
+    min_request_interval_sec: float,
+    provider_timeout_sec: float = PROVIDER_CALL_TIMEOUT_SEC,
+    error_threshold: int = PROVIDER_ERROR_CIRCUIT_THRESHOLD,
+    isolate: bool | None = None,
+    on_checkpoint: Callable[[list[dict[str, Any]], str], Iterable[str]] | None = None,
+    checkpoint_size: int = 200,
+    on_summary: Callable[[dict[str, Any]], None] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """Run stock sources as sequential provider passes over the dynamic gap.
+
+    BaoStock is primary, Sina only sees codes that BaoStock did not complete,
+    and Eastmoney requires a same-run one-code probe before its full pass.  The
+    Tencent stock source is deliberately absent because it cannot supply
+    `amount`; index fallbacks retain their existing behaviour elsewhere.
+    """
+    pending = list(dict.fromkeys(str(code) for code in codes))
+    rows: list[dict[str, Any]] = []
+    summaries: list[dict[str, Any]] = []
+
+    def record_summary(summary: dict[str, Any]) -> None:
+        summaries.append(summary)
+        if on_summary is not None:
+            on_summary(summary)
+
+    for provider, fn in sources:
+        if not pending:
+            break
+        if provider == "ak_em":
+            probe_rows, probe_remaining, probe_summary = _run_stock_provider_pass(
+                pending[:1],
+                day_dash,
+                day_compact,
+                provider=provider,
+                fn=fn,
+                min_request_interval_sec=min_request_interval_sec,
+                provider_timeout_sec=provider_timeout_sec,
+                error_threshold=error_threshold,
+                isolate=isolate,
+                on_checkpoint=on_checkpoint,
+                checkpoint_size=checkpoint_size,
+            )
+            probe_summary["probe"] = True
+            rows.extend(probe_rows)
+            # ``probe_remaining`` describes only ``probe_codes``.  Remove
+            # solely the codes that the probe actually checkpointed; filtering
+            # all of ``pending`` by that one-code set used to erase unprobed
+            # Eastmoney work and falsely report the gap as resolved.
+            probe_codes = pending[:1]
+            resolved_probe_codes = set(probe_codes) - probe_remaining
+            pending = [code for code in pending if code not in resolved_probe_codes]
+            if not resolved_probe_codes:
+                if probe_summary["circuit_reason"] is None:
+                    probe_summary["circuit_reason"] = "probe_failed"
+                probe_summary["after_missing"] = len(pending)
+                record_summary(probe_summary)
+                continue
+            probe_summary["after_missing"] = len(pending)
+            record_summary(probe_summary)
+            if not pending:
+                break
+        pass_rows, remaining, summary = _run_stock_provider_pass(
+            pending,
+            day_dash,
+            day_compact,
+            provider=provider,
+            fn=fn,
+            min_request_interval_sec=min_request_interval_sec,
+            provider_timeout_sec=provider_timeout_sec,
+            error_threshold=error_threshold,
+            isolate=isolate,
+            on_checkpoint=on_checkpoint,
+            checkpoint_size=checkpoint_size,
+        )
+        rows.extend(pass_rows)
+        pending = [code for code in pending if code in remaining]
+        summary["after_missing"] = len(pending)
+        record_summary(summary)
+    return rows, summaries, pending
+
+
 def fetch_with_sources(
     code: str,
     day_dash: str,
@@ -486,7 +835,6 @@ def fetch_with_sources(
     *,
     attempts_per_source: int,
     pacer: GlobalRequestPacer | None = None,
-    provider_calls: ProviderCallLimiter | None = None,
     require_complete_stock: bool = False,
 ) -> tuple[dict[str, Any] | None, list[str]]:
     errors: list[str] = []
@@ -494,19 +842,9 @@ def fetch_with_sources(
         quality_rejected = False
         for attempt in range(1, attempts_per_source + 1):
             try:
-                if provider_calls is not None:
-                    row = provider_calls.call(
-                        source_name,
-                        fn,
-                        code,
-                        day_dash,
-                        day_compact,
-                        pacer=pacer,
-                    )
-                else:
-                    if pacer is not None:
-                        pacer.wait()
-                    row = fn(code, day_dash, day_compact)
+                if pacer is not None:
+                    pacer.wait()
+                row = fn(code, day_dash, day_compact)
                 if require_complete_stock or row.get("sec_type") == "stock":
                     classification = classify_stock_row(row)
                     if not classification["complete"]:
@@ -529,10 +867,11 @@ def repair_day(
     trade_date: str,
     *,
     limit: int = 0,
-    workers: int = 4,
+    workers: int = DEFAULT_STOCK_WORKERS,
     attempts_per_source: int = 3,
-    min_request_interval_sec: float = 0.0,
+    min_request_interval_sec: float = DEFAULT_STOCK_REQUEST_INTERVAL_SEC,
     provider_timeout_sec: float = PROVIDER_CALL_TIMEOUT_SEC,
+    checkpoint_size: int = 200,
 ) -> dict[str, Any]:
     day_dash, day_compact = normalize_day(trade_date)
     conn = connect(db_path)
@@ -556,20 +895,15 @@ def repair_day(
         codes = codes[:limit]
 
     stock_sources = [
-        ("ak_em", fetch_stock_em),
+        ("baostock", fetch_stock_baostock),
         ("ak_sina", fetch_stock_sina),
-        ("ak_tx", fetch_stock_tx),
+        ("ak_em", fetch_stock_em),
     ]
     index_sources = [
         ("ak_sina", fetch_index_sina),
         ("ak_tx", fetch_index_tx),
     ]
     pacer = GlobalRequestPacer(min_request_interval_sec)
-    provider_calls = ProviderCallLimiter(
-        max_inflight=max(1, workers),
-        timeout_sec=provider_timeout_sec,
-    )
-
     started = time.time()
     index_rows: list[dict[str, Any]] = []
     index_failures: dict[str, list[str]] = {}
@@ -581,7 +915,6 @@ def repair_day(
             index_sources,
             attempts_per_source=attempts_per_source,
             pacer=pacer,
-            provider_calls=provider_calls,
         )
         if row is None:
             index_failures[code] = errs[-8:]
@@ -599,51 +932,49 @@ def repair_day(
     finally:
         conn.close()
 
-    rows: list[dict[str, Any]] = []
-    failures: dict[str, list[str]] = {}
-    provider_quality_rejections: dict[str, list[str]] = {}
     guard_rejections: list[dict[str, Any]] = []
+    saved_stock = 0
 
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-        futures = {
-            executor.submit(
-                fetch_with_sources,
-                code,
-                day_dash,
-                day_compact,
-                stock_sources,
-                attempts_per_source=attempts_per_source,
-                pacer=pacer,
-                provider_calls=provider_calls,
-                require_complete_stock=True,
-            ): code
-            for code in codes
-        }
-        for i, future in enumerate(as_completed(futures), start=1):
-            code = futures[future]
-            row, errs = future.result()
-            quality_errors = [error for error in errs if " rejected source=" in error]
-            if quality_errors:
-                provider_quality_rejections[code] = quality_errors[-8:]
-            if row is None:
-                failures[code] = errs[-8:]
-            else:
-                rows.append(row)
-            if i % 200 == 0 or i == len(futures):
-                conn = connect(db_path)
-                try:
-                    accepted, rejected = _filter_continuous_stock_rows(conn, rows)
-                    guard_rejections.extend(rejected)
-                    n = upsert_rows(conn, accepted)
-                    rows = []
-                    print(
-                        f"[STOCK] progress {i}/{len(futures)} saved_batch={n} "
-                        f"guard_rejected={len(guard_rejections)} "
-                        f"failures={len(failures)} elapsed={time.time() - started:.1f}s",
-                        flush=True,
-                    )
-                finally:
-                    conn.close()
+    def checkpoint_stock_rows(rows: list[dict[str, Any]], _provider: str) -> set[str]:
+        """Persist only parent-approved rows; rejected codes stay unresolved."""
+        nonlocal saved_stock
+        conn = connect(db_path)
+        try:
+            accepted, rejected = _filter_continuous_stock_rows(conn, rows)
+            guard_rejections.extend(rejected)
+            saved_stock += upsert_rows(conn, accepted)
+            return {str(row.get("sec_code") or "") for row in accepted}
+        finally:
+            conn.close()
+
+    def emit_provider_summary(summary: dict[str, Any]) -> None:
+        # Emitted at every pass end (including a circuit), so an outer deadline
+        # never hides which source has already checkpointed progress.
+        print("PROVIDER_SUMMARY=" + json.dumps(summary, ensure_ascii=False, sort_keys=True), flush=True)
+
+    rows, provider_summary, unresolved_codes = run_stock_provider_passes(
+        codes,
+        day_dash,
+        day_compact,
+        sources=stock_sources,
+        min_request_interval_sec=min_request_interval_sec,
+        provider_timeout_sec=provider_timeout_sec,
+        on_checkpoint=checkpoint_stock_rows,
+        checkpoint_size=checkpoint_size,
+        on_summary=emit_provider_summary,
+    )
+
+    provider_quality_rejections = {
+        str(summary["provider"]): list(summary.get("error_samples") or [])
+        for summary in provider_summary
+        if summary.get("error_samples")
+    }
+    print(
+        f"[STOCK] passes={len(provider_summary)} saved={saved_stock} "
+        f"remaining={len(unresolved_codes)} guard_rejected={len(guard_rejections)} "
+        f"elapsed={time.time() - started:.1f}s",
+        flush=True,
+    )
 
     conn = connect(db_path)
     try:
@@ -668,16 +999,18 @@ def repair_day(
         "pending_codes": int(len(codes)),
         "skipped_existing": int(len(existing_codes)),
         "retryable_existing": int(len(retryable_existing)),
-        "stock_failures": failures,
+        "stock_failures": {"unresolved_count": int(len(unresolved_codes)), "sample_codes": unresolved_codes[:50]},
         "provider_quality_rejections": provider_quality_rejections,
+        "provider_summary": provider_summary,
         "index_failures": index_failures,
         "guard_rejections": guard_rejections[:50],
         "guard_rejection_count": int(len(guard_rejections)),
-        "workers": int(max(1, workers)),
+        "workers": int(DEFAULT_STOCK_WORKERS),
         "min_request_interval_sec": float(max(0.0, min_request_interval_sec)),
         "provider_timeout_sec": float(max(0.1, provider_timeout_sec)),
-        "provider_timed_out_calls": provider_calls.timed_out_calls,
-        "provider_saturated_calls": provider_calls.saturated_calls,
+        "checkpoint_size": int(max(1, checkpoint_size)),
+        "provider_timed_out_calls": sum(int(summary.get("timeout", 0)) for summary in provider_summary),
+        "provider_saturated_calls": sum(int(summary.get("saturated", 0)) for summary in provider_summary),
         "raw_postcondition": postcondition,
         "elapsed_sec": round(time.time() - started, 1),
     }
@@ -688,9 +1021,9 @@ def main() -> int:
     parser.add_argument("--db", default="a_share_mvp.db")
     parser.add_argument("--date", required=True)
     parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--workers", type=int, default=DEFAULT_STOCK_WORKERS)
     parser.add_argument("--attempts-per-source", type=int, default=3)
-    parser.add_argument("--min-request-interval-sec", type=float, default=0.0)
+    parser.add_argument("--min-request-interval-sec", type=float, default=DEFAULT_STOCK_REQUEST_INTERVAL_SEC)
     parser.add_argument("--provider-timeout-sec", type=float, default=PROVIDER_CALL_TIMEOUT_SEC)
     args = parser.parse_args()
 
@@ -703,7 +1036,12 @@ def main() -> int:
         min_request_interval_sec=max(0.0, float(args.min_request_interval_sec)),
         provider_timeout_sec=max(0.1, float(args.provider_timeout_sec)),
     )
-    print(result)
+    compact = {
+        key: value
+        for key, value in result.items()
+        if key not in {"stock_failures", "provider_quality_rejections", "index_failures", "guard_rejections"}
+    }
+    print("REPAIR_RESULT=" + json.dumps(compact, ensure_ascii=False, sort_keys=True))
     return 0 if bool(result["raw_postcondition"]["ok"]) else 1
 
 
