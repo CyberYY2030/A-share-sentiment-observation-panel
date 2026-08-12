@@ -22,7 +22,6 @@ from ..data_quality import (
     STATUS_CLEAN,
     STATUS_USABLE_WITH_QUARANTINE,
     inspect_stock_session,
-    stock_quality_is_screening_ready,
     usable_stock_trade_dates,
 )
 from ..features import (
@@ -49,10 +48,9 @@ from ..selection_runtime import (
     CHINA_TZ,
     MODE_CLOSE_FINAL,
     MODE_CLOSE_PENDING,
-    MODE_DATA_UNAVAILABLE,
+    MODE_INTRADAY,
     SelectionRuntime,
 )
-from ..selection_context import build_selection_context
 from ..scanners.base_breakout import evaluate_base_breakout
 from ..scanners.counter_trend_rs import evaluate_counter_trend_rs
 from ..scanners.launch_burst import evaluate_compression_launch
@@ -846,177 +844,143 @@ def _formal_capability_view(
     *,
     selected_trade_date: str | None = None,
     now: dt.datetime | None = None,
+    runtime: SelectionRuntime | None = None,
+    snapshot_loader: SnapshotLoader | None = None,
+    intraday_enabled: bool | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
-    """Read only the current complete close-final batch for formal A–E."""
-    del now
+    """Read a close-final batch, or evaluate one current-session provisional snapshot."""
+    current = now or dt.datetime.now(CHINA_TZ)
     batch = latest_complete_batch(conn, trade_date)
     formal_trade_date = _formal_batch_trade_date(conn, trade_date)
     batch_pending = batch.code == "unfinalized"
     selected = str(selected_trade_date or trade_date)
-    date_status = (
-        "aligned"
-        if batch.code == "complete" and selected == str(trade_date) == formal_trade_date
-        else "date_mismatch" if batch.code == "complete" else "batch_pending"
-    )
-    evidence: dict[str, object] = {
-        "mode": MODE_CLOSE_FINAL if batch.code == "complete" else MODE_CLOSE_PENDING,
-        "as_of": None,
-        "price_as_of": str(trade_date),
-        "metadata_as_of": None,
-        "trend_profile": None,
-        "data_status": "complete" if batch.code == "complete" else "pending",
-        "snapshot_source": None,
-        "snapshot_coverage": None,
-        "snapshot_provider": None,
-        "snapshot_status": None,
-        "snapshot_observed_at": None,
-        "snapshot_raw_rows": None,
-        "snapshot_normalized_rows": None,
-        "snapshot_errors": [],
-        "snapshot_from_cache": False,
-        "snapshot_retry_at": None,
-        "selected_trade_date": selected,
-        "effective_trade_date": str(trade_date),
-        "formal_trade_date": formal_trade_date,
-        "date_status": date_status,
-        "formal_batch_status": "pending" if batch_pending else batch.code,
-    }
-    status = _capability_run_status(conn, trade_date)
-    status.attrs["a_history_coverage"] = a_history_coverage(conn, trade_date)
-    if batch.code != "complete":
-        if batch_pending and not status.empty:
+    def waiting_view(reason: str | None = None) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+        evidence: dict[str, object] = {
+            "mode": MODE_CLOSE_PENDING,
+            "result_kind": "waiting_for_formal_batch",
+            "as_of": None,
+            "price_as_of": str(trade_date),
+            "metadata_as_of": None,
+            "trend_profile": None,
+            "data_status": "pending",
+            "snapshot_source": None,
+            "snapshot_coverage": None,
+            "snapshot_provider": None,
+            "snapshot_status": None,
+            "snapshot_observed_at": None,
+            "snapshot_raw_rows": None,
+            "snapshot_normalized_rows": None,
+            "snapshot_errors": [],
+            "snapshot_from_cache": False,
+            "snapshot_retry_at": None,
+            "selected_trade_date": selected,
+            "effective_trade_date": str(trade_date),
+            "formal_trade_date": None,
+            "date_status": "batch_pending",
+            "formal_batch_status": "pending" if batch_pending else batch.code,
+            "runtime_reason": reason,
+        }
+        status = _capability_run_status(conn, trade_date)
+        if not status.empty:
             status["availability"] = "waiting_for_formal_batch"
+            if reason is not None:
+                status["error_msg"] = reason
+        status.attrs["a_history_coverage"] = a_history_coverage(conn, trade_date)
         return pd.DataFrame(), status, evidence
-    return _apply_date_evidence_gate(
-        _load_formal_capability_candidates(conn, trade_date), status, evidence
-    )
 
-    current = now or dt.datetime.now(CHINA_TZ)
-    resolved_runtime = runtime or SelectionRuntime()
-    snapshot = None
-    snapshot_source = None
-    snapshot_as_of = None
-    quote_result = None
+    if batch.code == "complete":
+        evidence = {
+            "mode": MODE_CLOSE_FINAL,
+            "result_kind": "persisted",
+            "as_of": None,
+            "price_as_of": str(trade_date),
+            "metadata_as_of": None,
+            "trend_profile": None,
+            "data_status": "complete",
+            "snapshot_source": None,
+            "snapshot_coverage": None,
+            "snapshot_provider": None,
+            "snapshot_status": None,
+            "snapshot_observed_at": None,
+            "snapshot_raw_rows": None,
+            "snapshot_normalized_rows": None,
+            "snapshot_errors": [],
+            "snapshot_from_cache": False,
+            "snapshot_retry_at": None,
+            "selected_trade_date": selected,
+            "effective_trade_date": str(trade_date),
+            "formal_trade_date": formal_trade_date,
+            "date_status": "aligned" if selected == str(trade_date) == formal_trade_date else "date_mismatch",
+            "formal_batch_status": "complete",
+        }
+        status = _capability_run_status(conn, trade_date)
+        status.attrs["a_history_coverage"] = a_history_coverage(conn, trade_date)
+        return _apply_date_evidence_gate(
+            _load_formal_capability_candidates(conn, trade_date), status, evidence
+        )
+
     quality = inspect_stock_session(conn, trade_date)
-    if not stock_quality_is_screening_ready(quality) and snapshot_loader is not None:
-        quote_result = _quote_result(snapshot_loader())
-        if quote_result.observed_at is None:
-            quote_result = replace(quote_result, observed_at=current.isoformat())
-        if quote_result.status in {"snapshot_usable", "snapshot_cache_fallback"}:
-            snapshot = quote_result.frame.copy()
-            snapshot_source = quote_result.provider
-            snapshot_as_of = quote_result.observed_at
-    if str(quality.get("status")) == STATUS_USABLE_WITH_QUARANTINE:
-        # The stock/index close gate already accepted this day.  Build a
-        # read-only formal preview from the quarantined-row-aware context; a
-        # persisted v2.5 batch remains the responsibility of run_daily.py.
-        context = build_selection_context(
-            conn,
-            str(trade_date),
-            mode=MODE_CLOSE_FINAL,
-            as_of=current.isoformat(),
-            price_as_of=str(trade_date),
-        )
-        evidence = _selection_evidence(
-            context,
-            mode=MODE_CLOSE_FINAL,
-            snapshot_source=None,
-            snapshot_coverage=None,
-            quote_result=None,
-        )
-        evidence.update(
-            _date_alignment_evidence(
-                context,
-                selected_trade_date=selected_trade_date or trade_date,
-                formal_trade_date=str(trade_date),
-            )
-        )
-        evidence.update(
-            {
-                "benchmark_status": context.benchmark_status,
-                "benchmark_provider": None,
-                "benchmark_observed_at": None,
-                "benchmark_errors": [],
-            }
-        )
-        c_history = a_history_coverage(
-            conn,
-            trade_date,
-            usable_dates=context.diagnostics.get("usable_dates"),
-        )
-        rows, status = _live_formal_capability_rows(conn, context)
-        status.attrs["a_history_coverage"] = c_history
-        return _apply_date_evidence_gate(rows, status, evidence)
+    if str(quality.get("status")) in {STATUS_CLEAN, STATUS_USABLE_WITH_QUARANTINE}:
+        return waiting_view("complete_close_batch_required")
 
-    result = resolved_runtime.run(
+    current_cn = current.replace(tzinfo=CHINA_TZ) if current.tzinfo is None else current.astimezone(CHINA_TZ)
+    current_time = current_cn.time().replace(tzinfo=None)
+    in_session = (
+        current_cn.date().isoformat() == str(trade_date)
+        and current_cn.weekday() < 5
+        and ((dt.time(9, 30) <= current_time <= dt.time(11, 30)) or (dt.time(13, 0) <= current_time < dt.time(15, 0)))
+    )
+    if intraday_enabled is not True or not in_session or snapshot_loader is None:
+        return waiting_view("current_intraday_snapshot_required")
+
+    quote_result = _quote_result(snapshot_loader())
+    if quote_result.observed_at is None:
+        quote_result = replace(quote_result, observed_at=current_cn.isoformat())
+    snapshot = quote_result.frame.copy() if quote_result.status in {"snapshot_usable", "snapshot_cache_fallback"} else pd.DataFrame()
+    result = (runtime or SelectionRuntime()).run(
         conn,
         trade_date,
-        now=current,
+        now=current_cn,
         snapshot_bars=snapshot,
-        snapshot_benchmark_closes=quote_result.benchmark_closes if quote_result is not None else None,
-        snapshot_as_of=snapshot_as_of if snapshot is not None and not snapshot.empty else None,
-        snapshot_source=snapshot_source,
+        snapshot_benchmark_closes=quote_result.benchmark_closes,
+        snapshot_as_of=quote_result.observed_at if not snapshot.empty else None,
+        snapshot_source=quote_result.provider,
     )
     context = result.context
-    if context is None:
-        return pd.DataFrame(), pd.DataFrame(), {}
-    formal_trade_date = (
-        _formal_batch_trade_date(conn, trade_date)
-        if result.mode == MODE_CLOSE_FINAL
-        else str(context.trade_date)
-    )
+    if context is None or result.mode != MODE_INTRADAY:
+        return waiting_view(result.reason)
+
     evidence = _selection_evidence(
         context,
-        mode=result.mode,
+        mode=MODE_INTRADAY,
         snapshot_source=result.snapshot_source,
         snapshot_coverage=result.snapshot_coverage,
         quote_result=quote_result,
     )
     evidence.update(
-        _date_alignment_evidence(
-            context,
-            selected_trade_date=selected_trade_date or trade_date,
-            formal_trade_date=formal_trade_date,
-        )
-    )
-    evidence.update(
         {
-            "benchmark_status": quote_result.benchmark_status if quote_result is not None else context.benchmark_status,
-            "benchmark_provider": quote_result.benchmark_provider if quote_result is not None else None,
-            "benchmark_observed_at": quote_result.benchmark_observed_at if quote_result is not None else None,
-            "benchmark_errors": list(quote_result.benchmark_errors) if quote_result is not None else [],
+            "result_kind": "provisional",
+            "formal_batch_status": "provisional",
+            "selected_trade_date": selected,
+            "effective_trade_date": str(context.trade_date),
+            "formal_trade_date": str(context.trade_date),
+            "date_status": "aligned" if selected == str(context.trade_date) else "date_mismatch",
+            "benchmark_status": quote_result.benchmark_status,
+            "benchmark_provider": quote_result.benchmark_provider,
+            "benchmark_observed_at": quote_result.benchmark_observed_at,
+            "benchmark_errors": list(quote_result.benchmark_errors),
         }
     )
-    c_history = a_history_coverage(
+    rows, status = _live_formal_capability_rows(conn, context)
+    if not rows.empty:
+        rows["result_kind"] = "provisional"
+    if not status.empty:
+        status["availability"] = "provisional"
+    status.attrs["a_history_coverage"] = a_history_coverage(
         conn,
         trade_date,
         usable_dates=context.diagnostics.get("usable_dates"),
     )
-    if result.mode == MODE_CLOSE_FINAL:
-        status = _capability_run_status(conn, trade_date)
-        status.attrs["a_history_coverage"] = c_history
-        return _apply_date_evidence_gate(
-            _load_formal_capability_candidates(conn, trade_date), status, evidence
-        )
-    if result.mode == MODE_DATA_UNAVAILABLE:
-        status = pd.DataFrame(
-            [
-                {
-                    "strategy_id": definition.strategy_id,
-                    "capability": definition.capability,
-                    "availability": "数据过时或缺失",
-                    "n_candidates": 0,
-                    "run_at": None,
-                    "last_nonempty": None,
-                    "skipped_reason_counts": {result.reason: len(context.universe)},
-                }
-                for definition in formal_definitions()
-            ]
-        )
-        status.attrs["a_history_coverage"] = c_history
-        return _apply_date_evidence_gate(pd.DataFrame(), status, evidence)
-    rows, status = _live_formal_capability_rows(conn, context)
-    status.attrs["a_history_coverage"] = c_history
     return _apply_date_evidence_gate(rows, status, evidence)
 
 
@@ -1776,6 +1740,7 @@ def render_scanner_tab(
 ) -> None:
     query_trade_date = latest_quote_trade_date or fallback_trade_date
     shared_snapshot_loader = None
+    formal_runtime = SelectionRuntime()
     if query_trade_date and (use_intraday or prefer_latest_quotes or force_latest_quotes):
         adapter_key = f"quote_snapshot_adapter_{query_trade_date}"
         if adapter_key not in st.session_state:
@@ -1820,6 +1785,10 @@ def render_scanner_tab(
                 status_conn,
                 today_date,
                 selected_trade_date=query_trade_date or today_date,
+                now=now,
+                runtime=formal_runtime,
+                snapshot_loader=shared_snapshot_loader,
+                intraday_enabled=use_intraday,
             )
             c_history = capability_status_df.attrs.get("a_history_coverage") or a_history_coverage(status_conn, today_date)
         finally:

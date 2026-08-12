@@ -739,6 +739,154 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertEqual(mismatched["formal_trade_date"], trade_date)
         self.assertEqual(set(mismatched_status["availability"]), {"date_mismatch"})
 
+    def test_usable_close_without_batch_waits_without_loading_snapshot(self) -> None:
+        from mining.candidate_persistence import migrate_selection_batch_schema
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _formal_capability_view
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+                calls = 0
+
+                def unexpected_snapshot_loader() -> pd.DataFrame:
+                    nonlocal calls
+                    calls += 1
+                    raise AssertionError("close view must not load a provisional snapshot")
+
+                rows, status, evidence = _formal_capability_view(
+                    conn,
+                    dates["target_trade_date"],
+                    selected_trade_date=dates["target_trade_date"],
+                    now=dt.datetime(2026, 4, 9, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    snapshot_loader=unexpected_snapshot_loader,
+                )
+            finally:
+                conn.close()
+
+        self.assertTrue(rows.empty)
+        self.assertEqual(calls, 0)
+        self.assertEqual(evidence["result_kind"], "waiting_for_formal_batch")
+        self.assertEqual(set(status["availability"]), {"waiting_for_formal_batch"})
+
+    def test_current_intraday_snapshot_is_provisional_shared_and_nonpersistent(self) -> None:
+        from mining.candidate_persistence import migrate_selection_batch_schema
+        from mining.db import connect
+        from mining.selection_runtime import SelectionRuntime
+        from mining.streamlit_tabs.tab_scanner import _build_cached_snapshot_loader, _formal_capability_view
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            intraday_date = "2026-04-17"
+            now = dt.datetime(2026, 4, 17, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+                snapshot = pd.read_sql_query(
+                    """
+                    SELECT sec_code, open, high, low, close, pre_close, change, change_pct, volume, amount
+                    FROM ash.kline_daily WHERE sec_type='stock' AND trade_date=?
+                    """,
+                    conn,
+                    params=[dates["target_trade_date"]],
+                )
+                before = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in ("selection_batches", "strategy_runs", "candidates", "pullback_state_history")
+                }
+                calls = 0
+
+                def source_loader() -> pd.DataFrame:
+                    nonlocal calls
+                    calls += 1
+                    return snapshot.copy()
+
+                loader = _build_cached_snapshot_loader(source_loader)
+                runtime = SelectionRuntime()
+                first_rows, first_status, first = _formal_capability_view(
+                    conn,
+                    intraday_date,
+                    selected_trade_date=intraday_date,
+                    now=now,
+                    runtime=runtime,
+                    snapshot_loader=loader,
+                    intraday_enabled=True,
+                )
+                repeated_rows, repeated_status, repeated = _formal_capability_view(
+                    conn,
+                    intraday_date,
+                    selected_trade_date=intraday_date,
+                    now=now,
+                    runtime=runtime,
+                    snapshot_loader=loader,
+                    intraday_enabled=True,
+                )
+                after = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in before
+                }
+            finally:
+                conn.close()
+
+        self.assertEqual(calls, 1)
+        self.assertEqual(first["mode"], "intraday_snapshot")
+        self.assertEqual(first["result_kind"], "provisional")
+        self.assertEqual(first["formal_batch_status"], "provisional")
+        self.assertEqual(set(first_status["capability"]), {"A", "B", "C", "D", "E"})
+        self.assertEqual(set(first_status["availability"]), {"provisional"})
+        self.assertEqual(first["snapshot_source"], "injected_loader")
+        self.assertEqual(first["date_status"], "aligned")
+        self.assertEqual(repeated["result_kind"], "provisional")
+        self.assertEqual(len(first_rows), len(repeated_rows))
+        self.assertEqual(set(repeated_status["availability"]), {"provisional"})
+        self.assertEqual(after, before)
+
+    def test_complete_formal_batch_takes_priority_over_current_snapshot(self) -> None:
+        from mining.candidate_persistence import migrate_selection_batch_schema
+        from mining.db import connect
+        from mining.streamlit_tabs.tab_scanner import _formal_capability_view
+        from run_daily import execute_formal_only_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            trade_date = dates["target_trade_date"]
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+            finally:
+                conn.close()
+            execute_formal_only_pipeline(base, trade_date)
+            conn = connect(base_dir=base)
+            try:
+                calls = 0
+
+                def unexpected_snapshot_loader() -> pd.DataFrame:
+                    nonlocal calls
+                    calls += 1
+                    raise AssertionError("complete formal batch must win")
+
+                rows, status, evidence = _formal_capability_view(
+                    conn,
+                    trade_date,
+                    selected_trade_date=trade_date,
+                    now=dt.datetime(2026, 4, 9, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8))),
+                    snapshot_loader=unexpected_snapshot_loader,
+                    intraday_enabled=True,
+                )
+            finally:
+                conn.close()
+
+        self.assertEqual(calls, 0)
+        self.assertEqual(evidence["result_kind"], "persisted")
+        self.assertEqual(evidence["formal_batch_status"], "complete")
+        self.assertFalse(status.empty)
+        self.assertTrue(rows.empty or "result_kind" not in rows.columns)
+
     def test_launch_burst_display_exposes_decision_features(self) -> None:
         from mining.streamlit_tabs.tab_scanner import _prepare_launch_display
 

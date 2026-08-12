@@ -199,6 +199,31 @@ class SelectionRuntimeTests(unittest.TestCase):
         self.assertNotEqual(first_close, second_close)
         self.assertTrue(second.context.diagnostics["activity_unavailable"])
 
+    def test_same_timestamp_price_change_rebuilds_snapshot_cache_key(self) -> None:
+        runtime = SelectionRuntime(self.policy)
+        now = dt.datetime(2026, 4, 17, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
+        first = runtime.run(
+            self.conn,
+            self.snapshot_date,
+            now=now,
+            snapshot_bars=self._snapshot(),
+            snapshot_as_of=now - dt.timedelta(minutes=1),
+            snapshot_source="unit-test",
+        )
+        changed = self._snapshot()
+        changed.loc[changed.index[0], "close"] = float(changed.loc[changed.index[0], "close"]) + 0.5
+        second = runtime.run(
+            self.conn,
+            self.snapshot_date,
+            now=now,
+            snapshot_bars=changed,
+            snapshot_as_of=now - dt.timedelta(minutes=1),
+            snapshot_source="unit-test",
+        )
+
+        self.assertNotEqual(first.cache_key, second.cache_key)
+        self.assertIsNot(first.context, second.context)
+
     def test_snapshot_without_same_batch_index_keeps_price_ready_and_e_unavailable(self) -> None:
         now = dt.datetime(2026, 4, 17, 10, 0, tzinfo=dt.timezone(dt.timedelta(hours=8)))
         runtime = SelectionRuntime(self.policy)

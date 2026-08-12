@@ -152,6 +152,26 @@ def _run_formal_capabilities(conn: Any, trade_date: str) -> tuple[list[dict[str,
     }
 
 
+def execute_formal_only_pipeline(
+    base_dir: str | Path = ".",
+    trade_date: str | None = None,
+) -> dict[str, Any]:
+    """Persist only one idempotent A-E close-final batch from existing local data."""
+    conn = connect(base_dir=base_dir)
+    try:
+        resolved_trade_date = trade_date or latest_stock_trade_date(conn)
+        if resolved_trade_date is None:
+            raise RuntimeError("No stock trade date available in the source database.")
+        formal_results, formal_batch = _run_formal_capabilities(conn, resolved_trade_date)
+        return {
+            "trade_date": resolved_trade_date,
+            "scanners": formal_results,
+            "formal_batch": formal_batch,
+        }
+    finally:
+        conn.close()
+
+
 def execute_daily_pipeline(
     base_dir: str | Path = ".",
     trade_date: str | None = None,
@@ -225,17 +245,11 @@ def execute_range_pipeline(
             trade_date=trade_date,
             refresh=False,
             out_dir=out_dir,
-            emit_reports=False,
+            emit_reports=trade_date == trade_dates[-1],
         )
     if last_result is None:
         raise RuntimeError("No trade dates found in the requested range.")
-    return execute_daily_pipeline(
-        base_dir=base_dir,
-        trade_date=end_date,
-        refresh=False,
-        out_dir=out_dir,
-        emit_reports=True,
-    )
+    return last_result
 
 
 def main() -> None:
@@ -244,6 +258,7 @@ def main() -> None:
     parser.add_argument("--base-dir", default=Path.cwd())
     parser.add_argument("--backfill-only", action="store_true")
     parser.add_argument("--range", nargs=2, metavar=("START", "END"))
+    parser.add_argument("--formal-only", action="store_true")
     parser.add_argument("--intraday", action="store_true")
     parser.add_argument("--intraday-start", default="14:00")
     parser.add_argument("--intraday-end", default="15:00")
@@ -254,6 +269,13 @@ def main() -> None:
     parser.add_argument("--reuse-shadow", action="store_true")
     parser.add_argument("--out")
     args = parser.parse_args()
+
+    if args.formal_only and args.range:
+        parser.error("--formal-only cannot be used with --range")
+    if args.formal_only and args.backfill_only:
+        parser.error("--formal-only cannot be used with --backfill-only")
+    if args.formal_only and args.intraday:
+        parser.error("--formal-only cannot be used with --intraday")
 
     if args.history_bootstrap_dry_run:
         if not args.target_date or not args.out or not args.shadow_db:
@@ -285,7 +307,12 @@ def main() -> None:
         print(result["display"].to_string(index=False) if not result["display"].empty else "no intraday launch candidates")
         print(f"report={result['report']}")
         return
-    if args.range:
+    if args.formal_only:
+        result = execute_formal_only_pipeline(
+            base_dir=args.base_dir,
+            trade_date=args.trade_date,
+        )
+    elif args.range:
         result = execute_range_pipeline(
             base_dir=args.base_dir,
             start_date=args.range[0],

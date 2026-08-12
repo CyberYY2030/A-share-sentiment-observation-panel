@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import json
 import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -123,6 +125,26 @@ def _empty_unavailable_context(trade_date: str, resolution: ModeResolution) -> S
     )
 
 
+def _snapshot_fingerprint(
+    snapshot: pd.DataFrame,
+    benchmark_closes: Mapping[str, object] | None,
+) -> str:
+    """Cache by observed snapshot content, so a same-minute price change rebuilds it."""
+    normalized = snapshot.copy()
+    normalized.columns = [str(column) for column in normalized.columns]
+    normalized = normalized.reindex(sorted(normalized.columns), axis=1)
+    if "sec_code" in normalized.columns:
+        normalized = normalized.sort_values("sec_code", kind="stable")
+    normalized = normalized.reset_index(drop=True)
+    payload = pd.util.hash_pandas_object(normalized, index=False).values.tobytes()
+    benchmarks = json.dumps(
+        {str(key): str(value) for key, value in sorted((benchmark_closes or {}).items())},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload + benchmarks).hexdigest()
+
+
 class SelectionRuntime:
     """Process-local snapshot cache; only close-final contexts may invoke a finalizer."""
 
@@ -194,7 +216,11 @@ class SelectionRuntime:
         snapshot["trade_date"] = str(trade_date)
         snapshot_names = snapshot[["sec_code", "sec_name"]] if "sec_name" in snapshot.columns else None
         snapshot_time = _parse_snapshot_as_of(snapshot_as_of)
-        cache_key = (str(trade_date), snapshot_time.isoformat(), resolution.mode)
+        cache_key = (
+            str(trade_date),
+            snapshot_time.isoformat(),
+            f"{resolution.mode}:{_snapshot_fingerprint(snapshot, snapshot_benchmark_closes)}",
+        )
         cached = self._snapshot_cache.get(cache_key)
         if cached is None:
             context = build_selection_context(

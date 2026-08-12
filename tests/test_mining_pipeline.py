@@ -1414,6 +1414,112 @@ class MiningPipelineTests(unittest.TestCase):
 
         self.assertEqual(rows, [])
 
+    def test_formal_only_pipeline_is_idempotent_and_writes_no_legacy_runs(self) -> None:
+        from mining.candidate_persistence import migrate_selection_batch_schema
+        from mining.db import connect
+        from run_daily import execute_formal_only_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            conn = connect(base_dir=base)
+            try:
+                migrate_selection_batch_schema(conn)
+                before = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in ("selection_batches", "strategy_runs", "candidates", "pullback_state_history")
+                }
+            finally:
+                conn.close()
+
+            first = execute_formal_only_pipeline(base, dates["target_trade_date"])
+            conn = connect(base_dir=base)
+            try:
+                after_first = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in before
+                }
+                formal_runs = conn.execute(
+                    "SELECT COUNT(*) FROM strategy_runs WHERE batch_id=? AND mode='close_final'",
+                    (first["formal_batch"]["batch_id"],),
+                ).fetchone()[0]
+                null_batch_runs = conn.execute(
+                    "SELECT COUNT(*) FROM strategy_runs WHERE batch_id IS NULL"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+            second = execute_formal_only_pipeline(base, dates["target_trade_date"])
+            conn = connect(base_dir=base)
+            try:
+                after_second = {
+                    table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in before
+                }
+                null_batch_runs_after = conn.execute(
+                    "SELECT COUNT(*) FROM strategy_runs WHERE batch_id IS NULL"
+                ).fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertEqual(first["formal_batch"]["status"], "complete")
+        self.assertFalse(first["formal_batch"]["reused"])
+        self.assertEqual(len(first["scanners"]), 6)
+        self.assertEqual(after_first["selection_batches"], before["selection_batches"] + 1)
+        self.assertEqual(after_first["strategy_runs"], before["strategy_runs"] + 6)
+        self.assertEqual(formal_runs, 6)
+        self.assertEqual(null_batch_runs, 0)
+        self.assertEqual(second["formal_batch"]["batch_id"], first["formal_batch"]["batch_id"])
+        self.assertTrue(second["formal_batch"]["reused"])
+        self.assertEqual(after_second, after_first)
+        self.assertEqual(null_batch_runs_after, null_batch_runs)
+
+    def test_execute_range_pipeline_runs_each_trade_day_once(self) -> None:
+        from run_daily import execute_range_pipeline
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            expected_days = [dates["target_trade_date"], dates["next_trade_date"], dates["t_plus_2"]]
+            with mock.patch("run_daily.execute_daily_pipeline", side_effect=lambda **kwargs: kwargs) as run_daily:
+                result = execute_range_pipeline(
+                    base_dir=base,
+                    start_date=expected_days[0],
+                    end_date=expected_days[-1],
+                    out_dir=base / "output",
+                )
+
+        self.assertEqual([call.kwargs["trade_date"] for call in run_daily.call_args_list], expected_days)
+        self.assertEqual(run_daily.call_count, len(expected_days))
+        self.assertTrue(run_daily.call_args_list[-1].kwargs["emit_reports"])
+        self.assertEqual(result["trade_date"], expected_days[-1])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            dates = create_sample_market_dbs(base)
+            with mock.patch("run_daily.execute_daily_pipeline", side_effect=lambda **kwargs: kwargs) as run_daily:
+                execute_range_pipeline(
+                    base_dir=base,
+                    start_date=dates["target_trade_date"],
+                    end_date=dates["target_trade_date"],
+                )
+        self.assertEqual(run_daily.call_count, 1)
+
+    def test_formal_only_cli_rejects_range(self) -> None:
+        import sys
+
+        from run_daily import main
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["run_daily.py", "--formal-only", "--range", "2026-08-10", "2026-08-10"],
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                main()
+
+        self.assertEqual(raised.exception.code, 2)
+
     def test_persist_watchlist_snapshot_is_idempotent_and_keeps_context(self) -> None:
         from mining.db import connect
         from mining.watchlist import persist_watchlist_snapshot
