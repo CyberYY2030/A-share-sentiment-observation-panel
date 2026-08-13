@@ -423,3 +423,72 @@
 - Scheduler terminal evidence in the log wins over a subsequently reused live PID. An over-budget worker without terminal evidence is `orphaned_manual_intervention` and keeps the exclusive key closed. A post-Popen state-publish failure terminates and waits for the child before returning `state_publish_failed`.
 - SQLite online-backup sandboxes proved the three UI states and a controlled-flow-only 08-11 fixture. The fixture copied the 08-10 stock/four-index shape into the sandbox, was explicitly marked non-real market data, made zero provider calls, and produced a `v2.5/close_final/complete` 08-11 batch with six formal runs. Its identical core-worker rerun grew no batch/run/candidate/pullback rows.
 - Evidence: focused 161 tests OK; full 348 tests OK (2 skipped); py_compile and diff check passed; browser console errors 0. Four production SHA-256 values equal their pre-task values. Report: `ops-harden-1a2-report.md` and `.json`.
+
+## 2026-08-12 OPS-HARDEN-1B controlled 08-11 production attempt
+
+- Status: `production_attempt_failed`; stopped after the one authorized core-worker invocation. No source, strategy, threshold, schema, task-control-flow, or historical batch change was made.
+- Task 0 passed: HEAD `f55107f`, only pre-existing user documentation changes were dirty, no in-scope production writer process or active core claim existed, and SQLite online backups of `a_share_mvp.db` and `mining_mvp.db` matched their sources before the attempt.
+- The exact single command ran for 3,369.6 seconds: `offline_daily_update.py --base-dir . --asof 2026-08-11 --target-day 2026-08-11 --domains stock index --timeout-sec 3600 --no-health`. Its one worker exhausted its budget while internally reporting three market attempts, ending terminal `no_launch / budget_exhausted`; `formal_attempt=0` and no separate formal command was run.
+- Failure layer: `market_quality` after an internal budget/control failure. The written 08-11 rows are 2,768 valid trades plus all four required indexes, but raw coverage is `0.532410... < 0.80`, status remains `known_bad_session`, and no complete formal batch exists. This is not a successful 08-11 activation.
+- Write-after evidence: only `a_share_mvp.db` changed (`kline_daily +2772`, all for 08-11); mining/concept/ETF hashes and tables are unchanged, batch id=3 remains one row, no 08-11 partial batch exists. No retry, standalone `run_daily.py`, browser acceptance, or new 1A.x repair was performed.
+- Evidence: `ops-harden-1b-20260812-1620/preflight-and-backup.json`, `postflight.json`, `worker-2026-08-11-first.log`, `ops-harden-1b-report.md`, and `.json`.
+
+## 2026-08-12 OPS-HARDEN-1A.3 provider circuit-breaker and low-frequency repair start
+
+- Goal: remove the deterministic per-symbol failing-provider retry and timed-out-thread saturation failure from the single existing market-day repair path; restore provider-stage passes, BaoStock-first stock repair, low-frequency defaults, hard timeout isolation, and compact provider summaries.
+- Maximum risk: treating a daemon-thread timeout as cancellation lets an unusable source retain its semaphore slots and turn the remaining universe into `in-flight limit reached`; a production rerun before that is fixed would repeat the 1B cascade.
+- First entry: add a red offline limiter/pass test around `repair_market_day_akshare.py`, then make the smallest repair-script and scheduler-default changes, prove them in SQLite online-backup copies and one bounded 20-code read-only probe only.
+- Boundary: no production write, no new OPS-HARDEN-1B, no formal/browser/concept/ETF operation; preserve the existing 1B failure record and all user-owned dirty files.
+
+## 2026-08-12 OPS-HARDEN-1A.3 provider circuit-breaker and low-frequency repair complete
+
+- Status: `ready_for_ops_harden_1b_1_review`; stopped before any production activation.
+- Provider control: the former daemon-thread limiter was removed. Stock repair now runs one process-isolated, provider-stage pass at a time: BaoStock first, then the dynamic remaining gap through Sina, then Eastmoney only after a successful same-run probe. Timeout/error circuits stop that source rather than emitting a saturation cascade.
+- Scheduler control: daily defaults are one worker and 0.45 seconds between request starts. The parent starts one repair child and records distinct started provider passes from compact `PROVIDER_SUMMARY`; it no longer restarts the same repair command three times. Runtime failures report actual remaining budget.
+- Evidence: the red import failure preceded the green 5,202-code circuit regression. Online-backup source/backup parity passed for all four databases. The controlled 08-11 copy skipped 2,768 complete rows, rejected a missing-amount row, then resumed the same gap with BaoStock only; four index codes remained present. The single allowed live probe was 20/20 complete at 0.45 seconds/request with one BaoStock worker.
+- Validation: focused `tests.test_backfill_rules tests.test_data_quality` 79 passed; full suite 352 passed, 2 skipped; `py_compile` and `git diff --check` passed. Production SHA-256 values are unchanged from Task 0.
+- Boundary: reports and sandbox evidence are under `output/screening-v2-work`; next action, if authorized, is a separately reviewed `OPS-HARDEN-1B.1`, never an automatic production retry.
+
+## 2026-08-12 OPS-HARDEN-1A.3 independent-review correction (P0/P1)
+
+- Status: `ready_for_ops_harden_1b_1_review`; no production action, network probe, or sandbox base copy was repeated.
+- P0: Eastmoney probe success now resolves only the actual persisted probe code. The full pass retains every other unresolved code; probe failure retains the whole gap.
+- P1: parent-owned 200-row checkpoints persist accepted rows during a long pass, retain guard rejections, and publish each pass/circuit summary immediately. Forced interruption/resume proof persisted 400 of 450 rows, then fetched exactly the remaining 50.
+- Error circuit semantics are consecutive provider-call errors; complete rows reset the counter and empty/invalid outcomes are explicit separate counters.
+- Correction validation: 5 focused tests passed; `tests.test_backfill_rules` 72 passed; full suite 357 passed, 2 skipped; `py_compile` and `git diff --check` passed. Four production hashes are unchanged and all `quick_check` results are `ok`.
+
+## 2026-08-12 OPS-HARDEN-1B.1 production invocation gate
+
+- Target: complete the real unresolved 2026-08-11 stock/index close-data gap through the single authorized BaoStock → Sina → probe-gated Eastmoney core invocation; only a raw `clean` or `usable_with_quarantine` result at `usable_ratio >= 0.90` and 4/4 required indexes may activate the formal v2.5 batch.
+- Order: preserve online-backup recovery points, run one `offline_daily_update.py` invocation with the authorized 5,400-second budget, then perform a new-process read-only postcondition audit. No alternate provider probe, repair command, or retry is authorized.
+- Maximum risk: a provider or outer deadline failure may leave partial but valid parent checkpoints. Preserve those checkpoints and report their real unresolved set; do not overwrite them through a second production invocation.
+
+## 2026-08-12 OPS-HARDEN-1B.1 one-shot production recovery
+
+- Status: `market_failed_with_progress`. One and only one 08-11 core invocation ran after four verified SQLite online backups; no source/test/threshold/schema change, Streamlit start, provider probe, manual repair, retry, commit, or push occurred.
+- Progress retained: BaoStock parent checkpoints added 770 valid `kline_daily` rows; 2,768 existing complete rows were skipped. The real unresolved set is 1,664 codes.
+- Stop reason: BaoStock opened a timeout circuit after 780 attempts; Sina opened its consecutive-error circuit after three `JSONDecodeError` calls; the Eastmoney probe failed (`RemoteDisconnected`). 08-11 remains 3,538/5,202, coverage ratio 0.680515 against baseline 5,199, `known_bad_session`, despite 4/4 required indices.
+- Formal boundary held: `formal_attempt=0`, mining hash/rows unchanged, no 08-11 batch/runs/candidates; reader remains on 08-10. THS and ETF hashes are unchanged. A new authorization is required before any further production action.
+
+## 2026-08-12 OPS-HARDEN-1A.4 single-code timeout isolation
+
+- Status: `ready_for_ops_harden_1b2_review`. This is source/test/temp-SQLite closure only; it did not repeat 1B.1, call a provider, write a production database, run formal, or start Streamlit.
+- A timeout now isolates the worker's active code: parent checkpoints delivered rows, kills the worker, preserves that code for fallback, and restarts the same provider for later non-terminal codes. Complete/empty/invalid/guard-rejected/checkpointed codes are not re-fetched.
+- Only three consecutive active-code timeouts open `timeout_threshold`; a complete row resets the streak. `PROVIDER_SUMMARY` records `timeout_codes`, `worker_restarts`, `codes_in`, `unresolved`, and `max_consecutive_errors`.
+- Evidence: Windows spawn regressions cover one timeout then continued success, separated timeouts, three consecutive timeouts, and 400-row temporary SQLite checkpoint/reopen. P0/P1 five passed; backfill rules 76 passed; full suite 361 passed, 2 skipped; compile/diff check passed.
+- Bound: maximum request-timeout wait before source fallback is 3 x 12 seconds, plus bounded worker terminate/spawn overhead; no infinite retry loop.
+
+## 2026-08-12 OPS-HARDEN-1B.2 checkpoint-resume production gate
+
+- Target: resume only the real 1,664-code 08-11 gap using the one authorized core invocation. The new online backups are the recovery point; only a raw `clean` or `usable_with_quarantine` result with 4/4 indexes and >=0.90 coverage may enter its formal-only stage.
+- Order: one wrapper retains the child process handle through exit and atomically records stdout, stderr, and OS rc. No second update, probe, manual repair, Streamlit, or formal command is authorized outside that child.
+- Maximum risk: provider failure can leave further valid checkpoints. Preserve them and report the exact unresolved set; never overwrite that progress through an automatic retry.
+
+## 2026-08-12 OPS-HARDEN-1B.2 checkpoint-resume production activation
+
+- Status: `completed_full_enough`; stopped after the sole authorized core invocation and the fresh-process read-only audit.
+- The wrapper retained its child process handle and wrote a reliable OS `returncode=0` plus complete stdout/stderr. It ran the exact authorized `offline_daily_update.py` command once, from `22:31:18+08:00` to `22:46:28+08:00`; no retry, standalone formal command, provider probe, Streamlit, code/test modification, commit, or push occurred.
+- Checkpoint continuation skipped the pre-existing 3,538 valid rows and processed the real 1,664-code gap. BaoStock checkpointed 1,642 valid rows; 22 code-level exclusions remain explicit (`18 provider_empty`, `3 provider_invalid`, `1 continuity_guard_rejected`). Sina saw only the dynamic 22-code remainder and circuit-broke after three errors; the one-code Eastmoney probe failed. These failures did not prevent the now-valid market gate.
+- 08-11 is `clean`: 5,180 valid of 5,202 stock-info codes, `coverage_ratio=0.9963454510482785` against a 5,199 baseline, `usable_ratio=1.0`, and all four required indices. Revalidation recorded `known_bad_session -> clean` using `cleared_after_raw_usable`.
+- The same child then made complete close-final v2.5 batch `4` (fingerprint `7ce37b9d0e6ed635802ad137e5d91f3b084c9c0dd4a78de6ebd8672204b09471`), six formal runs, and 359 candidates. The persisted reader now selects `2026-08-11`.
+- All four databases pass `quick_check`; THS and ETF hashes are byte-identical to preflight. Only the authorized a-share core/revalidation and mining formal tables changed. Evidence: `ops-harden-1b2-20260811-report.md` and `ops-harden-1b2-20260812-222901/`.

@@ -20,10 +20,10 @@ Then read only the files listed for that slice.
 - `app.py` is the Streamlit entrypoint. It only imports and calls `app_panel.main()`.
 - `app_panel.py` is the current main dashboard implementation. It contains auto-backfill checks, SQLite access, market sentiment calculations, intraday snapshot handling, and Streamlit rendering in one large module.
 - `backfill_orchestrator.py` starts long-running backfill scripts outside the Streamlit render thread and writes their output to `output/backfill_jobs/`.
-- `offline_daily_update.py` is the offline daily updater. It detects missing dates/domains across stock, index, concept, ETF, and mining outputs, then runs the needed backfill scripts with bounded retries. `daily_job.ps1` is the schedulable wrapper; it writes logs under `output/backfill_jobs/`, the latest health summary to `output/health_latest.md`, and an optional Telegram digest when `TG_BOT_TOKEN`/`TG_CHAT_ID` or ignored `data/notify_config.json` is configured.
-- `repair_market_day_akshare.py` repairs one market day of stock/index daily rows through AkShare fallback sources when the BaoStock path cannot fill a date.
+- `offline_daily_update.py` is the offline daily updater and the canonical outer repair entrypoint. In core mode it owns one close-ready target day, stock/index quality gates, one repair child, and the provider-free formal batch that follows a successful market gate. `daily_job.ps1` is the schedulable wrapper; it writes logs under `output/backfill_jobs/`, the latest health summary to `output/health_latest.md`, and an optional Telegram digest when `TG_BOT_TOKEN`/`TG_CHAT_ID` or ignored `data/notify_config.json` is configured.
+- `repair_market_day_akshare.py` is the bounded stock/index repair child. It classifies the true unresolved set, stages BaoStock → Sina → probed Eastmoney, isolates a timed-out symbol in a killable worker process, and checkpoints accepted rows in the parent. Do not launch it in parallel with the canonical outer updater.
 - `runtime_paths.py` centralizes local path resolution for `data/`, root-level legacy DBs, metrics CSVs, and runtime directories.
-- `run_daily.py` is the CLI entrypoint for the mining pipeline. It refreshes basics, runs scanners, persists candidates/outcomes, and emits reports.
+- `run_daily.py` is the CLI entrypoint for the mining pipeline. Its full path refreshes basics, runs scanners, persists candidates/outcomes, and emits reports; `--date <day> --formal-only` is the bounded provider-free path for one formal v2.5 close batch.
 - `mining/` is the newer modular package for strategy scanning and review UI.
 - `tests/` covers the mining pipeline, runtime paths, and Streamlit helper behavior with synthetic SQLite fixtures.
 
@@ -49,6 +49,13 @@ Mining flow:
 4. Registered scanners in `mining/scanners/` produce candidates.
 5. `backfill_outcomes()` writes forward returns to `outcomes`.
 6. `generate_markdown_report()` and `generate_excel_report()` write reports to `output/`.
+
+Formal-only close flow:
+
+1. `python run_daily.py --base-dir . --date YYYY-MM-DD --formal-only`
+2. Reuse the shared stock/index quality and universe contracts; quarantine rows stay excluded.
+3. Evaluate the capability registry and atomically persist one `v2.5/close_final/complete` batch.
+4. An identical fingerprint is a zero-growth reuse. No provider, legacy, outcome, watchlist, or report work runs in this mode.
 
 Data stores:
 
@@ -103,7 +110,7 @@ Opportunity/date-selection review:
 - `app_panel.py` functions `resolve_available_panel_close_date()` and `resolve_selected_opportunity_runtime()`.
 - `mining/streamlit_tabs/tab_scanner.py`
 - `run_daily.py`
-- `docs/superpowers/specs/2026-04-17-current-opportunity-mining-logic.md`
+- `docs/superpowers/specs/current-opportunity-selection-strategy.md`
 
 ## Usually Ignore
 
@@ -188,10 +195,16 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\daily_job.ps1 --dry-run --
 ## Long-Running Guardrails
 
 - For live data fetching, remote APIs, or bug reproduction that can block, do not keep retrying the same failing path indefinitely.
-- Default retry budget per interface is 3 attempts. If the same interface returns timeout, connection failure, empty payload, or the same parsing error 3 times, stop using that interface in the current turn and switch to a different source or fallback path.
+- Stock repair uses a consecutive provider-call circuit: one timed-out stock code is isolated and left unresolved, later codes continue after a worker restart, success resets the counter, and only three consecutive call errors switch the remaining set to the next provider.
+- Parent-owned SQLite checkpoints run every 200 accepted rows. Resume from the persisted unresolved set; never treat all existing rows as complete, never use `stock_count >= 2000` as success, and never throw away good checkpoints after a later timeout.
+- Tencent stock fallback is invalid when `amount=None`; reject it before persistence. Tencent index behavior is separate and must not be generalized to stocks.
+- Use one outer updater invocation and one stock worker at 0.45 seconds between request starts. Lowering request frequency cannot repair deterministic field mapping, stale completion criteria, or a worker lifecycle that cannot be killed.
 - If two different interfaces have both failed and the remaining path is high-cost, slow, or likely to repeat the same failure mode, stop and report the concrete error instead of continuing blind retries.
 - For long-running commands, set an explicit timeout whenever feasible and prefer short probe runs before full-range backfills.
 - If a command appears stuck, is making no observable progress, or leaves orphan child processes, stop it and report what was learned from the failure.
+- Treat task-created processes and temporary artifacts as owned resources. Record their PID/path at launch; at handoff either stop/delete them or explicitly state why they remain.
+- Validate command line, parent process, port, and task ownership before stopping anything. Never kill all `python.exe` or `node.exe`; current data writers and shared Codex/MCP services must remain untouched.
+- Reproducible browser profiles, acceptance database copies, and tool caches may be cleaned after the owner exits. Production logs, databases, screenshots/YAML, hashes, and reports are audit evidence and require a separate deletion decision.
 - When data cannot be fetched after bounded attempts, report:
   - which interfaces were tried
   - how many attempts were used

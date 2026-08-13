@@ -47,7 +47,7 @@ Data freshness, repair, or path behavior:
 
 Current opportunity-mining product logic:
 
-- `docs/superpowers/specs/2026-04-17-current-opportunity-mining-logic.md`
+- `docs/superpowers/specs/current-opportunity-selection-strategy.md`
 
 ## Important Local Data Boundaries
 
@@ -64,6 +64,24 @@ Current opportunity-mining product logic:
 - Startup freshness is split across `app_panel.py` and `offline_daily_update.py`: the panel detects visible gaps and starts background work; the offline updater owns the repair plan and domain-specific commands.
 - Close-mode date selection should follow real stock/index row coverage, not only a database max date. This keeps sentiment panels and opportunity mining on the same selectable close day.
 - Intraday/latest-quote opportunity results are for display. Historical candidates and outcomes are based on persisted close-data pipeline results unless a future product decision changes that boundary.
+
+## Market Repair Contract
+
+- Run one outer `offline_daily_update.py` invocation for one close-ready target day and the core `stock index` domains. Do not launch parallel direct repair children.
+- Completion is the shared row-quality postcondition, never a raw row-count threshold. Invalid or missing rows remain retryable; Tencent stock rows with `amount=None` are rejected rather than persisted as complete.
+- Keep the conservative production defaults: one market worker, a 0.45-second request-start interval, and SQLite checkpoints every 200 accepted rows.
+- A single-code timeout isolates only that code. Restart the same provider worker for later codes; switch provider only after three consecutive provider-call errors. A successful complete row resets the consecutive-error counter.
+- Resume from the persisted unresolved set. Do not refetch checkpointed complete rows, and do not discard good checkpoints after a later provider failure.
+- Run formal selection only after stock quality is `clean|usable_with_quarantine` and all four indices are present. On failure, preserve `PROVIDER_SUMMARY` and stop; never infer success from `rc=0` alone.
+- See `docs/runbook.md` and project lesson `ADATA-1`/`ADATA-2` for the incident root causes and operator response.
+
+## Agent Task Cleanup Contract
+
+- Every task that starts a process, browser daemon, local server, proxy, or temporary database copy owns its lifecycle. Record the PID/path when created and classify it at handoff as `keep` or `cleanup`.
+- Before completion, stop task-owned background processes and their verified children. Never kill by process name alone; validate command line, parentage, port, and task ownership. Shared Codex/MCP services and current production writers are out of scope.
+- Delete only reproducible caches and temporary profiles after their owning process exits. Preserve production databases, provider/job logs, screenshots/YAML, hashes, reports, and other audit evidence unless the user separately authorizes deletion.
+- Report what was stopped, what disk/memory was reclaimed, what was intentionally kept, and why. If evidence-like files are large, list their exact paths and sizes for a separate deletion decision.
+- Trigger-matched lesson: `ADATA-3`.
 
 ## Commands
 
@@ -107,6 +125,14 @@ Run opportunity-mining pipeline for a date range:
 python run_daily.py --base-dir . --range 2026-04-21 2026-04-22
 ```
 
+Run only the formal v2.5 A-E batch for one close-ready date:
+
+```powershell
+python run_daily.py --base-dir . --date 2026-08-10 --formal-only
+```
+
+`--formal-only` is the bounded production operation for formal selection. It does not call providers or run legacy, outcome, watchlist, or report work; identical input must reuse its fingerprint with zero growth.
+
 Run tests:
 
 ```powershell
@@ -127,7 +153,8 @@ python -m py_compile app.py app_panel.py runtime_paths.py backfill_orchestrator.
 - Make the smallest sufficient change that preserves product behavior and data integrity.
 - Prefer modifying existing files over adding parallel wrappers or duplicate scripts.
 - Do not run broad live backfills casually. Start with `--dry-run`, bounded date ranges, and explicit timeouts.
-- Do not retry the same external data source more than 3 times in one turn. Switch source or report the exact failure.
+- Do not repeat a failed production invocation blindly. Read its structured provider summary and unresolved set; the repair child itself owns the bounded three-consecutive-error provider switch.
+- Finish agent-created process and cache cleanup before reporting completion; do not leave acceptance servers, browser daemons, CDP proxies, or temporary database copies running without an explicit `keep` decision.
 - Before claiming success, run the smallest relevant verification command and report any command that could not be run.
 - Keep `AGENTS.md`, `CLAUDE.md`, and `README.md` aligned when project commands, data paths, or architecture boundaries change.
 

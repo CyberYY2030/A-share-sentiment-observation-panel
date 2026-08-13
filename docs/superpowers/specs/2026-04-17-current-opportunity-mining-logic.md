@@ -1,4 +1,6 @@
-# 当前机会挖掘逻辑清单（供与 Claude 讨论）
+# 历史机会挖掘逻辑清单（供与 Claude 讨论）
+
+> 2026-08-13 状态：本文件保留早期设计、评审与验收沿革，不再是当前运行口径。当前正式 A–E、数据质量、运营和验收边界见 `docs/superpowers/specs/current-opportunity-selection-strategy.md`；遇到冲突时以后者与现行代码为准。
 
 ## 1. 这份文档的目的
 

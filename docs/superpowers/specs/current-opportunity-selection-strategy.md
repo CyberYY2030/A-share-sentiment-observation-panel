@@ -1,6 +1,6 @@
 # 当前机会挖掘选股口径（v2.5）
 
-状态：当前真值；最后对齐于 R4。本文描述 `SCREENING_DEFINITION_VERSION` 与 capability registry 已定义的正式 A–E，不把命中数量、页面展示或历史价格路径当成收益有效性证明。
+状态：当前真值；最后对齐于 2026-08-13 完成的 2026-08-12 正常日更闭环。本文描述 `SCREENING_DEFINITION_VERSION` 与 capability registry 已定义的正式 A–E，不把命中数量、页面展示或历史价格路径当成收益有效性证明。
 
 ## 1. 数据、股票池与质量边界
 
@@ -8,7 +8,7 @@
 
 市场日先经过行级质量分类。`clean` 与允许带逐行隔离的可用日可以进入窗口；全市场坏日和 `known_bad_session` 被排除。确认停牌或可验证的 provider 停牌占位可维持历史价格连续性，但当日不可交易，不能成为当日候选；无有效成交、无效 OHLC 或缺失关键字段也不会被伪装成停牌。
 
-`2026-08-07` 的 397 股票行、约 7.64% 覆盖率属于 `known_bad_session` 的 fail-closed 反例，不是 close-final 输入。
+原型日质量合同以集中定义的 `0.80 / 0.95 / 0.90` 为边界：系统性坏日、覆盖不足和 present rows 可用率不足仍 fail closed；达到日级门槛但逐行不完整的股票继续 quarantine，绝不进入正式 universe。`2026-07-13` 的 5,199 行虽然数量完整，但没有有效成交且绝大多数是 provider 占位，是“行数不等于可用日”的 fail-closed 反例。
 
 ## 2. 正式 A–E 能力
 
@@ -34,17 +34,31 @@
 
 正式读取首先验证 batch schema，再选择同一交易日最新 complete batch。缺失 migration、缺列、损坏 schema、无 complete batch 或意外 SQL 异常都会显示结构化未定版/错误状态和空结果；不会回退到 unbatched、v2.0、legacy 或旧 batch 候选。日报和正式 Excel 也只读取 `close_final`。
 
+生产单日正式 A–E 批次使用专用入口：
+
+```powershell
+python run_daily.py --base-dir . --date YYYY-MM-DD --formal-only
+```
+
+该模式只运行正式 capability、原子持久化 close-final batch，并以 fingerprint 保证同输入复跑零增长；不会执行 legacy scanner、outcome 回填、watchlist、报告或 provider 抓取。目标日必须是已通过 stock/index 质量门禁的 close-ready 日期。
+
 ## 4. C 历史覆盖与冷启动
 
 C 在第一个有效 A complete batch 后即可对后续日期运行。面板显示 `a_history_coverage=N/60`：`N<60` 时标记 `bootstrapping/partial recall`，已有 C 候选继续展示，不能被表达成“今天没有机会”。
 
 当前面板普通读取不会现场回算或创建正式 batch。收盘后的有限最近日期追补是显式流程；60 日 A 历史冷启动是另一项授权：先在隔离库 dry-run，输出日期数、空榜数、候选数、fingerprint 与预计写入量；生产写入须另行授权，且不生成 outcomes。
 
-## 5. 隔离、浏览器和生产上线边界
+## 5. 隔离、浏览器和当前生产原型边界
 
 浏览器验收可通过 `SCREENING_BASE_DIR` 指向包含四个数据库副本的隔离目录；未设置该变量时保持仓库原有行为。R4 的浏览器、schema rehearsal、真实 smoke 与历史 dry-run 只使用隔离库，启动前后核对生产库 SHA-256。
 
-生产上线仍需单独授权，并依次执行：确认没有运行中的数据修复任务；备份并重哈希 `mining_mvp.db`；只执行 additive migration；运行 `integrity_check` 与 `foreign_key_check`；只对一个最新完整交易日做 canary；核对六个 formal runs、面板、日报和数据库增量；再另行授权日常 close-final 写入。60 日 A 历史冷启动继续保持单独授权。
+PROTO-2 在冻结 commit `7fd57fc` 上完成 2026-08-10 受控 canary：该日为 `usable_with_quarantine`，正式 batch id=2，六个 formal runs 共 470 条候选；同 fingerprint 复跑零增长。该历史证据继续保留。
+
+OPS-HARDEN-1B.2 已在冻结修复链上完成 2026-08-11 核心生产闭环：股票有效行 5,180、基准 eligible 5,199、coverage `0.9963454510`、usable `1.0`，四指数齐全；22 个尾项保持结构化未解决（18 `provider_empty`、3 `provider_invalid`、1 `continuity_guard_rejected`），不被伪装成 100% 完整。原子 revalidation 将旧闩锁转为 `clean`，正式 batch id=4、六个 formal runs、候选 359（strong trend 115、compression 1、momentum 204、second launch 0、base breakout 0、counter-trend RS 39），reader 选择日期为 2026-08-11。concept/ETF 仍按独立可选域展示，不阻断核心结果。
+
+2026-08-13 的正常启动进一步完成 2026-08-12 收盘闭环：股票有效行 5,179、coverage baseline 5,190、coverage `0.9978805395`、usable `1.0`、状态 `clean`，四指数齐全；23 个尾项保持在 provider/continuity 排除集合。正式 batch id=5、六个 formal runs、候选 356（strong trend 142、compression 6、momentum 125、second launch 1、base breakout 2、counter-trend RS 80）。这证明普通“打开才更新”链路能够在下一次启动时完成上一 close-ready 日，不要求当天夜间常驻调度器。
+
+收盘修复现采用质量感知未解决集合、单请求可杀死 worker、单代码超时隔离、连续三次 provider 调用错误切源、每 200 条 SQLite checkpoint 和单日 `--formal-only`。普通启动只针对最近已完成交易日运行一个全局互斥 writer；失败后需要显式重试，页面 rerun 不会并发重复写入。详细事故与恢复合同见 `docs/runbook.md`。
 
 ## 6. 解释边界
 

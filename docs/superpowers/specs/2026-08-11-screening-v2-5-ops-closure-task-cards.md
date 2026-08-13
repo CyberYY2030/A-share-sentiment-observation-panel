@@ -3,10 +3,28 @@
 - 日期：2026-08-11；最新裁决：2026-08-12
 - 上游线索：`output/screening-v2-work/independent-review/REVIEW.md`（独立只读复审；其中 07-13、rc=999 和当前日口径已被本文二次复审更正，不能直接当真值）
 - 原始冻结基线 commit：`534d546`（chore(runtime): freeze the actually-running version），分支 `codex/screening-v2`
-- 当前已提交基线 commit：`7fd57fc`（fix: restore provisional screening activation）
-- 状态：**PROTO-1、PROTO-1.1、PROTO-1.2 与 PROTO-2 的 2026-08-10 原型/canary 验收已完成，历史报告状态 `prototype_accepted_degraded_optional_data` 保留；但截至 2026-08-12，生产库没有 2026-08-11 stock/index 行及正式 v2.5/close_final batch。当前阶段状态修正为 `prototype_canary_accepted_ops_not_closed`，最新已完成交易日的自动运营闭环重新打开为 P0。**
-- 当前测试基线：`python -m unittest` = 324 tests, OK (skipped=2)
-- 续跑规则：PROTO-1/2 禁止重做，旧 OPS-1/2/3 章节只作根因背景，禁止原样续跑。下一唯一入口为本节 `OPS-HARDEN-1A`（源码/测试/沙箱，禁止生产写入）；通过独立复核后才可另行授权 `OPS-HARDEN-1B`（受控补齐 2026-08-11 并生成单日正式批次）。
+- 当前已提交运营修复基线 commit：`bcb3652da32cd2a7e0700b8efd4cb8d99f07be82`（fix(ops): isolate single-code provider timeouts）
+- 状态：**OPS-HARDEN-1B.2 已完成；2026-08-13 的普通启动又完成 2026-08-12 核心生产闭环。08-12 股票 5,179 条有效、四指数齐全、正式 batch id=5/356 candidates，状态 `clean`。当前无阻断性生产修复任务。**
+- 当前测试基线：`python -m unittest` = 361 tests, OK (skipped=2)
+- 续跑规则：PROTO-1/2 与 OPS-HARDEN-1A/1B 禁止重做，旧 OPS-1/2/3 章节只作根因背景。日常使用从普通面板启动；零写入验收使用四库 online-backup 副本和 `SCREENING_BASE_DIR`。下一交易日若失败，必须按 `docs/runbook.md` 的 provider summary/checkpoint 合同诊断，禁止盲目重复 invocation。
+
+---
+
+## 2026-08-12 OPS-HARDEN-1B.2 最终生产收口（最新状态，覆盖后文待办）
+
+- 冻结 HEAD：`bcb3652da32cd2a7e0700b8efd4cb8d99f07be82`；完整证据：`output/screening-v2-work/ops-harden-1b2-20260811-report.md`。
+- 单次授权 invocation 从真实 1,664-code unresolved 集合继续：BaoStock 接受 1,643 行，其中 1,642 行持久化、1 行 continuity guard 拒绝；Sina 只消费剩余 22 个代码；Eastmoney 探针失败后未进入全量。没有第二次生产重试。
+- 最终股票日为 `clean`：有效 5,180、coverage baseline 5,199、coverage `0.9963454510`、usable `1.0`；四指数齐全。22 个未解决代码为 18 `provider_empty`、3 `provider_invalid`、1 `continuity_guard_rejected`，全部排除于正式 universe。
+- revalidation 将旧 `known_bad_session` 原子转换为 `clean`。随后仅创建 batch id=4、`v2.5/close_final/complete`，六条 formal run 共 359 candidates；没有 partial batch，reader 日期为 2026-08-11。
+- 生产改动只发生于授权的 `a_share_mvp.db` 与 `mining_mvp.db`；THS/ETF 表和哈希不变，四库 `quick_check=ok`。
+- 此事故的确定性根因与成功恢复算法已固化在 `repair_market_day_akshare.py` 回归测试、`docs/runbook.md` 和项目 lessons `ADATA-1`/`ADATA-2`。当前没有需要继续执行的新 repair 卡；只需在下一正常收盘日做一次普通启动运营观察。
+
+### 2026-08-13 普通启动运营观察结论
+
+- 2026-08-12 close-ready 日通过正常面板触发的单一 core worker 完成：5,179 条有效股票、四指数、`clean`、coverage `0.9978805395`、usable `1.0`。
+- 同一 worker 在市场门禁后创建 batch id=5，六个 formal runs 共 356 candidates；该次正常运营观察已经完成，不再是待办。
+- 17:30 后刷新可处理当日 close；17:30 前或次日盘前处理上一完成交易日。系统保持“打开才更新”，不新增计划任务。
+- 上轮隔离验收遗留进程已在 2026-08-13 按精确 PID/命令行清理；生命周期纪律进入 `ADATA-3`。
 
 ---
 
@@ -132,7 +150,7 @@
 | `PROTO-1` | 统一原型门禁、可选域降级、health/UI/日期合同；测试和生产副本验收 | 禁止 | **已完成**，最终 commit `7fd57fc` |
 | `PROTO-2` | 用冻结 commit 做 08-10 原子 revalidation、正式 v2.5 batch、只读浏览器验收 | 仅 a_share/mining | **08-10 canary 已完成**；历史报告状态保留，不能外推为最新日闭环 |
 | `OPS-HARDEN-1A` | 修复核心域选择、180/240 预算死锁、no-launch 误诊、旧 `--range`、日期交集与全局互斥 | 禁止，先副本 | **历史：OPS-HARDEN-1A.1 已完成并停在 `ready_for_ops_harden_1b_review`；2026-08-12 更正：OPS-HARDEN-1A.2 补齐 worker 生命周期和 08-11 副本闭环后同样为 `ready_for_ops_harden_1b_review`。OPS-HARDEN-1B 仍须另行授权。** |
-| `OPS-HARDEN-1B` | 用冻结 1A commit 受控补齐 08-11，并生成/复验单日 formal batch | 另行授权，仅 a_share/mining | 08-11 指标与选股同日后，最新日闭环才可收口 |
+| `OPS-HARDEN-1B` | 用冻结 1A commit 受控补齐 08-11，并生成/复验单日 formal batch | **已完成**，仅 a_share/mining | OPS-HARDEN-1B.2 为 `completed_full_enough`；08-11 指标与选股同日，最新日闭环已收口 |
 | `OPS-HARDEN` | 历史缺口、可选域恢复、batch id=3 清理评估与长期完整性 | 另行规划 | 不阻断核心原型；不得混入 1A/1B |
 
 ### 四、PROTO-1（已完成，禁止重做）

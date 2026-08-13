@@ -1,6 +1,6 @@
 # 模式谱系总图（strategy / pattern map）
 
-把语料里**强势股模式 + 启动标准**（去重后 210 篇，占全部 526 篇的 40%，是最大主题）归成 7 个模式族。
+把语料里**强势股模式 + 启动标准**（去重后 210 篇，占全部 525 篇可用语料的 40%，是最大主题）归成 7 个模式族。
 这是"策略/模式/机会挖掘"这条线的总地图：先有全局，再逐族蒸馏成 `cards/setups/`，最后统一落地到 `mining/` 扫描器。
 
 > 落地性图例（按现有数据能做到哪一步）：
@@ -18,14 +18,14 @@
 
 ## 现有扫描器与缺口
 
-`mining/scanners/` 现有 4 个：`momentum_breakout`（启动/异动，含 early_strength 路径）、`rps_stock`（个股相对强度）、`rps_concept`（概念相对强度）、`cup_handle`（杯柄）。
+`mining/scanners/` 当前注册了 legacy/discovery 的 `momentum_breakout`、`rps_stock`、`rps_concept`、`trend_embryo`、`true_leader`、`launch_burst`，以及正式 v2.5 A–E 所用的 `strong_trend`、`second_launch`、`base_breakout`、`counter_trend_rs`。`mining.capabilities.CAPABILITY_REGISTRY` 是正式 A–E strategy id 的唯一清单；`cup_handle.py` 是未注册的旧模块。
 
-**关键缺口**：`mining/features.py` 全是单根 K 线计算（影线、突破、RPS），**没有涨停/连板高度/断板/反包识别**。
+**关键缺口**：`mining/features.py` 已有单日涨停和滚动新高判断；连续涨停高度、断板、空间板和反包仍没有统一的序列特征层。
 连板接力、反包、大长腿三族都卡在同一块基建——**涨停连板引擎**。它是这三族扫描器的共同地基，纯用现有日线（change_pct 判涨停、连板计数）即可建原型。
 
 ## 落地顺序（统一落地阶段执行）
 
-1. **涨停连板引擎**（`mining/features.py` 加 limit-up / 连板高度 / 断板 / "首次成为空间板" / 连板后调整收阴 的识别）——一块基建解锁连板接力、反包、大长腿三族。
+1. **涨停连板序列层**（在既有 `is_limit_up` 上增加连板高度 / 断板 / "首次成为空间板" / 连板后调整收阴 的识别）——一块基建解锁连板接力、反包、大长腿三族。
 2. **连板接力候选池扫描器**（SET-relay-new-king）——验证"卡片→扫描器"链路。
 3. **趋势/共振扫描器补强**（SET-trend-strong-leg → momentum_breakout 参数；SET-sector-resonance → rps_concept 抗跌维度）——改动小、复用现有。
 4. 反包**过滤标记**（SET-fanbao-low-odds）——给连板后调整票打 LOW-ODDS，防止把低胜率反包当机会。

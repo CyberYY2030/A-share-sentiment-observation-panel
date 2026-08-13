@@ -2,7 +2,7 @@
 
 本文件是**可移植的口径规格**，不是本仓库的实现说明。目的是把「什么算强趋势、什么算异动」这套定义完整交出去，供 A 股指标面板与机会挖掘模块复用。
 
-对应实现：`src/skills/strong_trend.py`、`src/skills/anomaly_scan.py`、`src/skills/price_history.py`，参数在 `config/skills/skill_c_strong_trend.yaml`、`config/skills/skill_d_anomaly.yaml`。实现细节以代码为准，**设计意图以本文件为准**。
+> 2026-08-13 说明：文中的 `src/skills/` 与 `config/skills/` 是原始可移植规格的外部实现路径，本仓库不包含这些文件，不能作为本项目的代码入口。当前 A 股正式选股以 `docs/superpowers/specs/current-opportunity-selection-strategy.md` 和 `mining.capabilities.CAPABILITY_REGISTRY` 为准；本文件只保留设计原则与移植注意事项。
 
 ---
 
