@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -116,6 +117,71 @@ class TradingCalendarTests(unittest.TestCase):
 
         self.assertEqual(result, {"status": "retained", "reason": "provider_calendar_unavailable"})
         self.assertEqual(after, before)
+
+    def test_calendar_refresh_uses_baostock_when_akshare_raises(self) -> None:
+        from offline_daily_update import _refresh_local_trade_calendar
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "offline_daily_update._akshare_trade_days", side_effect=RuntimeError("ak unavailable")
+        ), mock.patch(
+            "offline_daily_update._baostock_trade_days", return_value=["2026-08-20"]
+        ):
+            result = _refresh_local_trade_calendar(tmp, asof="2026-08-20")
+
+        self.assertEqual(result["status"], "updated")
+        self.assertEqual(result["source"], "baostock")
+
+    def test_calendar_refresh_retains_when_baostock_login_raises_after_akshare_empty(self) -> None:
+        from offline_daily_update import _refresh_local_trade_calendar
+
+        fake_baostock = mock.Mock()
+        fake_baostock.login.side_effect = RuntimeError("login unavailable")
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trade_calendar(tmp, source="akshare", open_dates=["2026-08-18"], coverage_end="2026-08-18")
+            before = calendar_path(tmp).read_bytes()
+            with mock.patch("offline_daily_update._akshare_trade_days", return_value=[]), mock.patch.dict(
+                sys.modules, {"baostock": fake_baostock}
+            ):
+                result = _refresh_local_trade_calendar(tmp, asof="2026-08-20")
+            after = calendar_path(tmp).read_bytes()
+
+        self.assertEqual(result["status"], "retained")
+        self.assertEqual(result["reason"], "provider_calendar_unavailable")
+        self.assertEqual(result["provider_error_types"], "baostock:RuntimeError")
+        self.assertEqual(after, before)
+        fake_baostock.login.assert_called_once_with()
+
+    def test_calendar_refresh_retains_old_bytes_when_both_loaders_raise(self) -> None:
+        from offline_daily_update import _refresh_local_trade_calendar
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trade_calendar(tmp, source="akshare", open_dates=["2026-08-18"], coverage_end="2026-08-18")
+            before = calendar_path(tmp).read_bytes()
+            with mock.patch("offline_daily_update._akshare_trade_days", side_effect=RuntimeError("ak unavailable")), mock.patch(
+                "offline_daily_update._baostock_trade_days", side_effect=ValueError("bao unavailable")
+            ):
+                result = _refresh_local_trade_calendar(tmp, asof="2026-08-20")
+            after = calendar_path(tmp).read_bytes()
+
+        self.assertEqual(result["status"], "retained")
+        self.assertEqual(result["reason"], "provider_calendar_unavailable")
+        self.assertEqual(result["provider_error_types"], "akshare:RuntimeError,baostock:ValueError")
+        self.assertEqual(after, before)
+
+    def test_calendar_refresh_exception_does_not_leave_calendar_tmp_file(self) -> None:
+        from offline_daily_update import _refresh_local_trade_calendar
+
+        with tempfile.TemporaryDirectory() as tmp:
+            write_trade_calendar(tmp, source="akshare", open_dates=["2026-08-18"], coverage_end="2026-08-18")
+            with mock.patch("offline_daily_update._akshare_trade_days", side_effect=RuntimeError("ak unavailable")), mock.patch(
+                "offline_daily_update._baostock_trade_days", side_effect=RuntimeError("bao unavailable")
+            ):
+                result = _refresh_local_trade_calendar(tmp, asof="2026-08-20")
+
+            temporary_paths = list(calendar_path(tmp).parent.glob("*.tmp"))
+
+        self.assertEqual(result["status"], "retained")
+        self.assertEqual(temporary_paths, [])
 
     def test_write_requires_provider_confirmed_coverage_end(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

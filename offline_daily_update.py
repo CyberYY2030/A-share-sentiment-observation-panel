@@ -723,12 +723,20 @@ def _akshare_trade_days(asof: str, days: int) -> list[str]:
 
 def _refresh_local_trade_calendar(base_dir: str | Path, *, asof: str) -> dict[str, str]:
     """Persist only provider-confirmed A-share open dates for panel read-only use."""
+    provider_error_types: list[str] = []
     for source, loader in (("akshare", _akshare_trade_days), ("baostock", _baostock_trade_days)):
-        dates = loader(asof, 10000)
+        try:
+            dates = loader(asof, 10000)
+        except Exception as exc:
+            provider_error_types.append(f"{source}:{type(exc).__name__}")
+            continue
         if dates:
             payload = write_trade_calendar(base_dir, source=source, open_dates=dates, coverage_end=asof)
             return {"status": "updated", "source": source, "coverage_end": str(payload["coverage_end"])}
-    return {"status": "retained", "reason": "provider_calendar_unavailable"}
+    retained = {"status": "retained", "reason": "provider_calendar_unavailable"}
+    if provider_error_types:
+        retained["provider_error_types"] = ",".join(provider_error_types)
+    return retained
 
 
 def resolve_expected_trade_days(
