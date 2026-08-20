@@ -71,6 +71,8 @@ def select_candidates_from_pullback_support(
                     "made_new_low_recent": bool(row.made_new_low_recent),
                     "reclaim_ma10": bool(row.reclaim_ma10),
                     "activity_expand": bool(row.activity_expand),
+                    "evaluator_rank": rank,
+                    "score": -float(rank),
                     "stop_signal": bool(row.state == PULLBACK_STATE_RETRIGGER),
                     "flag_strategies": "strong_trend",
                 },

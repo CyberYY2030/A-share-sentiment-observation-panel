@@ -485,7 +485,7 @@ class StrongTrendScanner(Scanner):
     strategy_id = "strong_trend"
     version = FORMAL_A_DEFINITION_VERSION
     kind = "stock"
-    description = "V2.5 absolute strong-trend definition with continuation and fresh-breakout paths."
+    description = "V2.6 absolute strong-trend definition with continuation and fresh-breakout paths."
     default_params = {"benchmark_code": "000852", "min_down_days": 3}
 
     def run(self, conn: sqlite3.Connection, trade_date: str) -> list[Candidate]:

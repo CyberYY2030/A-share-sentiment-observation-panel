@@ -35,3 +35,7 @@
 ## 完成条件
 
 定向含 R4/history 不少于99且全绿；全量不少于364且仅原2项 skip；编译、`git diff --check` 通过；五类 P1 复现转绿；20/20 回放非空且每能力每日≤20、B无重码、生产哈希不变。未同时满足则提交可审查候选但状态必须 `changes_incomplete`，禁止激活。清理任务 PID、临时 DB/cache，独立提交一个 commit，报告 `Lessons`。
+
+## 二审补正（代码先行，证据后置）
+
+`3b25fabe` 独立全量为375/375（原2 skip），但代码仍有两项 P1：日历把“最后开市日”误当“权威源确认到的自然日”，周一/长假后会 stale；C evaluator 顺序在共享 shortlist 中退化为 `sec_code`。写日历时显式传入 provider 查询成功的自然日 `coverage_end=asof`，`open_dates` 仍只含开市日；增加周一及长假测试。C 候选须携带稳定的 evaluator ranking score/order，使用与代码顺序相反的25股证明最终 Top20 与 evaluator 前20完全一致。同步把 `tab_scanner.py` 警告和 `strong_trend.py` 描述由 v2.5 改为 v2.6。先只提交代码/测试并独立复审；复审通过后才允许新 sandbox 做最终20日回放，禁止复用失效口径的14日诊断 sandbox。

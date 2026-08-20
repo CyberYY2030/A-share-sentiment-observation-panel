@@ -1856,7 +1856,7 @@ def render_scanner_tab(
     if selection_evidence.get("date_status") == "date_mismatch":
         st.error("date_mismatch：选择日期、实际评估日期与正式批次日期不一致，候选表已隐藏。")
     if selection_evidence.get("formal_batch_status") == "pending":
-        st.warning("等待正式批次：当日 v2.5 close_final/complete batch 尚不可用，候选为空。")
+        st.warning("等待正式批次：当日 v2.6 close_final/complete batch 尚不可用，候选为空。")
     elif selection_evidence["mode"] == "intraday_snapshot":
         st.warning("盘中临时结果：不会写入正式收盘候选或状态历史。")
     elif selection_evidence["mode"] == "close_pending":

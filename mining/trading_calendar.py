@@ -44,6 +44,7 @@ def write_trade_calendar(
     *,
     source: str,
     open_dates: Iterable[object],
+    coverage_end: object,
     retrieved_at: dt.datetime | None = None,
 ) -> dict[str, Any]:
     """Atomically persist provider-confirmed open dates; callers own provider access."""
@@ -52,6 +53,9 @@ def write_trade_calendar(
     dates = sorted({day for value in open_dates if (day := _parse_date(value))})
     if not dates:
         raise ValueError("calendar must contain at least one open date")
+    coverage = _parse_date(coverage_end)
+    if coverage is None or coverage < dates[-1]:
+        raise ValueError("coverage_end must be a provider-confirmed date at or after the last open date")
     observed = retrieved_at or dt.datetime.now(dt.timezone.utc)
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=dt.timezone.utc)
@@ -59,7 +63,7 @@ def write_trade_calendar(
         "schema_version": CALENDAR_SCHEMA_VERSION,
         "source": source,
         "retrieved_at": observed.isoformat(),
-        "coverage_end": dates[-1],
+        "coverage_end": coverage,
         "open_dates": dates,
     }
     path = calendar_path(base_dir)

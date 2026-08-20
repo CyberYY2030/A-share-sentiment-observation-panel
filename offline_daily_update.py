@@ -726,7 +726,7 @@ def _refresh_local_trade_calendar(base_dir: str | Path, *, asof: str) -> dict[st
     for source, loader in (("akshare", _akshare_trade_days), ("baostock", _baostock_trade_days)):
         dates = loader(asof, 10000)
         if dates:
-            payload = write_trade_calendar(base_dir, source=source, open_dates=dates)
+            payload = write_trade_calendar(base_dir, source=source, open_dates=dates, coverage_end=asof)
             return {"status": "updated", "source": source, "coverage_end": str(payload["coverage_end"])}
     return {"status": "retained", "reason": "provider_calendar_unavailable"}
 
