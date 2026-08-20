@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pandas as pd
 
-SCREENING_DEFINITION_VERSION = "v2.5"
+
+SCREENING_DEFINITION_VERSION = "v2.6"
+CAPABILITY_TOP_N = 20
 
 
 @dataclass(frozen=True)
@@ -83,3 +86,34 @@ def formal_definition(strategy_id: str) -> CapabilityDefinition:
 
 def visible_strategy_ids() -> tuple[str, ...]:
     return (*formal_strategy_ids(), *LEGACY_STRATEGY_IDS)
+
+
+def shortlist_capability_rows(rows: pd.DataFrame, *, top_n: int = CAPABILITY_TOP_N) -> pd.DataFrame:
+    """Deduplicate one capability before assigning its user-visible ranks.
+
+    Evaluators own eligibility.  This boundary only merges already eligible
+    subtypes, retains the strongest score, and makes the Top-N rule explicit.
+    """
+    if rows.empty:
+        return rows.copy()
+    result = rows.copy()
+    if "sec_code" not in result.columns:
+        raise ValueError("capability shortlist requires sec_code")
+    result["sec_code"] = result["sec_code"].astype(str).str.zfill(6)
+    score_source = result["score"] if "score" in result.columns else pd.Series(float("-inf"), index=result.index)
+    activity_source = result["activity_pct"] if "activity_pct" in result.columns else pd.Series(float("-inf"), index=result.index)
+    result["_score"] = pd.to_numeric(score_source, errors="coerce").fillna(float("-inf"))
+    result["_activity"] = pd.to_numeric(activity_source, errors="coerce").fillna(float("-inf"))
+    result = result.sort_values(["_score", "_activity", "sec_code"], ascending=[False, False, True], kind="stable")
+    if "event_subtype" in result.columns:
+        subtype_evidence = (
+            result.groupby("sec_code", sort=False)["event_subtype"]
+            .agg(lambda values: tuple(dict.fromkeys(str(value) for value in values if pd.notna(value))))
+        )
+        result = result.drop_duplicates("sec_code", keep="first")
+        result["subtype_evidence"] = result["sec_code"].map(subtype_evidence)
+    else:
+        result = result.drop_duplicates("sec_code", keep="first")
+    result = result.head(int(top_n)).copy()
+    result["capability_rank"] = range(1, len(result) + 1)
+    return result.drop(columns=["_score", "_activity"]).reset_index(drop=True)

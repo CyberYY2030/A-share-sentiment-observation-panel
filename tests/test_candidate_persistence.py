@@ -13,6 +13,41 @@ from tests._mining_test_helpers import create_sample_market_dbs
 
 
 class CandidatePersistenceTests(unittest.TestCase):
+    def test_capability_shortlist_removes_b_duplicates_and_the_twenty_first_row(self) -> None:
+        import pandas as pd
+
+        from mining.capabilities import shortlist_capability_rows
+
+        rows = pd.DataFrame(
+            [
+                {
+                    "sec_code": f"{600000 + index:06d}",
+                    "score": 100 - index,
+                    "activity_pct": 1.0,
+                    "event_subtype": "compression_launch" if index % 2 else "momentum_anomaly",
+                }
+                for index in range(1, 22)
+            ]
+            + [
+                {
+                    "sec_code": "600001",
+                    "score": 101.0,
+                    "activity_pct": 1.0,
+                    "event_subtype": "momentum_anomaly",
+                }
+            ]
+        )
+
+        selected = shortlist_capability_rows(rows)
+
+        self.assertEqual(len(selected), 20)
+        self.assertEqual(selected["capability_rank"].tolist(), list(range(1, 21)))
+        self.assertEqual(selected["sec_code"].nunique(), 20)
+        self.assertEqual(selected.iloc[0]["sec_code"], "600001")
+        self.assertEqual(
+            set(selected.iloc[0]["subtype_evidence"]), {"compression_launch", "momentum_anomaly"}
+        )
+
     @staticmethod
     def _context(
         fingerprint: str,
@@ -120,7 +155,7 @@ class CandidatePersistenceTests(unittest.TestCase):
 
             self.assertEqual("complete", persisted.status)
             self.assertEqual(
-                [(persisted.batch_id, "v2.5", "2026-08-05", "600004", "回调中")],
+                [(persisted.batch_id, "v2.6", "2026-08-05", "600004", "回调中")],
                 [
                     tuple(row)
                     for row in conn.execute(
@@ -486,7 +521,7 @@ class CandidatePersistenceTests(unittest.TestCase):
                     self.assertEqual(
                         6,
                         conn.execute(
-                            "SELECT COUNT(*) FROM candidates WHERE version='v2.5'"
+                            "SELECT COUNT(*) FROM candidates WHERE version='v2.6'"
                         ).fetchone()[0],
                     )
                     self.assertEqual(

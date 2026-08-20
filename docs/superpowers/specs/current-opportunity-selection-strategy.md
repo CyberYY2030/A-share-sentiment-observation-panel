@@ -1,6 +1,6 @@
-# 当前机会挖掘选股口径（v2.5）
+# 当前机会挖掘选股口径（v2.6）
 
-状态：当前真值；最后对齐于 2026-08-13 完成的 2026-08-12 正常日更闭环。本文描述 `SCREENING_DEFINITION_VERSION` 与 capability registry 已定义的正式 A–E，不把命中数量、页面展示或历史价格路径当成收益有效性证明。
+状态：当前真值；v2.5 批次保持历史只读，v2.6 以 capability 合并、去重后的 Top 20 为唯一展示与持久化边界。本文描述 `SCREENING_DEFINITION_VERSION` 与 capability registry 已定义的正式 A–E，不把命中数量、页面展示或历史价格路径当成收益有效性证明。
 
 ## 1. 数据、股票池与质量边界
 
@@ -16,13 +16,15 @@
 
 | 能力 | strategy_id | 定义与展示重点 |
 | --- | --- | --- |
-| A | `strong_trend` | 强趋势。只有 `continuation` 或 `fresh_breakout` 两条互斥路径；A2 同时要求新的收盘突破和仍接近 60 日高点，避免深跌反抽被当成突破。 |
-| B | `compression_launch`、`momentum_anomaly` | 异动启动。展示事件子类型、活跃度和分数。 |
-| C | `second_launch` | 回调支撑/再启动。只以先前已定版的 A 为资格来源；按强度和阶段筛选，正式候选只输出确认再启动状态。 |
-| D | `base_breakout` | 平台突破。展示箱体宽度、收缩、活跃度和突破幅度。 |
-| E | `counter_trend_rs` | 逆势强度。使用共享 benchmark 和相对强度序列，不由 UI 另行加载 benchmark。 |
+| A | `strong_trend` | 强趋势：`close>MA20>MA60`、两条均线不走弱、RPS20≥0.90；60 日高位距离和 MA20 乖离按板块硬门槛。fresh breakout 还需收盘突破、强收盘与活跃确认。 |
+| B | `compression_launch`、`momentum_anomaly` | 异动启动：两子策略合并评分并按代码去重。momentum 只认当日需求冲击；compression 的活跃度和 1 亿元成交额均为硬门槛。 |
+| C | `second_launch` | 回调支撑/再启动：点时价格路径证明 5–30 日前主升，A 历史仅作证据；近期创新低直接否决。 |
+| D | `base_breakout` | 平台突破：15–40 日平台、两次阻力触及、窄箱体与 ATR 收缩，再以强收盘、活跃度和成交额确认。 |
+| E | `counter_trend_rs` | 逆势强度。保留现有资格语义，参加能力级排名。 |
 
 市场背景只用于分组说明，不会为了弱市强制删除已经满足 A–E 定义的股票。弱市出现 A 空榜是合法结果。
+
+每个能力先合并其全部子策略，按 `sec_code` 保留最高分并记录 B 的 subtype evidence，再写入 `capability_rank=1..N`。每能力最多 20 条；不足不补位，空榜是有效结果。正式和盘中均调用同一 shortlist helper。盘中若上一预期交易日日线未覆盖，返回 `stale_history` 并展示最近正式日，不跨缺口计算。
 
 ## 3. 三种运行模式与页面语义
 

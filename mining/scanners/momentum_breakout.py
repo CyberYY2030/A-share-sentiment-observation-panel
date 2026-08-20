@@ -225,18 +225,14 @@ def evaluate_momentum_anomaly(
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Formal B/momentum path; A candidates are deliberately allowed to overlap."""
     p = {
-        "gain_main_lo": 6.0,
-        "gain_main_hi": 9.5,
+        "gain_main_lo": 5.0,
+        "gain_main_hi": 10.2,
         "gain_fast_lo": 7.0,
-        "gain_fast_hi": 13.0,
-        "high_over_open_min": 3.0,
-        "high_over_close_min": 5.0,
-        "shadow_latest_floor": -3.0,
+        "gain_fast_hi": 20.2,
+        "close_strength": 0.97,
+        "activity_pct_min": 0.80,
         "ret_5d_lo": 5.0,
-        "ret_5d_hi": 30.0,
-        "prior_pulse_min": 8.0,
-        "prior_shadow_min": 4.0,
-        "latest_gain_max": 5.0,
+        "ret_5d_hi": 25.0,
         **(params or {}),
     }
     diagnostics: dict[str, Any] = {"event_subtype": "momentum_anomaly", "skipped_reason_counts": {}}
@@ -265,37 +261,26 @@ def evaluate_momentum_anomaly(
             continue
         indexed = frame.assign(trade_date=frame["trade_date"].astype(str)).set_index("trade_date").reindex(dates)
         close = pd.to_numeric(indexed.get("adj_close"), errors="coerce")
-        raw_open = pd.to_numeric(indexed.get("open"), errors="coerce")
         raw_high = pd.to_numeric(indexed.get("high"), errors="coerce")
         derived_change = (close / close.shift(1) - 1.0) * 100.0
-        if not all(series.notna().iloc[-6:].all() for series in (close, raw_open, raw_high, derived_change)):
+        if not all(series.notna().iloc[-6:].all() for series in (close, raw_high, derived_change)):
             skipped["price_window_missing"] += 1
             continue
         current_change = float(derived_change.iloc[-1])
         ret_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
         recent_window_gain = (float(close.iloc[-1]) / float(close.iloc[-4]) - 1.0) * 100.0
         recent_spike = float(derived_change.iloc[-4:-1].max())
-        high_over_open = (float(raw_high.iloc[-1]) / float(raw_open.iloc[-1]) - 1.0) * 100.0
-        high_over_close = (float(raw_high.iloc[-1]) / float(close.iloc[-1]) - 1.0) * 100.0
+        close_strength = float(close.iloc[-1] / raw_high.iloc[-1]) if float(raw_high.iloc[-1]) > 0 else math.nan
         board = str(board_by_code.get(code) or "")
         fast_board = board in {"gem", "star"}
         gain = (
-            float(p["gain_fast_lo"]) < current_change < float(p["gain_fast_hi"])
+            float(p["gain_fast_lo"]) <= current_change <= float(p["gain_fast_hi"])
             if fast_board
-            else float(p["gain_main_lo"]) < current_change < float(p["gain_main_hi"])
+            else float(p["gain_main_lo"]) <= current_change <= float(p["gain_main_hi"])
         )
-        shadow = (
-            high_over_open > float(p["high_over_open_min"])
-            and high_over_close > float(p["high_over_close_min"])
-            and current_change > float(p["shadow_latest_floor"])
-        )
-        early_pulse = (
-            recent_spike >= float(p["prior_pulse_min"])
-            and high_over_close > float(p["prior_shadow_min"])
-            and current_change < float(p["latest_gain_max"])
-        )
-        in_path_range = float(p["ret_5d_lo"]) < ret_5d < float(p["ret_5d_hi"])
-        if not ((gain and in_path_range) or (shadow and in_path_range) or early_pulse):
+        in_path_range = float(p["ret_5d_lo"]) <= ret_5d <= float(p["ret_5d_hi"])
+        activity_ok = float(activity_by_code.at[code, "activity_pct"]) >= float(p["activity_pct_min"])
+        if not (gain and in_path_range and close_strength >= float(p["close_strength"]) and activity_ok):
             skipped["momentum_gate_failed"] += 1
             continue
         path = paths.loc[code] if not paths.empty and code in paths.index else None
@@ -310,11 +295,8 @@ def evaluate_momentum_anomaly(
                 "ret_5d": ret_5d,
                 "recent_window_gain_pct": recent_window_gain,
                 "recent_spike_max_pct": recent_spike,
-                "high_over_open_pct": high_over_open,
-                "high_over_close_pct": high_over_close,
-                "event_path": "+".join(
-                    name for name, matched in (("gain", gain), ("shadow", shadow), ("prior_pulse", early_pulse)) if matched
-                ),
+                "close_strength": close_strength,
+                "event_path": "demand_shock",
                 "activity_source": str(activity_by_code.at[code, "activity_source"]),
                 "activity_pct": float(activity_by_code.at[code, "activity_pct"]),
                 "path_context": path.path_context if path is not None else "常态",

@@ -59,17 +59,17 @@ def _event_context(*, mode: str = "close_final", activity: bool = True) -> Selec
 
 
 class EventActivityV2Tests(unittest.TestCase):
-    def test_compression_launch_uses_t_minus_one_activity_baseline_and_amount_is_diagnostic(self) -> None:
+    def test_compression_launch_uses_t_minus_one_activity_baseline_and_hard_amount_gate(self) -> None:
         context = _event_context()
         activity = build_event_activity(context)
         row = activity.rows.set_index("sec_code").loc["600001"]
         self.assertAlmostEqual(float(row["activity_ratio"]), 1.0)
 
         rows, diagnostics = evaluate_compression_launch(context)
-        self.assertEqual(set(rows["sec_code"]), {"600001", "300001"})
+        self.assertEqual(set(rows["sec_code"]), {"300001"})
         self.assertTrue(rows["event_subtype"].eq("compression_launch").all())
-        self.assertFalse(rows["amount_min_diagnostic"].any())
-        self.assertEqual(diagnostics["result_count"], 2)
+        self.assertTrue(rows["amount_min_diagnostic"].all())
+        self.assertEqual(diagnostics["result_count"], 1)
 
     def test_missing_activity_is_explicit_skip_reason(self) -> None:
         rows, diagnostics = evaluate_compression_launch(_event_context(activity=False))

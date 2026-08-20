@@ -16,6 +16,7 @@ from ..capabilities import (
     LEGACY_STRATEGY_IDS,
     SCREENING_DEFINITION_VERSION,
     formal_definitions,
+    shortlist_capability_rows,
     visible_strategy_ids,
 )
 from ..data_quality import (
@@ -779,7 +780,7 @@ def _live_formal_capability_rows(conn, context) -> tuple[pd.DataFrame, pd.DataFr
 
     try:
         strong = evaluate_strong_trend(context)
-        append_evaluation("strong_trend", strong.rows, strong.diagnostics, reference_column="close")
+        append_evaluation("strong_trend", strong.rows, strong.diagnostics, reference_column="reference_price")
     except Exception as exc:
         append_failure("strong_trend", exc)
 
@@ -832,10 +833,15 @@ def _live_formal_capability_rows(conn, context) -> tuple[pd.DataFrame, pd.DataFr
         append_evaluation("counter_trend_rs", rs_rows, rs_diagnostics)
     except Exception as exc:
         append_failure("counter_trend_rs", exc)
-    return (
-        pd.concat(output_frames, ignore_index=True, sort=False) if output_frames else pd.DataFrame(),
-        pd.DataFrame(status_rows),
-    )
+    combined = pd.concat(output_frames, ignore_index=True, sort=False) if output_frames else pd.DataFrame()
+    if not combined.empty:
+        selected_frames = []
+        for _, frame in combined.groupby("capability", sort=True):
+            selected = shortlist_capability_rows(frame)
+            selected["rank"] = selected["capability_rank"]
+            selected_frames.append(selected)
+        combined = pd.concat(selected_frames, ignore_index=True, sort=False)
+    return combined, pd.DataFrame(status_rows)
 
 
 def _formal_capability_view(
@@ -949,6 +955,20 @@ def _formal_capability_view(
     context = result.context
     if context is None or result.mode != MODE_INTRADAY:
         return waiting_view(result.reason)
+    clean_dates = {str(value) for value in context.diagnostics.get("clean_dates", [])}
+    # The selection context does not yet carry a local authoritative A-share
+    # calendar.  Never replace that missing truth with a weekday approximation.
+    expected_prior = context.diagnostics.get("expected_prior_trade_date")
+    if expected_prior is None or str(expected_prior) not in clean_dates:
+        rows, status, evidence = waiting_view(
+            "stale_history" if expected_prior is not None else "expected_trade_calendar_unavailable"
+        )
+        if not status.empty:
+            status["availability"] = "stale_history"
+        evidence["history_status"] = "stale_history"
+        evidence["expected_prior_trade_date"] = str(expected_prior) if expected_prior is not None else None
+        evidence["latest_formal_trade_date"] = _persisted_candidate_dates(conn)[-1] if _persisted_candidate_dates(conn) else None
+        return rows, status, evidence
 
     evidence = _selection_evidence(
         context,

@@ -1,0 +1,34 @@
+{
+  "definition_version": "v2.6",
+  "mode": "isolated_online_backup_replay",
+  "status": "blocked_partial",
+  "requested_usable_sessions": 20,
+  "completed_usable_sessions": 0,
+  "partial_attempt": {
+    "sandbox_batch_status": {
+      "v2.5_close_final_complete": 8,
+      "v2.6_close_final_failed": 6
+    },
+    "failed_dates": ["2026-07-20", "2026-07-21", "2026-07-22"],
+    "failure": "compression_launch: KeyError: activity_pct_min",
+    "disposition": "source corrected; fresh 20-session replay remains required"
+  },
+  "funnel": {
+    "universe": null,
+    "structure": null,
+    "trigger": null,
+    "eligible": null,
+    "top20": null,
+    "reason": "No v2.6 complete batch exists; values are intentionally not inferred from failed runs."
+  },
+  "capability_counts": null,
+  "b_subtype_dedup": null,
+  "data_gap_status": "formal production batches stop at 2026-08-17; 2026-08-18 partial and 2026-08-19 missing were not treated as close-ready.",
+  "source_sha256": {
+    "a_share_mvp.db": "77c4a00660fe9bc398a69a5dfda22fddae42faef0e4af11591c34187f35a6464",
+    "ths_concept.db": "837db4226ab1ab1f807163d8cec99ab35211e1d64371e682b7de30315f323b65",
+    "etf_mvp.db": "721ed4a41372b582189e93bd9363f343fc4eb9314aaed9f5a9a3005251a1bf28",
+    "mining_mvp.db": "ee2fd0419b3a0396ea471be364bbf63e8d543eb3c7affdc8169a7afe52d6e6cc"
+  },
+  "source_hash_before_equals_after": true
+}

@@ -657,7 +657,7 @@ class MiningUiSmokeTests(unittest.TestCase):
             finally:
                 conn.close()
 
-        self.assertEqual({"v2.5"}, set(loaded["version"]))
+        self.assertEqual({"v2.6"}, set(loaded["version"]))
         self.assertNotIn("000001", set(loaded["sec_code"]))
         self.assertEqual([trade_date], persisted_dates)
 
@@ -833,16 +833,16 @@ class MiningUiSmokeTests(unittest.TestCase):
                 conn.close()
 
         self.assertEqual(calls, 1)
-        self.assertEqual(first["mode"], "intraday_snapshot")
-        self.assertEqual(first["result_kind"], "provisional")
-        self.assertEqual(first["formal_batch_status"], "provisional")
+        self.assertEqual(first["mode"], "close_pending")
+        self.assertEqual(first["history_status"], "stale_history")
+        self.assertEqual(first["runtime_reason"], "expected_trade_calendar_unavailable")
         self.assertEqual(set(first_status["capability"]), {"A", "B", "C", "D", "E"})
-        self.assertEqual(set(first_status["availability"]), {"provisional"})
-        self.assertEqual(first["snapshot_source"], "injected_loader")
-        self.assertEqual(first["date_status"], "aligned")
-        self.assertEqual(repeated["result_kind"], "provisional")
+        self.assertEqual(set(first_status["availability"]), {"stale_history"})
+        self.assertIsNone(first["snapshot_source"])
+        self.assertEqual(first["date_status"], "batch_pending")
+        self.assertEqual(repeated["history_status"], "stale_history")
         self.assertEqual(len(first_rows), len(repeated_rows))
-        self.assertEqual(set(repeated_status["availability"]), {"provisional"})
+        self.assertEqual(set(repeated_status["availability"]), {"stale_history"})
         self.assertEqual(after, before)
 
     def test_complete_formal_batch_takes_priority_over_current_snapshot(self) -> None:

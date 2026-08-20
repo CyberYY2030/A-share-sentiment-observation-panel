@@ -349,7 +349,8 @@ def evaluate_compression_launch(
         "close_strength": 0.95,
         "vol_contract": 1.0,
         "activity_expand": 1.5,
-        "amount_min": 200_000_000,
+        "amount_min": 100_000_000,
+        "activity_pct_min": 0.80,
         **(params or {}),
     }
     diagnostics: dict[str, Any] = {"event_subtype": "compression_launch", "skipped_reason_counts": {}}
@@ -407,6 +408,7 @@ def evaluate_compression_launch(
         current_close = float(close.iloc[-1])
         current_high = float(high.iloc[-1])
         current_open = float(open_price.iloc[-1])
+        amount = pd.to_numeric(indexed.get("amount"), errors="coerce").iloc[-1] if "amount" in indexed.columns else math.nan
         recent_pct = returns.iloc[-1 - int(p["first_lookback"]) : -1]
         recent_activity = activity_series.iloc[-6:-1]
         base_activity = activity_series.iloc[-46:-6]
@@ -427,11 +429,13 @@ def evaluate_compression_launch(
             and expansion_ratio >= float(p["activity_expand"])
             and current_open <= previous_cluster_high
             and current_close > current_cluster_high
+            and float(activity_by_code.at[code, "activity_pct"]) >= float(p["activity_pct_min"])
+            and pd.notna(amount)
+            and float(amount) >= float(p["amount_min"])
         )
         if not qualifies:
             skipped["compression_gate_failed"] += 1
             continue
-        amount = pd.to_numeric(indexed.get("amount"), errors="coerce").iloc[-1] if "amount" in indexed.columns else math.nan
         path = paths.loc[code] if not paths.empty and code in paths.index else None
         rows.append(
             {

@@ -678,8 +678,6 @@ def classify_pullback_support_state(
     ma20 = _safe_float(row.get("ma20"))
     ma_long = _safe_float(row.get("ma_long"))
     shrink = _safe_float(row.get("shrink_ratio"))
-    below_long = math.isfinite(close) and math.isfinite(ma_long) and close < ma_long
-    below_ma20 = math.isfinite(close) and math.isfinite(ma20) and close < ma20
     made_new_low = _v2_bool(row.get("made_new_low_recent"))
     reclaim = _v2_bool(row.get("reclaim_ma10"))
     activity_expand = _v2_bool(row.get("activity_expand"))
@@ -689,18 +687,14 @@ def classify_pullback_support_state(
         and ma10 > 0
         and abs(close / ma10 - 1.0) <= 0.03
     )
-    prior_pullback = set(map(str, prior_states)).intersection(
-        {PULLBACK_STATE_PULLBACK, PULLBACK_STATE_READY}
-    )
-
     if not math.isfinite(pullback):
         return PULLBACK_STATE_PULLBACK
-    if pullback < -0.30 or (below_long and (made_new_low or below_ma20)):
+    if made_new_low or pullback < -0.20:
         return PULLBACK_STATE_BROKEN
     if pullback >= -0.05:
         return PULLBACK_STATE_EXTEND
     if reclaim and activity_expand:
-        return PULLBACK_STATE_RETRIGGER if prior_pullback else PULLBACK_STATE_READY
+        return PULLBACK_STATE_RETRIGGER
     if support_near_ma10 and math.isfinite(shrink) and shrink <= 0.70 and not made_new_low:
         return PULLBACK_STATE_READY
     return PULLBACK_STATE_PULLBACK
@@ -744,23 +738,43 @@ def _evaluate_pullback_row(
     adjusted_open = pd.to_numeric(indexed.get("adj_open", indexed.get("open")), errors="coerce")
     ma10 = close.rolling(10, min_periods=10).mean()
     ma20 = close.rolling(20, min_periods=20).mean()
-    ma_long = close.rolling(profile.long_window, min_periods=profile.long_window).mean()
+    ma_long = close.rolling(60, min_periods=60).mean()
     current_close = _series_value(close, len(close) - 1)
     current_ma10 = _series_value(ma10, len(ma10) - 1)
     current_ma20 = _series_value(ma20, len(ma20) - 1)
     current_ma_long = _series_value(ma_long, len(ma_long) - 1)
-    if not (math.isfinite(current_close) and math.isfinite(current_ma10) and math.isfinite(current_ma_long)):
+    if not (math.isfinite(current_close) and math.isfinite(current_ma10) and math.isfinite(current_ma20) and math.isfinite(current_ma_long)):
         return None
 
-    structure_index = clean_dates.index(first_structure_date)
-    window_close = close.iloc[structure_index:].dropna()
-    if window_close.empty:
+    if len(close) < 31:
         return None
-    peak_close = float(window_close.max())
-    peak_date = str(window_close.idxmax())
+    peak_window = close.iloc[-31:-5].dropna()
+    if peak_window.empty:
+        return None
+    peak_close = float(peak_window.max())
+    peak_date = str(peak_window.idxmax())
     peak_position = clean_dates.index(peak_date)
-    base_close = float(close.iloc[structure_index : peak_position + 1].min())
-    base_date = str(close.iloc[structure_index : peak_position + 1].idxmin())
+    base_window = close.iloc[max(0, peak_position - 30):peak_position + 1].dropna()
+    if base_window.empty:
+        return None
+    base_close = float(base_window.min())
+    base_date = str(base_window.idxmin())
+    fast_board = board_kind(code) in {"gem", "star"}
+    min_runup = 0.20 if fast_board else 0.15
+    max_pullback = 0.20 if fast_board else 0.15
+    min_pullback = 0.05
+    run_up_pct = peak_close / base_close - 1.0 if base_close > 0 else math.nan
+    pullback_pct = current_close / peak_close - 1.0 if peak_close > 0 else math.nan
+    pullback_days = len(close.loc[peak_date:].dropna()) - 1
+    if not (
+        math.isfinite(run_up_pct)
+        and run_up_pct >= min_runup
+        and math.isfinite(pullback_pct)
+        and -max_pullback <= pullback_pct <= -min_pullback
+        and 2 <= pullback_days <= 15
+        and current_close >= current_ma20 >= current_ma_long
+    ):
+        return None
     peak_volume = volume.iloc[max(0, peak_position - 4) : peak_position + 1].dropna()
     recent_volume = volume.tail(5).dropna()
     shrink_ratio = (
@@ -776,12 +790,9 @@ def _evaluate_pullback_row(
     )
     previous_close = _series_value(close, len(close) - 2)
     previous_ma10 = _series_value(ma10, len(ma10) - 2)
-    reclaim_ma10 = (
-        math.isfinite(previous_close)
-        and math.isfinite(previous_ma10)
-        and previous_close < previous_ma10
-        and current_close >= current_ma10
-    )
+    high = pd.to_numeric(indexed.get("adj_high", indexed.get("high")), errors="coerce")
+    breakout_3d = len(high.iloc[-4:-1].dropna()) == 3 and current_close > float(high.iloc[-4:-1].max())
+    reclaim_ma10 = current_close >= current_ma10 or current_close >= current_ma20 or breakout_3d
     previous_volume = volume.iloc[-6:-1].dropna()
     current_open = _series_value(adjusted_open, len(adjusted_open) - 1)
     activity_expand = (
@@ -789,12 +800,14 @@ def _evaluate_pullback_row(
         and current_close > current_open
         and len(previous_volume) == 5
         and math.isfinite(_series_value(volume, len(volume) - 1))
-        and _series_value(volume, len(volume) - 1) > float(previous_volume.mean())
+        and _series_value(volume, len(volume) - 1) >= float(previous_volume.mean()) * 1.2
     )
+    if made_new_low_recent or not activity_expand or not reclaim_ma10:
+        return None
     row: dict[str, Any] = {
         "sec_code": str(code).zfill(6),
         "sec_name": sec_name,
-        "first_structure_date": first_structure_date,
+        "first_structure_date": base_date,
         "a_qualified_date": min(a_dates) if a_dates else None,
         "a_qualified_once": bool(a_dates),
         "strength_tier": strength_tier,
@@ -802,10 +815,10 @@ def _evaluate_pullback_row(
         "main_rise_base_date": base_date,
         "peak_close": peak_close,
         "peak_date": peak_date,
-        "run_up_pct": peak_close / base_close - 1.0 if base_close > 0 else math.nan,
+        "run_up_pct": run_up_pct,
         "adj_close": current_close,
         "reference_price": current_close,
-        "pullback_pct": current_close / peak_close - 1.0 if peak_close > 0 else math.nan,
+        "pullback_pct": pullback_pct,
         "ma10": current_ma10,
         "ma20": current_ma20,
         "ma_long": current_ma_long,
@@ -814,6 +827,7 @@ def _evaluate_pullback_row(
         "dist_ma_long": current_close / current_ma_long - 1.0 if current_ma_long > 0 else math.nan,
         "shrink_ratio": shrink_ratio,
         "pullback_negative_days": pullback_negative_days,
+        "pullback_days": pullback_days,
         "made_new_low_recent": made_new_low_recent,
         "reclaim_ma10": reclaim_ma10,
         "activity_expand": activity_expand,
@@ -860,14 +874,9 @@ def evaluate_pullback_support(
     rows: list[dict[str, Any]] = []
     for code, frame in context.bars.groupby(context.bars["sec_code"].astype(str).str.zfill(6), sort=True):
         qualifying_a_dates = {date for date in a_pool.get(code, set()) if date in window_dates}
-        if not qualifying_a_dates:
-            skipped["never_in_a_qualified_pool"] += 1
-            continue
-        # C is defined by a prior formal A result, not by the legacy shared-MA
-        # proxy.  The earliest qualifying A date is also the start of this C
-        # structure window, keeping the displayed start inside the frozen
-        # 60-session eligibility horizon.
-        first_structure_date = min(qualifying_a_dates)
+        # Historical A is evidence only; v2.6 eligibility comes from the
+        # point-in-time price path computed below.
+        first_structure_date = clean_dates[-31] if len(clean_dates) >= 31 else clean_dates[0]
         row = _evaluate_pullback_row(
             frame,
             code=code,
@@ -880,10 +889,16 @@ def evaluate_pullback_support(
             strength_tier=tiers.get(code),
         )
         if row is None:
-            skipped["current_indicator_history_missing"] += 1
+            skipped["v26_price_path_gate_failed"] += 1
             continue
         rows.append(row)
-    result = pd.DataFrame(rows)
+    result = pd.DataFrame(rows, columns=[
+        "sec_code", "sec_name", "first_structure_date", "a_qualified_date", "a_qualified_once",
+        "strength_tier", "main_rise_base", "main_rise_base_date", "peak_close", "peak_date",
+        "run_up_pct", "adj_close", "reference_price", "pullback_pct", "ma10", "ma20", "ma_long",
+        "dist_ma10", "dist_ma20", "dist_ma_long", "shrink_ratio", "pullback_negative_days",
+        "pullback_days", "made_new_low_recent", "reclaim_ma10", "activity_expand", "state",
+    ])
     if not result.empty:
         state_order = {
             PULLBACK_STATE_RETRIGGER: 0,

@@ -19,12 +19,12 @@ from . import Candidate, Scanner, register
 FORMAL_A_DEFINITION_VERSION = SCREENING_DEFINITION_VERSION
 _A_OUTPUT_COLUMNS = [
     "sec_code", "sec_name", "reference_price", "strength_tier", "rank_band", "score",
-    "rps10_pct", "rps20_pct", "near_high_pct", "separation_pct", "liquidity_pct",
+    "rps10_pct", "rps20_pct", "near_high_pct", "separation_pct", "liquidity_pct", "activity_pct",
     "ret10", "ret20", "ma10", "ma20", "ma60", "ma20_slope_5", "atr20", "near_high_distance_atr",
     "rolling_high_20", "rolling_high_60", "prior_close_high_20", "near_high_profile", "strength_age",
     "first_seen_as_of", "maturity_evidence", "amount_health", "activity_contraction_at_high",
     "ranking_profile", "path_context", "gate_valid_trade", "gate_structure",
-    "gate_ma20_slope", "gate_ret10", "gate_ret20", "gate_rps20",
+    "gate_ma20_slope", "gate_ma60_slope", "gate_ret10", "gate_ret20", "gate_rps20", "gate_extension",
     "gate_near_high", "gate_liquidity", "gate_path",
 ]
 
@@ -87,7 +87,7 @@ def _stock_metric_rows(context: SelectionContext, dates: list[str], history: _AH
     result["reference_price"] = history.metrics["close"].loc[current].reindex(codes).to_numpy()
     result["valid_trade"] = history.gates["valid_trade"].loc[current].reindex(codes).to_numpy()
     for name in (
-        "ret10", "ret20", "ma10", "ma20", "ma60", "atr20", "rolling_high_20", "rolling_high_60",
+        "ret10", "ret20", "ma10", "ma20", "ma60", "atr20", "rolling_high_20", "rolling_high_60", "high", "activity_pct",
         "prior_close_high_20", "liquidity_raw", "amount_health", "ma20_slope_5", "ma60_slope_10",
         "continuous_60", "continuous_70", "halt_ratio_60", "halt_ratio_70", "resumption_watch",
     ):
@@ -125,10 +125,11 @@ def _separation_raw(bars: pd.DataFrame, benchmark_returns: pd.Series | None, dat
 
 def _first_failed_gate(row: pd.Series) -> str | None:
     for column, label in (
-        ("gate_valid_trade", "valid_trade"), ("gate_structure", "close_ma10_ma20"),
-        ("gate_ma20_slope", "ma20_slope_5"), ("gate_ret10", "ret10"), ("gate_ret20", "ret20"),
+        ("gate_valid_trade", "valid_trade"), ("gate_structure", "close_ma20_ma60"),
+        ("gate_ma20_slope", "ma20_slope_5"), ("gate_ma60_slope", "ma60_slope_10"),
+        ("gate_ret10", "ret10"), ("gate_ret20", "ret20"),
         ("gate_rps20", "rps20_pct"), ("gate_near_high", "near_high"),
-        ("gate_liquidity", "liquidity_pct"), ("gate_path", "a_path"),
+        ("gate_liquidity", "liquidity_pct"), ("gate_extension", "extension"), ("gate_path", "a_path"),
     ):
         if not bool(row.get(column, False)):
             if column == "gate_near_high" and row.get("near_high_profile") == "missing_atr20":
@@ -219,40 +220,40 @@ def _a_tier_history(context: SelectionContext, dates: list[str]) -> _AHistory:
     rps20_pct = ret20.where(rps_pool).rank(axis=1, pct=True, method="average")
     liquidity_raw = amount.where(valid_trade).shift(1).rolling(20, min_periods=16).median()
     liquidity_pct = liquidity_raw.where(rps_pool).rank(axis=1, pct=True, method="average")
+    activity_ratio = amount.where(valid_trade) / amount.where(valid_trade).shift(1).rolling(20, min_periods=20).mean()
+    activity_pct = activity_ratio.where(rps_pool).rank(axis=1, pct=True, method="average")
     valid_amount = amount.where(valid_trade)
     amount_health = valid_amount.rolling(20, min_periods=20).median() / valid_amount.rolling(60, min_periods=60).median()
     atr_coverage = atr20.notna().where(rps_pool).sum(axis=1) / rps_pool.sum(axis=1).replace(0, math.nan)
     use_atr = atr_coverage.ge(0.98)
-    near_high_distance_atr = (high20 - close) / atr20
-    near_high_raw = -near_high_distance_atr
     thresholds = pd.Series(
-        {code: 0.88 if board_kind(code) in {"gem", "star"} else 0.92 for code in codes}
+        {code: 0.85 if board_kind(code) in {"gem", "star"} else 0.90 for code in codes}
     )
-    near_by_board = close.div(high20).ge(thresholds, axis="columns")
-    gate_near_high = near_high_distance_atr.le(2.5)
-    gate_near_high.loc[~use_atr, :] = near_by_board.loc[~use_atr, :]
+    near_by_board = close.div(high60).ge(thresholds, axis="columns")
+    gate_near_high = near_by_board
+    near_high_distance_atr = (high60 - close) / atr20
+    near_high_raw = close.div(high60)
+    extension_limit = pd.Series(
+        {code: 1.25 if board_kind(code) in {"gem", "star"} else 1.15 for code in codes}
+    )
+    gate_extension = close.div(ma20).le(extension_limit, axis="columns")
     shared = (
         valid_trade
-        & close.gt(ma10)
-        & ma10.gt(ma20)
-        & ma20.gt(ma20.shift(5))
-        & ret10.gt(0)
-        & ret20.gt(0)
-        & rps20_pct.ge(0.80)
+        & close.gt(ma20)
+        & ma20.gt(ma60)
+        & ma20.ge(ma20.shift(5))
+        & ma60.ge(ma60.shift(10))
+        & rps20_pct.ge(0.90)
         & gate_near_high
-        & liquidity_pct.ge(0.40)
+        & gate_extension
     )
     continuation = (
         shared
         & complete_70
-        & ma20.gt(ma60)
-        & ma60.ge(ma60.shift(10))
         & halt.astype(float).rolling(70, min_periods=70).mean().le(0.20)
     )
     continuation_extra = (
         complete_70
-        & ma20.gt(ma60)
-        & ma60.ge(ma60.shift(10))
         & halt.astype(float).rolling(70, min_periods=70).mean().le(0.20)
     )
     fresh_breakout = (
@@ -260,15 +261,15 @@ def _a_tier_history(context: SelectionContext, dates: list[str]) -> _AHistory:
         & ~continuation
         & complete_60
         & close.ge(prior_close_high20)
-        & close.ge(0.85 * high60)
-        & rps10_pct.ge(0.80)
+        & close.div(high).ge(0.97)
+        & activity_pct.ge(0.80)
         & halt.astype(float).rolling(60, min_periods=60).mean().le(0.20)
     )
     fresh_breakout_extra = (
         complete_60
         & close.ge(prior_close_high20)
-        & close.ge(0.85 * high60)
-        & rps10_pct.ge(0.80)
+        & close.div(high).ge(0.97)
+        & activity_pct.ge(0.80)
         & halt.astype(float).rolling(60, min_periods=60).mean().le(0.20)
     )
     tiers = pd.DataFrame(pd.NA, index=dates, columns=codes, dtype="object")
@@ -276,13 +277,15 @@ def _a_tier_history(context: SelectionContext, dates: list[str]) -> _AHistory:
         tiers=tiers.mask(continuation, "continuation").mask(fresh_breakout, "fresh_breakout"),
         gates={
             "valid_trade": valid_trade,
-            "structure": close.gt(ma10) & ma10.gt(ma20),
-            "ma20_slope": ma20.gt(ma20.shift(5)),
-            "ret10": ret10.gt(0),
-            "ret20": ret20.gt(0),
-            "rps20": rps20_pct.ge(0.80),
+            "structure": close.gt(ma20) & ma20.gt(ma60),
+            "ma20_slope": ma20.ge(ma20.shift(5)),
+            "ma60_slope": ma60.ge(ma60.shift(10)),
+            "ret10": ret10.notna(),
+            "ret20": ret20.notna(),
+            "rps20": rps20_pct.ge(0.90),
             "near_high": gate_near_high,
-            "liquidity": liquidity_pct.ge(0.40),
+            "liquidity": liquidity_pct.notna(),
+            "extension": gate_extension,
             "continuation": continuation,
             "fresh_breakout": fresh_breakout,
             "continuation_extra": continuation_extra,
@@ -290,6 +293,7 @@ def _a_tier_history(context: SelectionContext, dates: list[str]) -> _AHistory:
         },
         metrics={
             "close": close,
+            "high": high,
             "ma10": ma10,
             "ma20": ma20,
             "ma60": ma60,
@@ -304,6 +308,7 @@ def _a_tier_history(context: SelectionContext, dates: list[str]) -> _AHistory:
             "rps10_pct": rps10_pct,
             "rps20_pct": rps20_pct,
             "liquidity_pct": liquidity_pct,
+            "activity_pct": activity_pct,
             "liquidity_raw": liquidity_raw,
             "amount_health": amount_health,
             "near_high_distance_atr": near_high_distance_atr,
@@ -362,38 +367,32 @@ def evaluate_strong_trend(
     base["liquidity_pct"] = base["liquidity_raw"].where(rps_pool_mask).rank(pct=True, method="average")
     atr_population = base[rps_pool_mask & base["continuous_60"].fillna(False)]
     atr_coverage = float(atr_population["atr20"].notna().mean()) if not atr_population.empty else 0.0
-    use_atr = atr_coverage >= 0.98
-    base["near_high_profile"] = "atr20" if use_atr else base["sec_code"].map(
-        lambda code: "board_fallback_fast" if board_kind(code) in {"gem", "star"} else "board_fallback_main"
-    )
-    if use_atr:
-        base["near_high_distance_atr"] = (base["rolling_high_20"] - base["reference_price"]) / base["atr20"]
-        base["near_high_raw"] = -base["near_high_distance_atr"]
-        base["gate_near_high"] = base["near_high_distance_atr"].le(2.5)
-        base.loc[base["near_high_distance_atr"].isna(), "near_high_profile"] = "missing_atr20"
-    else:
-        base["near_high_distance_atr"] = pd.NA
-        threshold = base["sec_code"].map(lambda code: 0.88 if board_kind(code) in {"gem", "star"} else 0.92)
-        base["near_high_raw"] = base["reference_price"] / base["rolling_high_20"]
-        base["gate_near_high"] = base["near_high_raw"].ge(threshold)
+    base["near_high_profile"] = "board_60d"
+    base["near_high_distance_atr"] = (base["rolling_high_60"] - base["reference_price"]) / base["atr20"]
+    base["near_high_raw"] = base["reference_price"] / base["rolling_high_60"]
+    threshold = base["sec_code"].map(lambda code: 0.85 if board_kind(code) in {"gem", "star"} else 0.90)
+    base["gate_near_high"] = base["near_high_raw"].ge(threshold)
     base["near_high_pct"] = cross_section_percentile(base["near_high_raw"])
 
     separation, separation_available, down_days_used = _separation_raw(context.bars, context.benchmark_returns, dates, min_down_days)
     base = base.merge(separation, on="sec_code", how="left")
     base["separation_pct"] = cross_section_percentile(base["separation_raw"]) if separation_available else pd.NA
     base["gate_valid_trade"] = base["valid_trade"].fillna(False)
-    base["gate_structure"] = base["reference_price"].gt(base["ma10"]) & base["ma10"].gt(base["ma20"])
-    base["gate_ma20_slope"] = base["ma20_slope_5"].gt(0)
-    base["gate_ret10"] = base["ret10"].gt(0)
-    base["gate_ret20"] = base["ret20"].gt(0)
-    base["gate_rps20"] = base["rps20_pct"].ge(0.80)
-    base["gate_liquidity"] = base["liquidity_pct"].ge(0.40)
-    shared = base[["gate_valid_trade", "gate_structure", "gate_ma20_slope", "gate_ret10", "gate_ret20", "gate_rps20", "gate_near_high", "gate_liquidity"]].all(axis=1)
+    base["gate_structure"] = base["reference_price"].gt(base["ma20"]) & base["ma20"].gt(base["ma60"])
+    base["gate_ma20_slope"] = base["ma20_slope_5"].ge(0)
+    base["gate_ma60_slope"] = base["ma60_slope_10"].ge(0)
+    base["gate_ret10"] = base["ret10"].notna()
+    base["gate_ret20"] = base["ret20"].notna()
+    base["gate_rps20"] = base["rps20_pct"].ge(0.90)
+    base["gate_liquidity"] = base["liquidity_pct"].notna()
+    extension_limit = base["sec_code"].map(lambda code: 1.25 if board_kind(code) in {"gem", "star"} else 1.15)
+    base["gate_extension"] = base["reference_price"].div(base["ma20"]).le(extension_limit)
+    shared = base[["gate_valid_trade", "gate_structure", "gate_ma20_slope", "gate_ma60_slope", "gate_ret10", "gate_ret20", "gate_rps20", "gate_near_high", "gate_liquidity", "gate_extension"]].all(axis=1)
     tier_history = history_a.tiers
     latest_tiers = tier_history.reindex(columns=base["sec_code"]).loc[str(context.trade_date)]
     continuation = base["sec_code"].map(latest_tiers).eq("continuation")
     fresh_breakout = base["sec_code"].map(latest_tiers).eq("fresh_breakout")
-    base["gate_path"] = continuation | fresh_breakout
+    base["gate_path"] = (continuation | fresh_breakout) & shared
     base["strength_tier"] = pd.NA
     base.loc[continuation, "strength_tier"] = "continuation"
     base.loc[fresh_breakout, "strength_tier"] = "fresh_breakout"
@@ -413,9 +412,9 @@ def evaluate_strong_trend(
 
     skipped = Counter()
     for gate, label in (("gate_valid_trade", "invalid_or_untradable_today"), ("gate_structure", "short_medium_structure_failed"),
-                        ("gate_ma20_slope", "ma20_slope_failed"), ("gate_ret10", "ret10_failed"),
+                        ("gate_ma20_slope", "ma20_slope_failed"), ("gate_ma60_slope", "ma60_slope_failed"), ("gate_ret10", "ret10_failed"),
                         ("gate_ret20", "ret20_failed"), ("gate_rps20", "rps20_failed"),
-                        ("gate_near_high", "near_high_failed"), ("gate_liquidity", "liquidity_failed"),
+                        ("gate_near_high", "near_high_failed"), ("gate_liquidity", "liquidity_failed"), ("gate_extension", "extension_failed"),
                         ("gate_path", "a_path_failed")):
         skipped[label] = int((~base[gate].fillna(False)).sum())
     skipped["halt_ratio_exceeded"] = int(
@@ -424,7 +423,7 @@ def evaluate_strong_trend(
     skipped["resumption_watch"] = int(base["resumption_watch"].fillna(False).sum())
     eligible = base[base["strength_tier"].notna()].copy()
     diagnostics.update({
-        "atr20_coverage": atr_coverage, "near_high_profile": "atr20" if use_atr else "board_fallback",
+        "atr20_coverage": atr_coverage, "near_high_profile": "board_60d",
         "separation_available": separation_available, "down_days_used": down_days_used,
         "rps_pool_count": len(rps_pool), "skipped_reason_counts": {key: value for key, value in sorted(skipped.items()) if value},
         "diagnostic_rows": base.loc[base["strength_tier"].isna(), ["sec_code", "first_failed_gate"] + [column for column in base.columns if column.startswith("gate_")]].to_dict("records"),

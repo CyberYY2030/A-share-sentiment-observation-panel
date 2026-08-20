@@ -11,10 +11,12 @@ from typing import Any, Iterable, Sequence
 import pandas as pd
 
 from .capabilities import (
+    CAPABILITY_TOP_N,
     SCREENING_DEFINITION_VERSION,
     formal_definition,
     formal_definitions,
     formal_strategy_ids,
+    shortlist_capability_rows,
 )
 from .db import connect, now_str
 from .scanners import Candidate
@@ -248,6 +250,72 @@ def _candidates_from_rows(
     return tuple(candidates)
 
 
+def _shortlist_capability_results(results: Iterable[CapabilityResult]) -> tuple[CapabilityResult, ...]:
+    """Apply the one A–E Top-20 contract after subtype evaluation, before persistence."""
+    provided = tuple(results)
+    selected_by_strategy: dict[str, list[Candidate]] = {item.strategy_id: [] for item in provided}
+    by_capability: dict[str, list[Candidate]] = {}
+    for item in provided:
+        definition = formal_definition(item.strategy_id)
+        by_capability.setdefault(definition.capability, []).extend(item.candidates)
+
+    for capability, candidates in by_capability.items():
+        def score(candidate: Candidate) -> tuple[float, float, str]:
+            features = candidate.features
+            try:
+                primary = float(features.get("score", float("-inf")))
+            except (TypeError, ValueError):
+                primary = float("-inf")
+            try:
+                activity = float(features.get("activity_pct", float("-inf")))
+            except (TypeError, ValueError):
+                activity = float("-inf")
+            return primary, activity, str(candidate.sec_code).zfill(6)
+
+        ranked = shortlist_capability_rows(pd.DataFrame(
+            {
+                "candidate": candidates,
+                "sec_code": [str(item.sec_code).zfill(6) for item in candidates],
+                "score": [score(item)[0] for item in candidates],
+                "activity_pct": [score(item)[1] for item in candidates],
+                "event_subtype": [item.features.get("event_subtype") for item in candidates],
+            }
+        ))
+        for row in ranked.itertuples(index=False):
+            candidate = row.candidate
+            code = str(candidate.sec_code).zfill(6)
+            rank = int(row.capability_rank)
+            features = dict(candidate.features)
+            features["capability_rank"] = rank
+            if capability == "B":
+                features["subtype_evidence"] = tuple(row.subtype_evidence)
+            selected_by_strategy[candidate.strategy_id].append(
+                Candidate(
+                    strategy_id=candidate.strategy_id,
+                    version=candidate.version,
+                    trade_date=candidate.trade_date,
+                    sec_type=candidate.sec_type,
+                    sec_code=code,
+                    sec_name=candidate.sec_name,
+                    entry_price=candidate.entry_price,
+                    features=features,
+                    rank=rank,
+                )
+            )
+
+    return tuple(
+        CapabilityResult(
+            item.strategy_id,
+            tuple(selected_by_strategy[item.strategy_id]),
+            item.universe_size,
+            item.status if item.status not in {"ok", "empty"} else ("ok" if selected_by_strategy[item.strategy_id] else "empty"),
+            item.error_msg,
+            item.state_rows,
+        )
+        for item in provided
+    )
+
+
 def evaluate_formal_capabilities(conn: sqlite3.Connection, context: Any) -> tuple[CapabilityResult, ...]:
     """Evaluate A–E once from the supplied shared close-final context."""
     universe_size = len(context.universe)
@@ -329,7 +397,7 @@ def evaluate_formal_capabilities(conn: sqlite3.Connection, context: Any) -> tupl
         append_rows("counter_trend_rs", rows)
     except Exception as exc:
         append_failure("counter_trend_rs", exc)
-    return tuple(results)
+    return _shortlist_capability_results(results)
 
 
 def _failed_batch(
@@ -411,6 +479,18 @@ def _validate_results(results: Iterable[CapabilityResult]) -> tuple[CapabilityRe
             candidate_codes = {str(candidate.sec_code).zfill(6) for candidate in result.candidates}
             if not candidate_codes.issubset(set(state_codes)):
                 raise ValueError("second_launch candidate has no matching state row")
+    by_capability: dict[str, list[Candidate]] = {}
+    for result in ordered:
+        by_capability.setdefault(formal_definition(result.strategy_id).capability, []).extend(result.candidates)
+    for capability, candidates in by_capability.items():
+        codes = [str(candidate.sec_code).zfill(6) for candidate in candidates]
+        ranks = sorted(candidate.rank for candidate in candidates if candidate.rank is not None)
+        if len(codes) > CAPABILITY_TOP_N:
+            raise ValueError(f"{capability} exceeds capability Top {CAPABILITY_TOP_N}")
+        if len(codes) != len(set(codes)):
+            raise ValueError(f"{capability} has duplicate candidate sec_code")
+        if ranks != list(range(1, len(ranks) + 1)):
+            raise ValueError(f"{capability} ranks are not contiguous")
     return ordered
 
 
@@ -426,7 +506,7 @@ def persist_close_final_batch(
     if str(context.mode) != "close_final" or not context.input_fingerprint:
         return _failed_batch(conn, context, "close_final mode and input_fingerprint are required")
     try:
-        results = _validate_results(capability_results)
+        results = _validate_results(_shortlist_capability_results(capability_results))
     except Exception as exc:
         return _failed_batch(conn, context, str(exc))
 

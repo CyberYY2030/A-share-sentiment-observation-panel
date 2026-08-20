@@ -56,7 +56,36 @@ def _context() -> SelectionContext:
 
 
 class PullbackStateMachineTests(unittest.TestCase):
-    def test_five_state_boundaries_and_retrigger_requires_prior_final_state(self) -> None:
+    def test_v26_c_accepts_a_price_path_without_a_history(self) -> None:
+        dates = pd.bdate_range("2025-01-02", periods=150).strftime("%Y-%m-%d").tolist()
+        rows = []
+        for index, trade_date in enumerate(dates):
+            if index < 125:
+                close = 10.0
+            elif index < 144:
+                close = 10.0 + (index - 125) * 0.1
+            elif index == 144:
+                close = 14.0
+            else:
+                close = [13.2, 13.1, 13.0, 12.9, 13.28][index - 145]
+            rows.append({
+                "sec_code": "600001", "trade_date": trade_date, "adj_open": close * 0.99,
+                "adj_high": close * 1.01, "adj_low": close * 0.99, "adj_close": close,
+                "volume": 240.0 if index == 149 else (20.0 if index >= 145 else 100.0),
+            })
+        context = SelectionContext(
+            bars=pd.DataFrame(rows), universe=pd.DataFrame([{"sec_code": "600001", "sec_name": "PathOnly"}]),
+            trade_date=dates[-1], mode="close_final", as_of=dates[-1], price_as_of=dates[-1],
+            metadata_as_of=dates[-1], trend_profile="P120", data_status="ready", diagnostics={"clean_dates": dates},
+        )
+
+        result = evaluate_pullback_support(context, a_qualified_dates={})
+
+        self.assertEqual(result.rows["sec_code"].tolist(), ["600001"])
+        self.assertFalse(result.rows.iloc[0]["a_qualified_once"])
+        self.assertEqual(result.rows.iloc[0]["state"], PULLBACK_STATE_RETRIGGER)
+
+    def test_v26_c_states_retrigger_on_confirmed_price_path_and_veto_recent_low(self) -> None:
         base = {
             "pullback_pct": -0.12,
             "adj_close": 100.0,
@@ -73,22 +102,20 @@ class PullbackStateMachineTests(unittest.TestCase):
         self.assertEqual(classify_pullback_support_state(base), PULLBACK_STATE_READY)
         self.assertEqual(classify_pullback_support_state({**base, "pullback_pct": -0.31}), PULLBACK_STATE_BROKEN)
         trigger = {**base, "reclaim_ma10": True, "activity_expand": True}
-        self.assertEqual(classify_pullback_support_state(trigger), PULLBACK_STATE_READY)
+        self.assertEqual(classify_pullback_support_state(trigger), PULLBACK_STATE_RETRIGGER)
         self.assertEqual(
-            classify_pullback_support_state(trigger, prior_states=(PULLBACK_STATE_PULLBACK,)),
-            PULLBACK_STATE_RETRIGGER,
+            classify_pullback_support_state({**trigger, "made_new_low_recent": True}),
+            PULLBACK_STATE_BROKEN,
         )
 
-    def test_eligibility_requires_shared_five_day_structure_and_a_pool_not_legacy_flags(self) -> None:
+    def test_v26_c_does_not_require_historical_a_and_rejects_an_unqualified_price_path(self) -> None:
         context = _context()
         result = evaluate_pullback_support(
             context,
             a_qualified_dates={"600001": [context.trade_date]},
         )
-        self.assertEqual(result.rows["sec_code"].tolist(), ["600001"])
-        self.assertTrue(result.rows.iloc[0]["a_qualified_once"])
-        self.assertIn(result.rows.iloc[0]["first_structure_date"], context.diagnostics["clean_dates"][-60:])
-        self.assertEqual(result.diagnostics["skipped_reason_counts"], {"never_in_a_qualified_pool": 1})
+        self.assertTrue(result.rows.empty)
+        self.assertEqual(result.diagnostics["skipped_reason_counts"], {"v26_price_path_gate_failed": 2})
 
     def test_legacy_state_writer_is_disabled_for_intraday_and_close_final(self) -> None:
         context = _context()

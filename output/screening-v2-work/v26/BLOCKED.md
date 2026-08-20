@@ -1,0 +1,5 @@
+# Blocked
+
+- `stale_history` needs an authoritative local A-share expected-trading-day calendar. Existing helpers either call a provider or fall back to weekdays, both outside this task's allowed boundary. Intraday therefore fails closed with `expected_trade_calendar_unavailable` and shows the latest formal date; no weekday approximation is used.
+- The 20-session sandbox replay was stopped after task-owned PID 47792 made no progress for about three minutes. Its partial v2.6 batches exposed `compression_launch: KeyError: activity_pct_min`; the source was corrected and covered by synthetic tests, but no complete 20-session evidence may be claimed until a fresh replay completes.
+- Full suite result: `364` run, `5` failures, `1` error, `2` skipped. Four R4/history assertions still intentionally seed or replay frozen v2.5 contracts while current selection is v2.6; one legacy `launch_burst` amount boundary was repaired, and the remaining frozen fixture CSV hash mismatch is unrelated to a writable v2.6 source file. No old v2.5 fixture or historical batch was rewritten to force green.

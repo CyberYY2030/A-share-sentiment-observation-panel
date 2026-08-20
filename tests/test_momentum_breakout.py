@@ -12,8 +12,8 @@ class MomentumBreakoutV2Tests(unittest.TestCase):
         context = _event_context()
         context.diagnostics["simulated_a_members"] = {"600001"}
         rows, diagnostics = evaluate_momentum_anomaly(context)
-        self.assertEqual(set(rows["sec_code"]), {"600001", "300001"})
+        self.assertEqual(set(rows["sec_code"]), {"300001"})
         self.assertTrue(rows["event_subtype"].eq("momentum_anomaly").all())
-        self.assertTrue(rows["event_path"].str.contains("gain").all())
-        self.assertEqual(diagnostics["result_count"], 2)
-        self.assertEqual({candidate.sec_code for candidate in select_momentum_anomaly_from_context(context)}, {"600001", "300001"})
+        self.assertTrue(rows["event_path"].eq("demand_shock").all())
+        self.assertEqual(diagnostics["result_count"], 1)
+        self.assertEqual({candidate.sec_code for candidate in select_momentum_anomaly_from_context(context)}, {"300001"})

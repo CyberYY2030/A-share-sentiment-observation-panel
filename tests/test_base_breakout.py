@@ -22,7 +22,7 @@ def _base_context() -> SelectionContext:
             elif index < 144:
                 close = 15.0 + (0.02 if index % 2 else -0.02)
             else:
-                close = 16.4
+                close = 16.1
             closes.append(close)
         for index, trade_date in enumerate(dates):
             close = closes[index]
@@ -47,7 +47,7 @@ def _base_context() -> SelectionContext:
                     "adj_close": close,
                     "change_pct": (close / pre_close - 1.0) * 100.0,
                     "turnover_ratio": 2.0 + (0.2 if code == "600001" and index == len(dates) - 1 else 0.0),
-                    "amount": 100_000_000.0,
+                    "amount": 500_000_000.0 if code == "600001" and index == len(dates) - 1 else 100_000_000.0,
                 }
             )
     return SelectionContext(
@@ -81,21 +81,33 @@ class BaseBreakoutTests(unittest.TestCase):
         self.assertNotIn("600002", set(rows["sec_code"]))
         self.assertGreaterEqual(diagnostics["skipped_reason_counts"]["base_breakout_gate_failed"], 1)
 
+    def test_v26_rejects_a_25_percent_wide_main_board_box(self) -> None:
+        context = _base_context()
+        target = context.bars["sec_code"].eq("600001")
+        target_dates = context.bars.loc[target, "trade_date"].tolist()
+        for index in range(len(target_dates) - 2, len(target_dates) - 41, -7):
+            mask = target & context.bars["trade_date"].eq(target_dates[index])
+            context.bars.loc[mask, ["low", "adj_low"]] = 11.0
+
+        rows, _ = evaluate_base_breakout(context)
+
+        self.assertNotIn("600001", set(rows["sec_code"]))
+
     def test_output_order_is_the_documented_sort_order(self) -> None:
         context = _base_context()
         extra = context.bars[context.bars["sec_code"].eq("600001")].copy()
         extra["sec_code"] = "600003"
         extra.loc[extra.index[-1], "turnover_ratio"] = 5.0
-        extra.loc[extra.index[-1], "amount"] = 500_000_000.0
+        extra.loc[extra.index[-1], "amount"] = 600_000_000.0
         context.bars = pd.concat([context.bars, extra], ignore_index=True)
         context.universe = pd.concat(
             [context.universe, pd.DataFrame([{"sec_code": "600003", "sec_name": "Second", "board": "main"}])],
             ignore_index=True,
         )
         rows, _ = evaluate_base_breakout(context)
-        self.assertEqual(rows["sec_code"].tolist(), ["600003", "600001"])
+        self.assertEqual(rows["sec_code"].tolist(), ["600003"])
         candidates = select_base_breakout_from_context(context)
-        self.assertEqual([candidate.rank for candidate in candidates], [1, 2])
+        self.assertEqual([candidate.rank for candidate in candidates], [1])
 
     def test_change_pct_null_does_not_block_adjusted_price_breakout(self) -> None:
         context = _base_context()

@@ -20,12 +20,7 @@ class StrongTrendTests(unittest.TestCase):
                 if code == "600001":
                     close = 10.0 * (1.005 ** index)
                 elif code == "300996":
-                    if index < 40:
-                        close = 15.0
-                    elif index < 60:
-                        close = 15.0 - (index - 40) * 0.25
-                    else:
-                        close = 10.0 + (index - 60) * 0.26
+                    close = 15.0 * (1.005 ** index)
                 else:
                     close = 10.0 * (0.998 ** index)
                 closes.append(close)
@@ -42,7 +37,12 @@ class StrongTrendTests(unittest.TestCase):
                         "adj_close": close,
                         "close": close,
                         "pre_close": pre_close,
-                        "amount": 1_000_000_000.0 + (100_000_000.0 if code in {"600001", "300996"} else 0.0),
+                        "row_status": "confirmed_halt" if code == "300996" and 10 <= index <= 24 else "valid_trade",
+                        "amount": (
+                            3_000_000_000.0
+                            if code == "300996" and index == len(dates) - 1
+                            else 1_000_000_000.0 + (100_000_000.0 if code in {"600001", "300996"} else 0.0)
+                        ),
                         "volume": 1_000_000.0,
                     }
                 )
@@ -129,7 +129,7 @@ class StrongTrendTests(unittest.TestCase):
         self.assertGreater(history.metrics["near_high_distance_atr"].at[context.trade_date, "300996"], 2.5)
         self.assertFalse(history.gates["near_high"].at[context.trade_date, "300996"])
         failed = {row["sec_code"]: row["first_failed_gate"] for row in evaluation.diagnostics["diagnostic_rows"]}
-        self.assertIn(failed["300996"], {"ma20_slope_5", "near_high", "a_path"})
+        self.assertIn(failed["300996"], {"close_ma20_ma60", "ma20_slope_5", "near_high", "a_path"})
 
     def test_weak_market_can_publish_an_empty_strong_trend_list(self) -> None:
         context, benchmark = self._context()
