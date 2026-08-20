@@ -1,0 +1,16 @@
+{
+  "status": "changes_incomplete",
+  "source_hash_unchanged": true,
+  "smoke": {
+    "trade_date": "2026-07-20",
+    "status": "complete",
+    "counts": {"A": 20, "B": 20, "C": 1, "D": 5, "E": 20},
+    "b_unique_codes": 20
+  },
+  "replay": {
+    "requested_sessions": 20,
+    "completed_sessions": 1,
+    "blocked_after": "2026-07-20",
+    "reason": "sequential runner ended after first checkpoint without stdout/stderr diagnostic"
+  }
+}

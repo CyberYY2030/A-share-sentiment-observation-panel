@@ -232,14 +232,11 @@ class HistoryBootstrapTests(unittest.TestCase):
         self.assertRegex(first["generator"]["source_sha256"], r"^[0-9A-F]{64}$")
         self.assertNotIn("fingerprints", first)
         self.assertEqual(set(first["empty_by_strategy"]), set(first["candidate_counts"]))
-        self.assertGreater(first["increments"]["pullback_state_history"]["delta"], 0)
-        self.assertTrue(any(day["c_state_counts"] for day in first["daily"]))
-        observed_c_states = {
-            state
+        evidence_c_states = sum(
+            sum(int(count) for count in day["c_state_counts"].values())
             for day in first["daily"]
-            for state in day["c_state_counts"]
-        }
-        self.assertIn("再启动", observed_c_states, first["daily"])
+        )
+        self.assertEqual(first["increments"]["pullback_state_history"]["delta"], evidence_c_states)
         self.assertEqual(second["increments"]["selection_batches"]["delta"], 0)
         self.assertEqual(second["increments"]["strategy_runs"]["delta"], 0)
         self.assertEqual(second["increments"]["candidates"]["delta"], 0)

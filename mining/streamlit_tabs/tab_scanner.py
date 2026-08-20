@@ -43,6 +43,7 @@ from ..scanners.rps_stock import (
 )
 from ..universe import build_universe
 from ..reports import compute_market_regime
+from ..trading_calendar import previous_trade_date
 from ..quote_snapshot import QuoteSnapshotAdapter, QuoteSnapshotResult
 from ..selection_batches import latest_complete_batch, selection_batch_schema_state
 from ..selection_runtime import (
@@ -853,6 +854,8 @@ def _formal_capability_view(
     runtime: SelectionRuntime | None = None,
     snapshot_loader: SnapshotLoader | None = None,
     intraday_enabled: bool | None = None,
+    expected_prior_trade_date: str | None = None,
+    calendar_reason: str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
     """Read a close-final batch, or evaluate one current-session provisional snapshot."""
     current = now or dt.datetime.now(CHINA_TZ)
@@ -933,7 +936,6 @@ def _formal_capability_view(
     current_time = current_cn.time().replace(tzinfo=None)
     in_session = (
         current_cn.date().isoformat() == str(trade_date)
-        and current_cn.weekday() < 5
         and ((dt.time(9, 30) <= current_time <= dt.time(11, 30)) or (dt.time(13, 0) <= current_time < dt.time(15, 0)))
     )
     if intraday_enabled is not True or not in_session or snapshot_loader is None:
@@ -956,12 +958,10 @@ def _formal_capability_view(
     if context is None or result.mode != MODE_INTRADAY:
         return waiting_view(result.reason)
     clean_dates = {str(value) for value in context.diagnostics.get("clean_dates", [])}
-    # The selection context does not yet carry a local authoritative A-share
-    # calendar.  Never replace that missing truth with a weekday approximation.
-    expected_prior = context.diagnostics.get("expected_prior_trade_date")
+    expected_prior = expected_prior_trade_date
     if expected_prior is None or str(expected_prior) not in clean_dates:
         rows, status, evidence = waiting_view(
-            "stale_history" if expected_prior is not None else "expected_trade_calendar_unavailable"
+            "stale_history" if expected_prior is not None else (calendar_reason or "expected_trade_calendar_unavailable")
         )
         if not status.empty:
             status["availability"] = "stale_history"
@@ -1801,6 +1801,7 @@ def render_scanner_tab(
         try:
             market_summary = _load_market_regime_summary(status_conn, today_date)
             run_status_df = _load_strategy_run_status(status_conn, today_date)
+            calendar = previous_trade_date(base_dir, current_date=today_date, now=now)
             formal_today_df, capability_status_df, selection_evidence = _formal_capability_view(
                 status_conn,
                 today_date,
@@ -1809,6 +1810,8 @@ def render_scanner_tab(
                 runtime=formal_runtime,
                 snapshot_loader=shared_snapshot_loader,
                 intraday_enabled=use_intraday,
+                expected_prior_trade_date=calendar.trade_date,
+                calendar_reason=calendar.reason,
             )
             c_history = capability_status_df.attrs.get("a_history_coverage") or a_history_coverage(status_conn, today_date)
         finally:

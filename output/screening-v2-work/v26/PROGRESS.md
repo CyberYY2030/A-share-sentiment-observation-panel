@@ -1,8 +1,8 @@
 # v2.6 progress
 - Goal: make formal and intraday A–E use the same capability-level deduplicated Top 20 shortlist.
 - Frozen semantics: strict v2.6 A–D gates; E keeps its eligibility semantics.
-- Task 0: source paths are readable; production root is readable; Python 3.11 is installed but execution is currently denied by the sandbox.
+- Task 0 repair reproduction: intraday reads an unwritten diagnostics key; C lacks a 0.75 shrink gate and has a degenerate reclaim gate; B loses existing subtype evidence; C truncates before capability aggregation.
 - Risk: isolated real-data replay may need an approved local Python invocation; no provider or production write is allowed.
 - First entry: `mining/candidate_persistence.py` evaluator and shared shortlist boundary.
-- Sandbox replay PID 47792: keep until v26 evidence completes; then stop only if still owned and clean its temporary logs.
-- Validation: targeted 99 tests pass; full suite is blocked by five legacy R4/history expectations plus one frozen-fixture hash mismatch, recorded in BLOCKED.md.
+- Historical baseline: prior full run was 364 tests, 4 failures, 1 error, 2 skipped; no provider/production investigation will be repeated.
+- Repair result: local calendar, C gates, B idempotency and R4/history migration landed; 126 targeted tests and compilation pass; replay checkpoint is 1/20 and full-suite completion signal was unavailable.

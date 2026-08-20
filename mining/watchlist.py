@@ -790,9 +790,14 @@ def _evaluate_pullback_row(
     )
     previous_close = _series_value(close, len(close) - 2)
     previous_ma10 = _series_value(ma10, len(ma10) - 2)
+    previous_ma20 = _series_value(ma20, len(ma20) - 2)
     high = pd.to_numeric(indexed.get("adj_high", indexed.get("high")), errors="coerce")
     breakout_3d = len(high.iloc[-4:-1].dropna()) == 3 and current_close > float(high.iloc[-4:-1].max())
-    reclaim_ma10 = current_close >= current_ma10 or current_close >= current_ma20 or breakout_3d
+    reclaimed_from_below = (
+        (math.isfinite(previous_close) and math.isfinite(previous_ma10) and previous_close < previous_ma10 <= current_close)
+        or (math.isfinite(previous_close) and math.isfinite(previous_ma20) and previous_close < previous_ma20 <= current_close)
+    )
+    reclaim_ma10 = reclaimed_from_below or breakout_3d
     previous_volume = volume.iloc[-6:-1].dropna()
     current_open = _series_value(adjusted_open, len(adjusted_open) - 1)
     activity_expand = (
@@ -802,7 +807,13 @@ def _evaluate_pullback_row(
         and math.isfinite(_series_value(volume, len(volume) - 1))
         and _series_value(volume, len(volume) - 1) >= float(previous_volume.mean()) * 1.2
     )
-    if made_new_low_recent or not activity_expand or not reclaim_ma10:
+    if (
+        made_new_low_recent
+        or not math.isfinite(shrink_ratio)
+        or shrink_ratio > 0.75
+        or not activity_expand
+        or not (reclaim_ma10 or breakout_3d)
+    ):
         return None
     row: dict[str, Any] = {
         "sec_code": str(code).zfill(6),

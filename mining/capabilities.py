@@ -105,11 +105,25 @@ def shortlist_capability_rows(rows: pd.DataFrame, *, top_n: int = CAPABILITY_TOP
     result["_score"] = pd.to_numeric(score_source, errors="coerce").fillna(float("-inf"))
     result["_activity"] = pd.to_numeric(activity_source, errors="coerce").fillna(float("-inf"))
     result = result.sort_values(["_score", "_activity", "sec_code"], ascending=[False, False, True], kind="stable")
-    if "event_subtype" in result.columns:
-        subtype_evidence = (
-            result.groupby("sec_code", sort=False)["event_subtype"]
-            .agg(lambda values: tuple(dict.fromkeys(str(value) for value in values if pd.notna(value))))
-        )
+    if "event_subtype" in result.columns or "subtype_evidence" in result.columns:
+        def subtype_values(value: object) -> tuple[str, ...]:
+            if value is None:
+                return ()
+            if isinstance(value, (tuple, list, set)):
+                return tuple(str(item) for item in value if item is not None and not pd.isna(item))
+            if not isinstance(value, (str, bytes)) and pd.isna(value):
+                return ()
+            return (str(value),)
+
+        def merge_subtypes(group: pd.DataFrame) -> tuple[str, ...]:
+            merged: list[str] = []
+            for _, item in group.iterrows():
+                for column in ("event_subtype", "subtype_evidence"):
+                    if column in item:
+                        merged.extend(subtype_values(item[column]))
+            return tuple(dict.fromkeys(merged))
+
+        subtype_evidence = result.groupby("sec_code", sort=False).apply(merge_subtypes, include_groups=False)
         result = result.drop_duplicates("sec_code", keep="first")
         result["subtype_evidence"] = result["sec_code"].map(subtype_evidence)
     else:

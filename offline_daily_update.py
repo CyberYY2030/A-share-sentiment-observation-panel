@@ -23,6 +23,7 @@ from mining.data_quality import (
     stock_quality_is_screening_ready,
 )
 from mining.selection_batches import latest_complete_batch
+from mining.trading_calendar import write_trade_calendar
 from runtime_paths import build_runtime_paths
 
 
@@ -696,6 +697,7 @@ def _akshare_trade_days(asof: str, days: int) -> list[str]:
     except Exception:
         return []
 
+
     try:
         cal = ak.tool_trade_date_hist_sina()
     except Exception:
@@ -717,6 +719,16 @@ def _akshare_trade_days(asof: str, days: int) -> list[str]:
         return out[-days:]
     except Exception:
         return []
+
+
+def _refresh_local_trade_calendar(base_dir: str | Path, *, asof: str) -> dict[str, str]:
+    """Persist only provider-confirmed A-share open dates for panel read-only use."""
+    for source, loader in (("akshare", _akshare_trade_days), ("baostock", _baostock_trade_days)):
+        dates = loader(asof, 10000)
+        if dates:
+            payload = write_trade_calendar(base_dir, source=source, open_dates=dates)
+            return {"status": "updated", "source": source, "coverage_end": str(payload["coverage_end"])}
+    return {"status": "retained", "reason": "provider_calendar_unavailable"}
 
 
 def resolve_expected_trade_days(
@@ -1850,6 +1862,8 @@ def _run_core_offline_update(
             "concept_deferred": True,
         }
 
+    calendar_status = _refresh_local_trade_calendar(paths.base_dir, asof=close_cap)
+    logs.append(f"a_share_trade_calendar={calendar_status}")
     deadline = time.monotonic() + total
     revalidations: list[dict[str, Any]] = []
     quality_mismatches: list[dict[str, Any]] = []

@@ -38,7 +38,8 @@ def select_candidates_from_pullback_support(
     rows = evaluation.rows
     if rows.empty:
         return []
-    selected = rows[rows["state"].eq(PULLBACK_STATE_RETRIGGER)].head(int(top_n))
+    # Capability-level ranking owns the only Top-20 truncation.
+    selected = rows[rows["state"].eq(PULLBACK_STATE_RETRIGGER)]
     candidates: list[Candidate] = []
     for rank, row in enumerate(selected.itertuples(index=False), start=1):
         candidates.append(

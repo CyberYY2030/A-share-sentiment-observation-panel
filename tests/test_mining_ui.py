@@ -825,6 +825,16 @@ class MiningUiSmokeTests(unittest.TestCase):
                     snapshot_loader=loader,
                     intraday_enabled=True,
                 )
+                valid_rows, valid_status, valid = _formal_capability_view(
+                    conn,
+                    intraday_date,
+                    selected_trade_date=intraday_date,
+                    now=now,
+                    runtime=runtime,
+                    snapshot_loader=loader,
+                    intraday_enabled=True,
+                    expected_prior_trade_date=dates["target_trade_date"],
+                )
                 after = {
                     table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
                     for table in before
@@ -843,6 +853,10 @@ class MiningUiSmokeTests(unittest.TestCase):
         self.assertEqual(repeated["history_status"], "stale_history")
         self.assertEqual(len(first_rows), len(repeated_rows))
         self.assertEqual(set(repeated_status["availability"]), {"stale_history"})
+        self.assertEqual(valid["mode"], "intraday_snapshot")
+        self.assertNotEqual(valid.get("history_status"), "stale_history")
+        self.assertFalse(valid_status.empty)
+        self.assertIsInstance(valid_rows, pd.DataFrame)
         self.assertEqual(after, before)
 
     def test_complete_formal_batch_takes_priority_over_current_snapshot(self) -> None:

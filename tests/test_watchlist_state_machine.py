@@ -55,35 +55,61 @@ def _context() -> SelectionContext:
     )
 
 
+def _v26_price_path_context(recent_volumes: list[float]) -> SelectionContext:
+    dates = pd.bdate_range("2025-01-02", periods=150).strftime("%Y-%m-%d").tolist()
+    rows = []
+    for index, trade_date in enumerate(dates):
+        if index < 125:
+            close = 10.0
+        elif index < 144:
+            close = 10.0 + (index - 125) * 0.1
+        elif index == 144:
+            close = 14.0
+        else:
+            close = [13.2, 13.1, 13.0, 12.9, 13.28][index - 145]
+        rows.append({
+            "sec_code": "600001", "trade_date": trade_date, "adj_open": close * 0.99,
+            "adj_high": close * 1.01, "adj_low": close * 0.99, "adj_close": close,
+            "volume": recent_volumes[index - 145] if index >= 145 else 100.0,
+        })
+    return SelectionContext(
+        bars=pd.DataFrame(rows), universe=pd.DataFrame([{"sec_code": "600001", "sec_name": "PathOnly"}]),
+        trade_date=dates[-1], mode="close_final", as_of=dates[-1], price_as_of=dates[-1],
+        metadata_as_of=dates[-1], trend_profile="P120", data_status="ready", diagnostics={"clean_dates": dates},
+    )
+
+
 class PullbackStateMachineTests(unittest.TestCase):
     def test_v26_c_accepts_a_price_path_without_a_history(self) -> None:
-        dates = pd.bdate_range("2025-01-02", periods=150).strftime("%Y-%m-%d").tolist()
-        rows = []
-        for index, trade_date in enumerate(dates):
-            if index < 125:
-                close = 10.0
-            elif index < 144:
-                close = 10.0 + (index - 125) * 0.1
-            elif index == 144:
-                close = 14.0
-            else:
-                close = [13.2, 13.1, 13.0, 12.9, 13.28][index - 145]
-            rows.append({
-                "sec_code": "600001", "trade_date": trade_date, "adj_open": close * 0.99,
-                "adj_high": close * 1.01, "adj_low": close * 0.99, "adj_close": close,
-                "volume": 240.0 if index == 149 else (20.0 if index >= 145 else 100.0),
-            })
-        context = SelectionContext(
-            bars=pd.DataFrame(rows), universe=pd.DataFrame([{"sec_code": "600001", "sec_name": "PathOnly"}]),
-            trade_date=dates[-1], mode="close_final", as_of=dates[-1], price_as_of=dates[-1],
-            metadata_as_of=dates[-1], trend_profile="P120", data_status="ready", diagnostics={"clean_dates": dates},
-        )
+        context = _v26_price_path_context([20.0, 20.0, 20.0, 20.0, 240.0])
 
         result = evaluate_pullback_support(context, a_qualified_dates={})
 
         self.assertEqual(result.rows["sec_code"].tolist(), ["600001"])
         self.assertFalse(result.rows.iloc[0]["a_qualified_once"])
         self.assertEqual(result.rows.iloc[0]["state"], PULLBACK_STATE_RETRIGGER)
+
+    def test_v26_c_shrink_ratio_boundary_is_hard_eligibility_gate(self) -> None:
+        at_boundary = evaluate_pullback_support(_v26_price_path_context([63.75, 63.75, 63.75, 63.75, 120.0]))
+        above_boundary = evaluate_pullback_support(_v26_price_path_context([63.7625, 63.7625, 63.7625, 63.7625, 120.0]))
+
+        self.assertEqual(at_boundary.rows["sec_code"].tolist(), ["600001"])
+        self.assertAlmostEqual(float(at_boundary.rows.iloc[0]["shrink_ratio"]), 0.75)
+        self.assertTrue(above_boundary.rows.empty)
+
+    def test_v26_c_rejects_reclaim_without_prior_close_below_moving_average(self) -> None:
+        context = _v26_price_path_context([20.0, 20.0, 20.0, 20.0, 240.0])
+        bars = context.bars.copy()
+        final_date = context.trade_date
+        prior_date = context.diagnostics["clean_dates"][-2]
+        bars.loc[bars["trade_date"].eq(prior_date), "adj_close"] = 13.28
+        bars.loc[bars["trade_date"].eq(prior_date), "adj_high"] = 13.41
+        bars.loc[bars["trade_date"].eq(final_date), "adj_high"] = 13.29
+        context.bars = bars
+
+        result = evaluate_pullback_support(context)
+
+        self.assertTrue(result.rows.empty)
 
     def test_v26_c_states_retrigger_on_confirmed_price_path_and_veto_recent_low(self) -> None:
         base = {

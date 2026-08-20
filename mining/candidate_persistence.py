@@ -279,6 +279,7 @@ def _shortlist_capability_results(results: Iterable[CapabilityResult]) -> tuple[
                 "score": [score(item)[0] for item in candidates],
                 "activity_pct": [score(item)[1] for item in candidates],
                 "event_subtype": [item.features.get("event_subtype") for item in candidates],
+                "subtype_evidence": [item.features.get("subtype_evidence") for item in candidates],
             }
         ))
         for row in ranked.itertuples(index=False):

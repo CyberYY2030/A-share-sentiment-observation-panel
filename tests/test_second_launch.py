@@ -66,6 +66,30 @@ class SecondLaunchTests(unittest.TestCase):
         self.assertTrue(candidates[0].features["stop_signal"])
         self.assertEqual(candidates[0].features["flag_strategies"], "strong_trend")
 
+    def test_second_launch_returns_all_eligible_rows_for_capability_ranking(self) -> None:
+        from mining.capabilities import shortlist_capability_rows
+
+        rows = []
+        for index in reversed(range(25)):
+            row = self._evaluation().rows.iloc[0].to_dict()
+            row["sec_code"] = f"{600100 + index:06d}"
+            row["sec_name"] = row["sec_code"]
+            rows.append(row)
+        evaluation = PullbackSupportEvaluation(pd.DataFrame(rows), None, {})
+
+        candidates = select_candidates_from_pullback_support(
+            evaluation,
+            trade_date="2026-02-03",
+            strategy_id="second_launch",
+            version="v2.6",
+            top_n=20,
+        )
+
+        self.assertEqual(len(candidates), 25)
+        self.assertEqual({candidate.sec_code for candidate in candidates}, {f"{600100 + index:06d}" for index in range(25)})
+        final = shortlist_capability_rows(pd.DataFrame({"sec_code": [candidate.sec_code for candidate in candidates]}))
+        self.assertEqual(final["sec_code"].tolist(), [f"{600100 + index:06d}" for index in range(20)])
+
     def test_scanner_consumes_one_evaluation_and_persists_that_same_final_state(self) -> None:
         context = SelectionContext(
             bars=pd.DataFrame(),

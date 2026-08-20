@@ -47,6 +47,11 @@ class CandidatePersistenceTests(unittest.TestCase):
         self.assertEqual(
             set(selected.iloc[0]["subtype_evidence"]), {"compression_launch", "momentum_anomaly"}
         )
+        repeated = shortlist_capability_rows(selected)
+        self.assertEqual(repeated["sec_code"].tolist(), selected["sec_code"].tolist())
+        self.assertEqual(
+            set(repeated.iloc[0]["subtype_evidence"]), {"compression_launch", "momentum_anomaly"}
+        )
 
     @staticmethod
     def _context(
