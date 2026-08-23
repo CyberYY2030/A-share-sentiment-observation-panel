@@ -917,15 +917,37 @@ def upsert_daily_matrics(con: sqlite3.Connection, df: pd.DataFrame) -> int:
         "trade_date","sentiment_score","momentum","momentum_z","adv_dec_ratio","ew_ret","adv_ratio",
         "hot_excess","small_big_rel","etf_share_pct","turnover_rel_ma10","updated_at"
     ]
-    write_cols = [c for c in candidates if c in cols and c in d.columns]
-    if "trade_date" not in write_cols:
-        write_cols = ["trade_date"] + write_cols
-    ph = ",".join(["?"] * len(write_cols))
-    sql = f"INSERT OR REPLACE INTO daily_matrics ({','.join(write_cols)}) VALUES ({ph})"
-    rows = list(d[write_cols].itertuples(index=False, name=None))
-    con.executemany(sql, rows)
+    business_cols = [
+        c for c in candidates
+        if c not in {"trade_date", "updated_at"} and c in cols and c in d.columns
+    ]
+    write_cols = ["trade_date", *business_cols, "updated_at"]
+    quoted_cols = ",".join(f'"{column}"' for column in write_cols)
+    placeholders = ",".join(["?"] * len(write_cols))
+    if business_cols:
+        assignments = ",".join(
+            f'"{column}"=excluded."{column}"'
+            for column in [*business_cols, "updated_at"]
+        )
+        changed = " OR ".join(
+            f'daily_matrics."{column}" IS NOT excluded."{column}"'
+            for column in business_cols
+        )
+        sql = (
+            f"INSERT INTO daily_matrics ({quoted_cols}) VALUES ({placeholders}) "
+            f"ON CONFLICT(trade_date) DO UPDATE SET {assignments} WHERE {changed}"
+        )
+    else:
+        sql = (
+            f"INSERT INTO daily_matrics ({quoted_cols}) VALUES ({placeholders}) "
+            "ON CONFLICT(trade_date) DO NOTHING"
+        )
+    affected = 0
+    for row in d[write_cols].itertuples(index=False, name=None):
+        con.execute(sql, row)
+        affected += int(con.execute("SELECT changes()").fetchone()[0])
     con.commit()
-    return len(rows)
+    return affected
 
 
 

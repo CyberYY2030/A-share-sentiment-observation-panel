@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 import sqlite3
 import datetime as dt
+import hashlib
 import time
 from unittest import mock
 
@@ -12,6 +13,73 @@ from tests._mining_test_helpers import create_sample_market_dbs, trading_days
 
 
 class MiningUiSmokeTests(unittest.TestCase):
+    def test_daily_matrics_upsert_is_idempotent_for_identical_rows(self) -> None:
+        from app_panel import upsert_daily_matrics
+
+        def sha256(path: Path) -> str:
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        frame = pd.DataFrame(
+            [
+                {"trade_date": "2026-08-17", "sentiment_score": 80.0, "momentum": 1.2},
+                {"trade_date": "2026-08-18", "sentiment_score": 81.0, "momentum": 1.3},
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.db"
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(upsert_daily_matrics(conn, frame), 2)
+            finally:
+                conn.close()
+            before_sha = sha256(path)
+            conn = sqlite3.connect(path)
+            try:
+                before_rows = conn.execute(
+                    "SELECT trade_date, updated_at FROM daily_matrics ORDER BY trade_date"
+                ).fetchall()
+                time.sleep(1.1)
+                self.assertEqual(upsert_daily_matrics(conn, frame), 0)
+                after_rows = conn.execute(
+                    "SELECT trade_date, updated_at FROM daily_matrics ORDER BY trade_date"
+                ).fetchall()
+            finally:
+                conn.close()
+
+            self.assertEqual(after_rows, before_rows)
+            self.assertEqual(sha256(path), before_sha)
+
+    def test_daily_matrics_upsert_only_timestamps_changed_business_row(self) -> None:
+        from app_panel import upsert_daily_matrics
+
+        initial = pd.DataFrame(
+            [
+                {"trade_date": "2026-08-17", "sentiment_score": 80.0, "momentum": 1.2},
+                {"trade_date": "2026-08-18", "sentiment_score": 81.0, "momentum": 1.3},
+            ]
+        )
+        changed = initial.copy()
+        changed.loc[changed["trade_date"].eq("2026-08-17"), "sentiment_score"] = 82.0
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "metrics.db"
+            conn = sqlite3.connect(path)
+            try:
+                self.assertEqual(upsert_daily_matrics(conn, initial), 2)
+                before_rows = conn.execute(
+                    "SELECT trade_date, sentiment_score, updated_at FROM daily_matrics ORDER BY trade_date"
+                ).fetchall()
+                time.sleep(1.1)
+                self.assertEqual(upsert_daily_matrics(conn, changed), 1)
+                after_rows = conn.execute(
+                    "SELECT trade_date, sentiment_score, updated_at FROM daily_matrics ORDER BY trade_date"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        self.assertEqual(after_rows[0][1], 82.0)
+        self.assertNotEqual(after_rows[0][2], before_rows[0][2])
+        self.assertEqual(after_rows[1], before_rows[1])
+
     def test_followup_change_accepts_object_typed_sql_prices(self) -> None:
         from mining.streamlit_tabs.tab_scanner import _build_followups
 
