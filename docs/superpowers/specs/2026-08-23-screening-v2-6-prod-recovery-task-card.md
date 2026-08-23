@@ -99,4 +99,11 @@ python offline_daily_update.py --base-dir . --asof YYYY-MM-DD --target-day YYYY-
 
 ## 执行结果
 
-状态：`not_started`
+状态：`production_recovery_verified`
+
+- 2026-08-23 已按 `08-18 -> 08-19 -> 08-20 -> 08-21` 完成生产恢复；四日 stock 均为 `clean`、`usable_ratio=1.0`、`missing_rows=0`，四指数齐全。
+- v2.6 正式批次 10～13 均为 `close_final/complete`；A～E 每项 `<=20`，B 无重复，rank 连续，v2.5/batch 9 未改写。
+- 真实面板指标和选股日期均为 2026-08-21；`mode=close_final`、`result_kind=persisted`、`data_status=complete`，重复渲染未改写相同指标的 `updated_at`。
+- concept/ETF 保持原 SHA，可选 concept 数据以 `concept_coverage_incomplete` 显式降级；四库最终 `quick_check=ok`。
+- 任务自有 updater、repair/formal、Streamlit 8505 和 Playwright 进程均已清理；未触碰其他项目的 8501/8502 服务。
+- 完整证据见 `output/screening-v2-work/v26/prod-recovery-1/attempt-2/prod-recovery-1-report.md` 与同名 JSON。
