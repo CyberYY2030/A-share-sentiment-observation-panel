@@ -315,6 +315,47 @@ class TailNextMorningTests(unittest.TestCase):
             with self.assertRaisesRegex(TailDataError, "development_year_guard:20250102"):
                 load_day_statistics(tmp, "20250102", allowed_years=("2023",))
 
+    def test_dplus1_diagnostic_and_sell_quality_are_independent(self) -> None:
+        from mining.tail_next_morning import minute_sufficient_statistics, outcome_from_statistics
+
+        day = minute_sufficient_statistics(make_bars())
+        diagnostic_bad = make_bars()
+        diagnostic_bad.loc[5, "close"] = 0.0
+        completed = outcome_from_statistics(day, minute_sufficient_statistics(diagnostic_bad), "20230109")
+        self.assertEqual(completed["outcome_status"], "ready")
+        self.assertIsNone(completed["mfe_0930_1000"])
+        self.assertIsNone(completed["mae_0930_1000"])
+
+        sell_bad = make_bars()
+        sell_bad.loc[30, "close"] = 0.0
+        delayed = outcome_from_statistics(day, minute_sufficient_statistics(sell_bad), "20230109")
+        self.assertEqual(delayed["outcome_status"], "delayed_exit_required")
+
+    def test_listing_uses_exact_daily_sessions_not_calendar_days(self) -> None:
+        from mining.tail_next_morning import development_listing_evidence, feature_snapshot_from_statistics, minute_sufficient_statistics
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            daily = root / "daily"
+            daily.mkdir()
+            thirty_sessions_in_fifty_days = pd.date_range("2023-01-01", periods=30, freq="B")
+            pd.DataFrame({"date": thirty_sessions_in_fifty_days}).to_excel(daily / "000001.xlsx", index=False)
+            evidence = development_listing_evidence(daily, "000001", "20230220", 1, {})
+            self.assertEqual(evidence["listing_age_source"], "daily_k_exact_date_sessions")
+            self.assertEqual(evidence["listing_history_sessions"], 30)
+
+            sparse_sessions = pd.date_range("2023-01-01", periods=10, freq="10D")
+            pd.DataFrame({"date": sparse_sessions}).to_excel(daily / "600000.xlsx", index=False)
+            sparse = development_listing_evidence(daily, "600000", "20230430", 99, {})
+            self.assertEqual(sparse["listing_history_sessions"], 10)
+            isolated = feature_snapshot_from_statistics(
+                "600000",
+                minute_sufficient_statistics(make_bars()),
+                [minute_sufficient_statistics(make_bars()) for _ in range(3)],
+                sparse,
+            )
+            self.assertEqual(isolated["feature_reason"], "listing_history_under_20")
+
     def test_development_loader_opens_container_once_and_keeps_minute_universe_without_daily_k(self) -> None:
         from mining.tail_next_morning import development_listing_evidence, feature_snapshot_from_statistics, load_day_statistics, minute_sufficient_statistics
 
@@ -401,9 +442,12 @@ class TailNextMorningTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            manifest = [{"trade_date": "20230103", "path": "a", "source_kind": "zip", "size_bytes": 1, "mtime_ns": 1}]
+            manifest = {
+                "minute_containers": [{"trade_date": "20230103", "path": "a", "source_kind": "zip", "size_bytes": 1, "mtime_ns": 1, "member_count": 1, "central_directory_digest": "a"}],
+                "daily_k_root": {"root": "daily", "candidate_count": 0, "total_bytes": 0, "tree_digest": "b", "files": []},
+            }
             _prepare_development_run(root, mode="dev-preflight", input_manifest=manifest, resume_run_id="resume-target")
-            changed = [{**manifest[0], "size_bytes": 2}]
+            changed = {**manifest, "minute_containers": [{**manifest["minute_containers"][0], "size_bytes": 2}]}
             with self.assertRaisesRegex(TailDataError, "resume_hash_mismatch"):
                 _prepare_development_run(root, mode="dev-preflight", input_manifest=changed, resume_run_id="resume-target")
 
@@ -417,6 +461,132 @@ class TailNextMorningTests(unittest.TestCase):
             self.assertEqual(len(result["target_dates"]), 10)
             self.assertFalse((run_dir / "frozen_rule.json").exists())
             self.assertEqual(json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"], "SUCCEEDED")
+
+    def test_input_identity_lock_takeover_and_incremental_resume(self) -> None:
+        from mining.tail_next_morning import (
+            TailDataError,
+            _acquire_run_lock,
+            _input_manifest,
+            _prepare_development_run,
+            load_day_statistics,
+            run_dev_preflight,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dates = [f"202301{day:02d}" for day in range(3, 17)]
+            codes = tuple(f"600{index:03d}" for index in range(12))
+            self._write_development_days(root, dates, codes)
+            daily = root / "daily"
+            daily.mkdir()
+            pd.DataFrame({"date": ["2022-01-01"]}).to_excel(daily / "600000.xlsx", index=False)
+            identity = _input_manifest(root, daily, [dates[0]], ("2023",))
+            container = identity["minute_containers"][0]
+            self.assertIn("central_directory_digest", container)
+            self.assertEqual(container["member_count"], 13)
+            self.assertIn("tree_digest", identity["daily_k_root"])
+            directory_source = root / "2023" / "01" / "20230117" / "sh"
+            directory_source.mkdir(parents=True)
+            (directory_source / "600000.csv").write_bytes(make_bars().to_csv(index=False).encode("utf-8"))
+            directory_identity = _input_manifest(root, daily, ["20230117"], ("2023",))["minute_containers"][0]
+            self.assertEqual(directory_identity["source_kind"], "directory")
+            self.assertEqual(directory_identity["candidate_count"], 1)
+            self.assertIn("tree_digest", directory_identity)
+
+            lock_dir, lock_manifest = _prepare_development_run(root / "locks", mode="dev-preflight", input_manifest=identity)
+            stale = {"pid": 99999999, "host": __import__("socket").gethostname(), "run_id": lock_manifest["run_id"], "run_hash": lock_manifest["run_hash"], "started_at": "old"}
+            (lock_dir / "run.lock").write_text(json.dumps(stale), encoding="utf-8")
+            with self.assertRaisesRegex(TailDataError, "single_writer_lock_exists"):
+                _acquire_run_lock(lock_dir, lock_manifest, explicit_resume=False)
+            lock = _acquire_run_lock(lock_dir, lock_manifest, explicit_resume=True)
+            self.assertTrue(any((lock_dir / "lock_evidence").iterdir()))
+            lock.unlink()
+
+            real_load = load_day_statistics
+            first_calls: list[str] = []
+
+            def interrupting_load(*args, **kwargs):
+                first_calls.append(str(args[1]))
+                if str(args[1]) == "20230108":
+                    raise KeyboardInterrupt()
+                return real_load(*args, **kwargs)
+
+            with mock.patch("mining.tail_next_morning.development_listing_evidence", return_value=listing()), mock.patch(
+                "mining.tail_next_morning.load_day_statistics", side_effect=interrupting_load
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_dev_preflight(root, daily, root / "out")
+            run_id = next((root / "out").iterdir()).name
+            self.assertEqual(json.loads(((root / "out" / run_id) / "completion.json").read_text(encoding="utf-8"))["status"], "CANCELLED")
+
+            resumed_calls: list[str] = []
+
+            def recording_load(*args, **kwargs):
+                resumed_calls.append(str(args[1]))
+                return real_load(*args, **kwargs)
+
+            with mock.patch("mining.tail_next_morning.development_listing_evidence", return_value=listing()), mock.patch(
+                "mining.tail_next_morning.load_day_statistics", side_effect=recording_load
+            ):
+                result, run_dir = run_dev_preflight(root, daily, root / "out", resume_run_id=run_id)
+            self.assertEqual(result["selection_status"], "canary_probe_not_frozen")
+            self.assertEqual(resumed_calls[0], "20230108")
+            self.assertNotIn("20230103", resumed_calls)
+            self.assertTrue((run_dir / "sha256_manifest.json").exists())
+
+    def test_full_development_freeze_requires_positive_both_years_and_complete_contract(self) -> None:
+        from mining.tail_next_morning import _finalize_economic_outputs
+
+        def rows_for_year(year: str, offset: float) -> list[dict[str, object]]:
+            rows = []
+            for index in range(10):
+                value = offset + index * 0.001
+                percentiles = {
+                    "tail_return_rel": (index + 1) / 10,
+                    "tail_end_location": (index + 1) / 10,
+                    "tail_amount_accel": (index + 1) / 10,
+                    "pre_tail_return_rel": (index + 1) / 10,
+                    "activity_ratio": (index + 1) / 10,
+                    "recent_3date_return_rel": (index + 1) / 10,
+                }
+                rows.append(
+                    {
+                        "sec_code": f"600{index:03d}",
+                        "feature_status": "ready",
+                        "feature_percentiles": percentiles,
+                        "features": percentiles,
+                        "outcome": {
+                            "outcome_status": "ready",
+                            "gross_return": value + 0.003,
+                            "net_return_15bps": value + 0.0015,
+                            "net_return_30bps": value,
+                            "buy": {"status": "ready", "amount": 10_000_000.0},
+                            "sell": {"status": "ready", "amount": 10_000_000.0},
+                            "exit_date": f"{year}0109",
+                        },
+                    }
+                )
+            return rows
+
+        manifest = {"spec_hash": "spec", "runner_source_hash": "runner", "input_manifest_hash": "input", "run_id": "run", "run_hash": "hash"}
+        with tempfile.TemporaryDirectory() as tmp:
+            ready_rows = {"20230106": rows_for_year("2023", 0.001), "20240105": rows_for_year("2024", 0.001)}
+            economic, _ = _finalize_economic_outputs(Path(tmp), mode="dev-run", canary=False, target_dates=sorted(ready_rows), daily_rows=ready_rows, run_manifest=manifest, approved_commit="approved")
+            self.assertEqual(economic["selection_status"], "ready")
+            rule = json.loads((Path(tmp) / "frozen_rule.json").read_text(encoding="utf-8"))
+            self.assertIn("execution_contract", rule)
+            self.assertEqual(rule["binding"]["approved_commit"], "approved")
+
+            blocked_rows = {"20230106": rows_for_year("2023", 0.001), "20240105": rows_for_year("2024", -0.020)}
+            economic, _ = _finalize_economic_outputs(Path(tmp), mode="dev-run", canary=False, target_dates=sorted(blocked_rows), daily_rows=blocked_rows, run_manifest=manifest, approved_commit="approved")
+            self.assertEqual(economic["selection_status"], "no_stable_development_signal")
+            self.assertFalse((Path(tmp) / "frozen_rule.json").exists())
+
+    def test_dev_run_requires_explicit_approved_commit(self) -> None:
+        from mining.tail_next_morning import TailDataError, _validate_approved_development_commit
+
+        with self.assertRaisesRegex(TailDataError, "dev_run_requires_approved_commit"):
+            _validate_approved_development_commit(None)
 
     def test_spec_hash_excludes_execution_results_but_covers_frozen_definition(self) -> None:
         from mining.tail_next_morning import _frozen_contract_hash

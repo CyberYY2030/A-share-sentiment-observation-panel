@@ -357,6 +357,16 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - P1-6：resume 会重读已完成容器，lock 无 owner 身份，普通异常/中断/已完成快路径的终态与 artifact 复核不完备。
 - 修复边界已回写第 4、8、9 节；只解锁 Terra 的 TNM-2AF 定点修复与新 canary，不授权完整开发批、2025 或 2026。
 
+### TNM-2AF 执行结果
+
+状态：`tnm2af_partial`
+
+- 已完成定点 runner 修复并通过定向验收：D+1 `[09:30,10:00)` 诊断与 `[10:00,10:05)` 卖出质量状态分离；日 K 只读取 `date` 列并以去重有效日期计算 `<D` session；输入身份加入 ZIP central-directory、目录 CSV tree 和全日 K XLSX tree；checkpoint 保存 source frontier、滚动历史、visible session、pending exit 与完成 target；lock 为带 PID/host/run hash 的 JSON，显式同机死 PID 恢复保留证据；`CANCELLED`/`FAILED`/完成 artifact 复核分开；完整开发冻结增加双年度正 `mean_daily_net30`、无 unresolved exit 和完整合同/产物哈希门槛。`dev-run` 现要求 `--approved-commit`，本轮未调用。
+- 定向验收已通过：`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（21 tests）、`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py`、`git diff --check`。新增回归包含 D+1 诊断/卖出隔离、30 个真实 session 跨 50 日与 10 个 session 跨 60+ 日、ZIP/目录/日 K 输入身份、死 PID lock 接管、取消后从 source frontier 增量恢复、双年度冻结门槛和 frozen contract 绑定。
+- 新真实只读 canary attempt 保留为取消证据：`output/tail-next-morning-v1/dev-preflight/dev-preflight-31f2a75b8db2112d`，`run_hash=31f2a75b8db2112da34432fba2b926bea14c42975ebda61e03084e693844127f`，`spec_hash=495a00ccdec0693aea761a4cfdd642630d130fe94283910a96188e3bcd820f0f`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`。manifest 已冻结 14 个 2023 ZIP 容器和 5,532 个日 K XLSX（tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`）；首 target `20230106` 的 minute universe 为 4,769。
+- 性能停止：现场在约 3 分钟仅完成日 K 精确 `date` 扫描 100/4,769，任务自有 Python PID `25332` 的 CPU 已约 148 秒，投影超过 30 分钟。已安全停止该 PID，写入 `completion.json=status:CANCELLED, reason=canary_listing_date_extraction_projection_exceeds_30_minutes`，并保留 `resume_state.json`、`progress.json`、`lock_evidence/cancelled-4dc22eab094ad70e.json`；没有删除或覆盖任何旧 attempt，也没有启动完整 `dev-run`、2025/2026、provider/L2/ML/生产 DB/scanner。
+- 新信号建议的“读取到第 20 个 `<D` session 即停止”可保持上市资格判断，却与第 4 节“按去重有效日期精确计算 `<D` 的交易日数”相冲突。未静默改变该冻结口径，等待规划会话裁决后才可继续 canary；TNM-2B/TNM-3 继续锁定。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`

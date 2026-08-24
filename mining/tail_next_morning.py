@@ -9,16 +9,20 @@ outcomes are calculated by a separate function.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 import csv
+from datetime import datetime, timedelta, timezone
 import gzip
 import hashlib
 import io
 import json
 import math
 import os
+import socket
 import subprocess
 import tempfile
 import zipfile
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
@@ -51,6 +55,7 @@ FEATURE_NUMBER = {name: index for index, name in enumerate(FEATURE_NAMES, start=
 DEVELOPMENT_YEARS = ("2023", "2024")
 RANDOM_BASELINE_SEED = "20260824"
 SLOT_COUNT = 10
+TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-24-tail-next-morning-v1-task-cards.md"
 
 
 def _session_labels() -> tuple[str, ...]:
@@ -633,18 +638,21 @@ def minute_sufficient_statistics(raw: pd.DataFrame) -> dict[str, Any]:
     else:
         result["signal"] = {"status": "invalid", "reason": signal_reason}
     result["buy"] = compact_vwap("14:51", "14:56")
-    morning_end = _window_index("10:05")
-    morning_reason = reason_for(0, morning_end)
-    if morning_reason is None:
-        potential = values[:_window_index("10:00")]
-        result["morning"] = {
+    # These two D+1 consumers are intentionally independent.  A malformed
+    # 09:30--10:00 diagnostic bar must not turn an otherwise executable
+    # 10:00--10:05 sale into a delayed exit.
+    diagnostic_end = _window_index("10:00")
+    diagnostic_reason = reason_for(0, diagnostic_end)
+    if diagnostic_reason is None:
+        potential = values[:diagnostic_end]
+        result["morning_diagnostic"] = {
             "status": "ready",
             "mfe_high": float(potential[:, 1].max()),
             "mae_low": float(potential[:, 2].min()),
-            "sell": compact_vwap("10:00", "10:05"),
         }
     else:
-        result["morning"] = {"status": "invalid", "reason": morning_reason, "sell": None}
+        result["morning_diagnostic"] = {"status": "invalid", "reason": diagnostic_reason, "mfe_high": None, "mae_low": None}
+    result["morning_sell"] = compact_vwap("10:00", "10:05")
     result["delayed_exit_windows"] = [{"start": start, "end": end, **compact_vwap(start, end)} for start, end in DELAYED_LATER_DAY_WINDOWS]
     return result
 
@@ -722,32 +730,111 @@ def load_day_statistics(
     }
 
 
-def _listing_base(daily_root: str | Path, code: str, cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _xlsx_active_sheet_path(archive: zipfile.ZipFile) -> str:
+    workbook = ElementTree.fromstring(archive.read("xl/workbook.xml"))
+    active_tab = int(next((node.attrib.get("activeTab", "0") for node in workbook.iter() if node.tag.endswith("}workbookView")), "0"))
+    sheets = [node for node in workbook.iter() if node.tag.endswith("}sheet")]
+    if active_tab >= len(sheets):
+        raise ValueError("active_sheet_missing")
+    relationship_id = next((value for key, value in sheets[active_tab].attrib.items() if key.endswith("}id")), None)
+    relationships = ElementTree.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+    target = next((node.attrib.get("Target") for node in relationships if node.attrib.get("Id") == relationship_id), None)
+    if not target:
+        raise ValueError("active_sheet_relationship_missing")
+    clean = target.lstrip("/").replace("../", "")
+    return clean if clean.startswith("xl/") else "xl/" + clean
+
+
+def _xlsx_shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    result: list[str] = []
+    with archive.open("xl/sharedStrings.xml") as payload:
+        for _, node in ElementTree.iterparse(payload, events=("end",)):
+            if node.tag.endswith("}si"):
+                result.append("".join(child.text or "" for child in node.iter() if child.tag.endswith("}t")))
+                node.clear()
+    return result
+
+
+def _xlsx_cell_value(cell: Any, shared_strings: list[str]) -> str:
+    raw = next((node.text or "" for node in cell if node.tag.endswith("}v")), "")
+    if cell.attrib.get("t") == "s":
+        return shared_strings[int(raw)]
+    if cell.attrib.get("t") == "inlineStr":
+        return "".join(node.text or "" for node in cell.iter() if node.tag.endswith("}t"))
+    return raw
+
+
+def _xlsx_column(cell_reference: str) -> str:
+    return "".join(character for character in cell_reference if character.isalpha())
+
+
+def _xlsx_date_values(path: Path) -> tuple[str, ...]:
+    """Read the active sheet's declared `date` column without loading K-line values."""
+    with zipfile.ZipFile(path) as archive:
+        shared_strings = _xlsx_shared_strings(archive)
+        dates: set[str] = set()
+        date_column: str | None = None
+        with archive.open(_xlsx_active_sheet_path(archive)) as payload:
+            for _, row in ElementTree.iterparse(payload, events=("end",)):
+                if not row.tag.endswith("}row"):
+                    continue
+                cells = list(row)
+                if row.attrib.get("r") == "1":
+                    for cell in cells:
+                        if _xlsx_cell_value(cell, shared_strings).strip().lower() == "date":
+                            date_column = _xlsx_column(cell.attrib.get("r", ""))
+                elif date_column:
+                    for cell in cells:
+                        if _xlsx_column(cell.attrib.get("r", "")) != date_column:
+                            continue
+                        raw = _xlsx_cell_value(cell, shared_strings).strip()
+                        try:
+                            numeric = float(raw)
+                        except (TypeError, ValueError):
+                            numeric = None
+                        parsed = (
+                            datetime(1899, 12, 30) + timedelta(days=numeric)
+                            if numeric is not None and math.isfinite(numeric) and abs(numeric) < 1_000_000
+                            else pd.to_datetime(raw, errors="coerce")
+                        )
+                        if not pd.isna(parsed):
+                            dates.add(parsed.date().isoformat())
+                        break
+                row.clear()
+    return tuple(sorted(dates))
+
+
+def _listing_base(
+    daily_root: str | Path,
+    code: str,
+    cache: dict[str, dict[str, Any]],
+    *,
+    allowed_daily_files: set[str] | None = None,
+) -> dict[str, Any]:
     normalized = canonical_code(code)
     if normalized in cache:
         return cache[normalized]
     path = Path(daily_root) / f"{normalized}.xlsx"
+    relative_path = path.relative_to(Path(daily_root)).as_posix() if path.exists() else None
+    if allowed_daily_files is not None and relative_path is not None and relative_path not in allowed_daily_files:
+        raise TailDataError("daily_k_read_outside_frozen_input")
     if not path.exists():
         value = {"status": "missing", "daily_columns": [], "listing_first_date": None}
     else:
         try:
-            from openpyxl import load_workbook
-
-            workbook = load_workbook(path, read_only=True, data_only=True)
-            rows = workbook.active.iter_rows(values_only=True)
-            header = next(rows, None)
-            first = next(rows, None)
-            workbook.close()
-            columns = [str(column) for column in (header or ())]
-            date_index = next((index for index, column in enumerate(columns) if column.strip().lower() == "date"), None)
-            first_date = pd.to_datetime(first[date_index], errors="coerce") if first is not None and date_index is not None else pd.NaT
+            # The only K-line field consumed by TNM is `date`.  Reading the
+            # active-sheet XML directly avoids materialising other indicators.
+            dates = _xlsx_date_values(path)
             value = {
-                "status": "ready" if date_index is not None and not pd.isna(first_date) else "unreadable",
-                "daily_columns": columns,
-                "listing_first_date": None if pd.isna(first_date) else first_date.date().isoformat(),
+                "status": "ready" if dates else "unreadable",
+                "daily_columns": ["date"],
+                "listing_first_date": dates[0] if dates else None,
+                "daily_dates": dates,
             }
         except Exception:
-            value = {"status": "unreadable", "daily_columns": [], "listing_first_date": None}
+            value = {"status": "unreadable", "daily_columns": [], "listing_first_date": None, "daily_dates": ()}
     cache[normalized] = value
     return value
 
@@ -758,17 +845,16 @@ def development_listing_evidence(
     trade_date: str,
     minute_visible_sessions: int,
     cache: dict[str, dict[str, Any]],
+    *,
+    allowed_daily_files: set[str] | None = None,
 ) -> dict[str, Any]:
-    """Use only daily-K first-date/header evidence; never read K-line outcomes or amount."""
-    base = _listing_base(daily_root, code, cache)
+    """Use only daily-K date evidence; never read K-line outcomes or amount."""
+    base = _listing_base(daily_root, code, cache, allowed_daily_files=allowed_daily_files)
     first_date = base.get("listing_first_date")
     if base.get("status") == "ready" and first_date is not None:
-        age_days = (pd.Timestamp(str(trade_date)) - pd.Timestamp(first_date)).days
-        # A sixty-calendar-day lower bound is deliberately conservative for the
-        # twenty-session gate and consumes no post-listing daily K-line values.
-        history = MIN_HISTORY_SESSIONS if age_days >= 60 else min(int(minute_visible_sessions), MIN_HISTORY_SESSIONS - 1)
+        history = bisect_left(base.get("daily_dates", ()), pd.Timestamp(str(trade_date)).date().isoformat())
         return {
-            "listing_age_source": "daily_k_first_date",
+            "listing_age_source": "daily_k_exact_date_sessions",
             "listing_history_sessions": history,
             "listing_first_date": first_date,
             "daily_columns": base["daily_columns"],
@@ -862,16 +948,20 @@ def outcome_from_statistics(day: Mapping[str, Any] | None, next_day: Mapping[str
         return _unavailable_outcome("unavailable_buy_window_invalid")
     if buy.get("status") != "ready":
         return _unavailable_outcome("cash_unfilled_buy", dict(buy))
-    if next_day is None or next_day.get("morning", {}).get("status") != "ready":
+    if next_day is None:
         return {
             **_unavailable_outcome("delayed_exit_required", dict(buy)),
             "outcome_status": "delayed_exit_required",
             "exit_date": None,
         }
-    morning = next_day["morning"]
-    mfe = float(morning["mfe_high"] / float(buy["vwap"]) - 1.0)
-    mae = float(morning["mae_low"] / float(buy["vwap"]) - 1.0)
-    sell = morning["sell"]
+    diagnostic = next_day.get("morning_diagnostic", {})
+    if diagnostic.get("status") == "ready":
+        mfe = float(diagnostic["mfe_high"] / float(buy["vwap"]) - 1.0)
+        mae = float(diagnostic["mae_low"] / float(buy["vwap"]) - 1.0)
+    else:
+        mfe = None
+        mae = None
+    sell = next_day.get("morning_sell", {})
     if sell.get("status") == "ready":
         return _completed_outcome(buy, sell, mfe, mae, next_date)
     return {
@@ -962,8 +1052,7 @@ def _frozen_contract_hash(task_card: str | Path) -> str:
 
 
 def _spec_hash() -> str:
-    task_card = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-24-tail-next-morning-v1-task-cards.md"
-    return _frozen_contract_hash(task_card)
+    return _frozen_contract_hash(TASK_CARD)
 
 
 def _discover_trade_dates(minute_root: str | Path, years: Iterable[str]) -> list[str]:
@@ -998,31 +1087,77 @@ def _target_dates_for_development(calendar: list[str], *, canary: bool) -> tuple
     return targets, calendar
 
 
-def _input_manifest(minute_root: str | Path, trade_dates: Iterable[str], allowed_years: Iterable[str]) -> list[dict[str, Any]]:
+def _zip_input_identity(source: Path) -> dict[str, Any]:
+    """Record ZIP central-directory identity without consuming member payloads."""
+    with zipfile.ZipFile(source) as archive:
+        central_directory = [
+            {
+                "relative_path": info.filename,
+                "uncompressed_size": int(info.file_size),
+                "crc": f"{int(info.CRC):08x}",
+            }
+            for info in sorted(archive.infolist(), key=lambda item: item.filename)
+        ]
+    stat = source.stat()
+    return {
+        "path": str(source),
+        "size_bytes": int(stat.st_size),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "member_count": len(central_directory),
+        "central_directory_digest": _json_digest(central_directory),
+    }
+
+
+def _directory_input_identity(source: Path) -> dict[str, Any]:
+    candidates = []
+    for item in sorted(source.rglob("*.csv")):
+        stat = item.stat()
+        candidates.append({"relative_path": item.relative_to(source).as_posix(), "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
+    return {
+        "path": str(source),
+        "candidate_count": len(candidates),
+        "total_bytes": sum(item["size_bytes"] for item in candidates),
+        "tree_digest": _json_digest(candidates),
+    }
+
+
+def _daily_k_input_identity(daily_root: str | Path) -> dict[str, Any]:
+    root = Path(daily_root)
+    candidates = []
+    for item in sorted(root.rglob("*.xlsx")):
+        stat = item.stat()
+        candidates.append({"relative_path": item.relative_to(root).as_posix(), "size_bytes": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
+    return {
+        "root": str(root),
+        "candidate_count": len(candidates),
+        "total_bytes": sum(item["size_bytes"] for item in candidates),
+        "tree_digest": _json_digest(candidates),
+        "files": candidates,
+    }
+
+
+def _input_manifest(
+    minute_root: str | Path,
+    daily_root: str | Path,
+    trade_dates: Iterable[str],
+    allowed_years: Iterable[str],
+) -> dict[str, Any]:
     allowed = set(str(year) for year in allowed_years)
     records: list[dict[str, Any]] = []
     for trade_date in sorted(set(trade_dates)):
         if str(trade_date)[:4] not in allowed:
             raise TailDataError(f"development_year_guard:{trade_date}")
         source, source_kind = locate_day_source(minute_root, trade_date)
-        stat = source.stat()
-        records.append(
-            {
-                "trade_date": str(trade_date),
-                "path": str(source),
-                "source_kind": source_kind,
-                "size_bytes": stat.st_size if source.is_file() else None,
-                "mtime_ns": stat.st_mtime_ns,
-            }
-        )
-    return records
+        identity = _zip_input_identity(source) if source_kind == "zip" else _directory_input_identity(source)
+        records.append({"trade_date": str(trade_date), "source_kind": source_kind, **identity})
+    return {"minute_containers": records, "daily_k_root": _daily_k_input_identity(daily_root)}
 
 
 def _prepare_development_run(
     output_dir: str | Path,
     *,
     mode: str,
-    input_manifest: list[dict[str, Any]],
+    input_manifest: Mapping[str, Any],
     resume_run_id: str | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     manifest_hash = _json_digest(input_manifest)
@@ -1048,14 +1183,49 @@ def _prepare_development_run(
     return run_dir, run_manifest
 
 
-def _acquire_run_lock(run_dir: Path, run_id: str) -> Path:
+def _pid_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _acquire_run_lock(run_dir: Path, run_manifest: Mapping[str, Any], *, explicit_resume: bool) -> Path:
     lock = run_dir / "run.lock"
+    owner = {
+        "pid": os.getpid(),
+        "host": socket.gethostname(),
+        "run_id": run_manifest["run_id"],
+        "run_hash": run_manifest["run_hash"],
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
-        raise TailDataError("single_writer_lock_exists") from exc
+        try:
+            existing = json.loads(lock.read_text(encoding="utf-8"))
+        except Exception as parse_exc:
+            raise TailDataError("single_writer_lock_exists") from parse_exc
+        if not explicit_resume:
+            raise TailDataError("single_writer_lock_exists") from exc
+        if existing.get("host") != socket.gethostname() or existing.get("run_hash") != run_manifest["run_hash"]:
+            raise TailDataError("resume_lock_owner_mismatch") from exc
+        if _pid_is_alive(existing.get("pid")):
+            raise TailDataError("resume_lock_pid_alive") from exc
+        evidence_dir = run_dir / "lock_evidence"
+        evidence_name = f"superseded-{_json_digest(existing)[:16]}.json"
+        _atomic_write_json(evidence_dir / evidence_name, existing)
+        lock.unlink()
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-        handle.write(run_id + "\n")
+        handle.write(_canonical_json_bytes(owner).decode("utf-8"))
     return lock
 
 
@@ -1070,6 +1240,75 @@ def _read_checkpoint(path: Path, run_hash: str) -> dict[str, Any] | None:
     if checkpoint.get("run_hash") != run_hash:
         raise TailDataError("checkpoint_hash_mismatch")
     return checkpoint
+
+
+def _state_path(run_dir: Path) -> Path:
+    return run_dir / "resume_state.json"
+
+
+def _read_resume_state(run_dir: Path, run_hash: str) -> dict[str, Any] | None:
+    path = _state_path(run_dir)
+    if not path.exists():
+        return None
+    state = json.loads(path.read_text(encoding="utf-8"))
+    if state.get("run_hash") != run_hash:
+        raise TailDataError("resume_state_hash_mismatch")
+    return state
+
+
+def _checkpointable_statistics(statistics: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Persist only rolling feature/outcome windows; delayed grids are one-day consumers."""
+    return {
+        code: {key: value for key, value in stat.items() if key != "delayed_exit_windows"}
+        for code, stat in statistics.items()
+    }
+
+
+def _write_resume_state(
+    run_dir: Path,
+    *,
+    run_hash: str,
+    next_index: int,
+    last_trade_date: str | None,
+    source_by_date: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    source_records: Mapping[str, Mapping[str, Any]],
+    visible_history: Mapping[str, int],
+    pending: Mapping[str, Mapping[str, Any]],
+    updates: Mapping[str, Mapping[str, Any]],
+    completed_targets: Iterable[str],
+) -> None:
+    _atomic_write_json(
+        _state_path(run_dir),
+        {
+            "run_hash": run_hash,
+            "source_frontier": {"next_index": int(next_index), "last_trade_date": last_trade_date},
+            "rolling_history": {date: _checkpointable_statistics(stats) for date, stats in source_by_date.items()},
+            "source_records": dict(source_records),
+            "visible_history": {code: int(value) for code, value in visible_history.items()},
+            "pending_exits": dict(pending),
+            "outcome_updates": dict(updates),
+            "completed_targets": sorted(set(completed_targets)),
+        },
+    )
+
+
+def _verify_completed_artifacts(run_dir: Path, completion: Mapping[str, Any], run_hash: str) -> dict[str, Any] | None:
+    if completion.get("status") != "SUCCEEDED" or completion.get("run_hash") != run_hash:
+        return None
+    artifact_hashes = completion.get("economic_artifacts")
+    if not isinstance(artifact_hashes, Mapping):
+        raise TailDataError("completion_artifact_manifest_missing")
+    manifest_path = run_dir / "sha256_manifest.json"
+    if not manifest_path.exists() or json.loads(manifest_path.read_text(encoding="utf-8")) != artifact_hashes:
+        raise TailDataError("completion_artifact_manifest_mismatch")
+    for name, expected in artifact_hashes.items():
+        path = run_dir / str(name)
+        if not path.exists() or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            raise TailDataError("completion_artifact_hash_mismatch")
+    result_path = run_dir / "development_results.json"
+    if not result_path.exists():
+        raise TailDataError("completion_results_missing")
+    return json.loads(result_path.read_text(encoding="utf-8"))
 
 
 def _net30(outcome: Mapping[str, Any] | None) -> float | None:
@@ -1227,10 +1466,23 @@ def _target_rows(
     daily_root: str | Path,
     visible_history: Mapping[str, int],
     listing_cache: dict[str, dict[str, Any]],
+    *,
+    allowed_daily_files: set[str] | None = None,
+    on_listing_progress: Any = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    for code, day in sorted(day_statistics.items()):
-        listing = development_listing_evidence(daily_root, code, target_date, int(visible_history.get(code, 0)), listing_cache)
+    ordered_days = sorted(day_statistics.items())
+    for position, (code, day) in enumerate(ordered_days, start=1):
+        if on_listing_progress is not None and (position == 1 or position % 100 == 0 or position == len(ordered_days)):
+            on_listing_progress(position, len(ordered_days))
+        listing = development_listing_evidence(
+            daily_root,
+            code,
+            target_date,
+            int(visible_history.get(code, 0)),
+            listing_cache,
+            allowed_daily_files=allowed_daily_files,
+        )
         snapshot = feature_snapshot_from_statistics(code, day, tuple(previous.get(code) for previous in prior_days), listing)
         if snapshot["feature_status"] == "ready":
             snapshot["outcome"] = outcome_from_statistics(day, next_statistics.get(code), next_date)
@@ -1337,6 +1589,126 @@ def _write_economic_csv(path: Path, portfolios: list[dict[str, Any]]) -> None:
     _atomic_write_bytes(path, compressed.getvalue())
 
 
+def _daily_deciles_and_rank_ic(daily_rows: Mapping[str, list[dict[str, Any]]]) -> tuple[dict[str, Any], dict[str, Any]]:
+    deciles: dict[str, Any] = {}
+    rank_ic: dict[str, Any] = {}
+    for trade_date, rows in sorted(daily_rows.items()):
+        ready = [row for row in rows if row.get("feature_status") == "ready"]
+        returns = [_net30(row.get("outcome")) for row in ready]
+        deciles[trade_date] = {}
+        rank_ic[trade_date] = {}
+        for feature in FEATURE_NAMES:
+            buckets: list[list[float]] = [[] for _ in range(10)]
+            pairs: list[tuple[float, float]] = []
+            for row, net30 in zip(ready, returns):
+                percentile = row.get("feature_percentiles", {}).get(feature)
+                if isinstance(percentile, (int, float)) and math.isfinite(float(percentile)):
+                    bucket = min(9, max(0, int(float(percentile) * 10)))
+                    if net30 is not None:
+                        buckets[bucket].append(float(net30))
+                        pairs.append((float(percentile), float(net30)))
+            deciles[trade_date][feature] = [
+                {"decile": index + 1, "count": len(values), "mean_net30": float(sum(values) / len(values)) if values else None}
+                for index, values in enumerate(buckets)
+            ]
+            if len(pairs) < 2 or len(pairs) != len(ready):
+                rank_ic[trade_date][feature] = {"status": "unavailable", "spearman_rank_ic": None, "count": len(pairs)}
+            else:
+                coefficient = _spearman_rank_correlation([pair[0] for pair in pairs], [pair[1] for pair in pairs])
+                rank_ic[trade_date][feature] = {
+                    "status": "ready" if pd.notna(coefficient) else "unavailable",
+                    "spearman_rank_ic": float(coefficient) if pd.notna(coefficient) else None,
+                    "count": len(pairs),
+                }
+    return deciles, rank_ic
+
+
+def _spearman_rank_correlation(left: list[float], right: list[float]) -> float | None:
+    """Tie-aware Spearman correlation without adding scipy to the frozen runner."""
+    if len(left) != len(right) or len(left) < 2:
+        return None
+
+    def ranks(values: list[float]) -> list[float]:
+        ranked = sorted(enumerate(values), key=lambda item: item[1])
+        result = [0.0] * len(values)
+        index = 0
+        while index < len(ranked):
+            end = index + 1
+            while end < len(ranked) and ranked[end][1] == ranked[index][1]:
+                end += 1
+            average = (index + 1 + end) / 2.0
+            for original, _ in ranked[index:end]:
+                result[original] = average
+            index = end
+        return result
+
+    left_ranks, right_ranks = ranks(left), ranks(right)
+    left_mean, right_mean = sum(left_ranks) / len(left_ranks), sum(right_ranks) / len(right_ranks)
+    numerator = sum((a - left_mean) * (b - right_mean) for a, b in zip(left_ranks, right_ranks))
+    denominator = math.sqrt(sum((a - left_mean) ** 2 for a in left_ranks) * sum((b - right_mean) ** 2 for b in right_ranks))
+    return None if denominator == 0 else float(numerator / denominator)
+
+
+def _strategy_performance(portfolios: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    by_year: dict[str, list[float]] = {year: [] for year in DEVELOPMENT_YEARS}
+    daily: list[dict[str, Any]] = []
+    equity = 1.0
+    peak = 1.0
+    max_drawdown = 0.0
+    blocked = False
+    for portfolio in sorted(portfolios, key=lambda item: str(item["trade_date"])):
+        net30 = portfolio["strategy"].get("net30")
+        trade_date = str(portfolio["trade_date"])
+        if not isinstance(net30, (int, float)) or not math.isfinite(float(net30)):
+            blocked = True
+            daily.append({"trade_date": trade_date, "net30": None, "equity": None})
+            continue
+        value = float(net30)
+        by_year.setdefault(trade_date[:4], []).append(value)
+        equity *= 1.0 + value
+        peak = max(peak, equity)
+        max_drawdown = min(max_drawdown, equity / peak - 1.0)
+        daily.append({"trade_date": trade_date, "net30": value, "equity": equity})
+    annual = {
+        year: {"available_days": len(values), "mean_daily_net30": float(sum(values) / len(values)) if values else None}
+        for year, values in by_year.items()
+    }
+    return {"annual": annual, "compound_equity_curve": daily, "max_drawdown": max_drawdown if daily and not blocked else None, "blocked_unresolved_exit": blocked}
+
+
+def _execution_summary(daily_rows: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any]:
+    counters = {"feature_isolated": 0, "cash_unfilled_buy": 0, "delayed_exit": 0, "unresolved_exit": 0, "outcome_unavailable": 0}
+    for rows in daily_rows.values():
+        for row in rows:
+            if row.get("feature_status") != "ready":
+                counters["feature_isolated"] += 1
+                continue
+            status = (row.get("outcome") or {}).get("outcome_status")
+            if status == "cash_unfilled_buy":
+                counters["cash_unfilled_buy"] += 1
+            elif status == "delayed_exit_required":
+                counters["delayed_exit"] += 1
+            elif status == "unresolved_exit_at_phase_end":
+                counters["unresolved_exit"] += 1
+            elif status != "ready":
+                counters["outcome_unavailable"] += 1
+    return counters
+
+
+def _frozen_execution_contract() -> dict[str, Any]:
+    return {
+        "signal_window": "D [14:20,14:50)",
+        "buy_window": "D [14:51,14:56)",
+        "opening_sell_window": "D+1 [10:00,10:05)",
+        "eligibility": {"d_minus_1_amount": ">500000000", "minimum_listing_history_sessions": MIN_HISTORY_SESSIONS},
+        "costs": {"gross": 0.0, "net15bps": 0.0015, "net30bps": 0.0030},
+        "slots": SLOT_COUNT,
+        "tie_break": "score_desc_then_sec_code_asc",
+        "baselines": ["eligible_pool_equal_weight", "sha256_seeded_random_top10", "tail_return_relative_top10"],
+        "delayed_exit": {"grid_minutes": 5, "first_day": list(DELAYED_FIRST_DAY_WINDOWS), "later_days": list(DELAYED_LATER_DAY_WINDOWS), "no_year_crossing": True, "phase_end": "unresolved_exit_at_phase_end"},
+    }
+
+
 def _finalize_economic_outputs(
     run_dir: Path,
     *,
@@ -1344,6 +1716,8 @@ def _finalize_economic_outputs(
     canary: bool,
     target_dates: list[str],
     daily_rows: Mapping[str, list[dict[str, Any]]],
+    run_manifest: Mapping[str, Any] | None = None,
+    approved_commit: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, str]]:
     selection = select_development_features(daily_rows)
     if canary:
@@ -1351,7 +1725,7 @@ def _finalize_economic_outputs(
         selection_status = "canary_probe_not_frozen"
     else:
         directions = {row["feature"]: int(row["direction"]) for row in selection["selected_features"]}
-        selection_status = "ready" if directions and selection["status"] == "ready" else "no_stable_development_signal"
+        selection_status = "provisional"
     portfolios = [_portfolio_day(daily_rows[date], date, directions) for date in target_dates] if directions else []
     capacity = _capacity_sleeve_ledger({date: daily_rows[date] for date in target_dates}, directions) if directions else {
         "capacity_verdict_5m": "capacity_unproven",
@@ -1360,6 +1734,16 @@ def _finalize_economic_outputs(
         "per_stock_yuan": CAPACITY_PER_STOCK_YUAN,
         "sleeve_count": SLOT_COUNT,
     }
+    deciles, rank_ic = _daily_deciles_and_rank_ic(daily_rows)
+    performance = _strategy_performance(portfolios)
+    annual_ok = all(
+        isinstance(performance["annual"].get(year, {}).get("mean_daily_net30"), (int, float))
+        and float(performance["annual"][year]["mean_daily_net30"]) > 0
+        for year in DEVELOPMENT_YEARS
+    )
+    no_unresolved = not performance["blocked_unresolved_exit"] and not any(portfolio["strategy"].get("blocked") for portfolio in portfolios)
+    if not canary:
+        selection_status = "ready" if directions and selection["status"] == "ready" and annual_ok and no_unresolved else "no_stable_development_signal"
     economic = {
         "contract": "TNM-2 development runner",
         "mode": mode,
@@ -1370,7 +1754,11 @@ def _finalize_economic_outputs(
         "queue_model_status": "unavailable_not_modeled_vwap_small_order_baseline",
         "selection_status": selection_status,
         "feature_selection": selection,
+        "daily_deciles": deciles,
+        "daily_spearman_rank_ic": rank_ic,
         "portfolios": portfolios,
+        "strategy_performance": performance,
+        "execution_summary": _execution_summary(daily_rows),
         "capacity_ledger": capacity,
     }
     result_path = run_dir / "development_results.json"
@@ -1381,18 +1769,55 @@ def _finalize_economic_outputs(
         result_path.name: hashlib.sha256(result_path.read_bytes()).hexdigest(),
         csv_path.name: hashlib.sha256(csv_path.read_bytes()).hexdigest(),
     }
-    if not canary:
+    frozen_path = run_dir / "frozen_rule.json"
+    if not canary and selection_status == "ready":
         frozen_rule = {
             "selected_features": selection["selected_features"],
             "selection_status": selection_status,
             "corporate_action_filter": "unproven_not_applied",
             "st_filter_applied": False,
+            "execution_contract": _frozen_execution_contract(),
+            "binding": {
+                "spec_hash": (run_manifest or {}).get("spec_hash"),
+                "approved_commit": approved_commit,
+                "runner_source_hash": (run_manifest or {}).get("runner_source_hash"),
+                "input_manifest_hash": (run_manifest or {}).get("input_manifest_hash"),
+                "run_id": (run_manifest or {}).get("run_id"),
+                "run_hash": (run_manifest or {}).get("run_hash"),
+                "economic_artifact_hashes": artifact_hashes,
+            },
         }
-        frozen_path = run_dir / "frozen_rule.json"
         _atomic_write_json(frozen_path, frozen_rule)
         artifact_hashes[frozen_path.name] = hashlib.sha256(frozen_path.read_bytes()).hexdigest()
+    elif frozen_path.exists():
+        # A resumed development run that fails its stability gate must never
+        # retain a prior usable rule in the same identity directory.
+        frozen_path.unlink()
     _atomic_write_json(run_dir / "sha256_manifest.json", artifact_hashes)
     return economic, artifact_hashes
+
+
+def _validate_approved_development_commit(approved_commit: str | None) -> str:
+    if not approved_commit:
+        raise TailDataError("dev_run_requires_approved_commit")
+    try:
+        resolved = subprocess.run(
+            ["git", "rev-parse", str(approved_commit)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).stdout.strip()
+    except Exception as exc:
+        raise TailDataError("approved_commit_unresolvable") from exc
+    if _current_git_commit() != resolved:
+        raise TailDataError("approved_commit_not_current_head")
+    owned = (str(TASK_CARD), str(Path(__file__)), "tests/test_tail_next_morning.py")
+    check = subprocess.run(["git", "diff", "--quiet", "HEAD", "--", *owned], check=False)
+    cached = subprocess.run(["git", "diff", "--cached", "--quiet", "HEAD", "--", *owned], check=False)
+    if check.returncode or cached.returncode:
+        raise TailDataError("dev_run_task_owned_paths_not_clean")
+    return resolved
 
 
 def run_development(
@@ -1402,6 +1827,7 @@ def run_development(
     *,
     canary: bool,
     resume_run_id: str | None = None,
+    approved_commit: str | None = None,
 ) -> tuple[dict[str, Any], Path]:
     """One read-only production path for the fixed canary and later dev-run.
 
@@ -1409,28 +1835,49 @@ def run_development(
     targets and no frozen rule.  The `False` branch exists for TNM-2B after its
     independent approval; this task never invokes it.
     """
+    approved = None if canary else _validate_approved_development_commit(approved_commit)
     allowed_years = ("2023",) if canary else DEVELOPMENT_YEARS
     calendar = _discover_trade_dates(minute_root, allowed_years)
     target_dates, process_dates = _target_dates_for_development(calendar, canary=canary)
-    manifest = _input_manifest(minute_root, process_dates, allowed_years)
+    manifest = _input_manifest(minute_root, daily_root, process_dates, allowed_years)
     mode = "dev-preflight" if canary else "dev-run"
     run_dir, run_manifest = _prepare_development_run(output_dir, mode=mode, input_manifest=manifest, resume_run_id=resume_run_id)
-    lock = _acquire_run_lock(run_dir, run_manifest["run_id"])
     completion_path = run_dir / "completion.json"
+    completed = json.loads(completion_path.read_text(encoding="utf-8")) if completion_path.exists() else None
+    completed_result = _verify_completed_artifacts(run_dir, completed, run_manifest["run_hash"]) if completed else None
+    if completed_result is not None:
+        return completed_result, run_dir
+    if completed and not resume_run_id:
+        raise TailDataError("resume_required_for_terminal_run")
+    lock = _acquire_run_lock(run_dir, run_manifest, explicit_resume=bool(resume_run_id))
     try:
-        completed = json.loads(completion_path.read_text(encoding="utf-8")) if completion_path.exists() else None
-        if completed and completed.get("status") == "SUCCEEDED" and completed.get("run_hash") == run_manifest["run_hash"]:
-            return json.loads((run_dir / "development_results.json").read_text(encoding="utf-8")), run_dir
-        _atomic_write_json(run_dir / "progress.json", {"run_id": run_manifest["run_id"], "status": "RUNNING", "completed_target_dates": 0, "total_target_dates": len(target_dates)})
-        source_by_date: dict[str, dict[str, dict[str, Any]]] = {}
-        source_records: dict[str, dict[str, Any]] = {}
-        visible_history: dict[str, int] = {}
+        state = _read_resume_state(run_dir, run_manifest["run_hash"]) if resume_run_id else None
+        source_by_date: dict[str, dict[str, dict[str, Any]]] = dict((state or {}).get("rolling_history", {}))
+        source_records: dict[str, dict[str, Any]] = dict((state or {}).get("source_records", {}))
+        visible_history: dict[str, int] = {code: int(value) for code, value in (state or {}).get("visible_history", {}).items()}
         listing_cache: dict[str, dict[str, Any]] = {}
-        pending: dict[str, dict[str, Any]] = {}
+        pending: dict[str, dict[str, Any]] = dict((state or {}).get("pending_exits", {}))
         updates_path = run_dir / "outcome_updates.json"
-        updates: dict[str, dict[str, Any]] = json.loads(updates_path.read_text(encoding="utf-8")) if updates_path.exists() else {}
-        completed_targets = 0
-        for index, trade_date in enumerate(process_dates):
+        updates: dict[str, dict[str, Any]] = dict((state or {}).get("outcome_updates", {}))
+        if not updates and updates_path.exists():
+            updates = json.loads(updates_path.read_text(encoding="utf-8"))
+        completed_target_dates: set[str] = set((state or {}).get("completed_targets", ()))
+        next_index = int((state or {}).get("source_frontier", {}).get("next_index", 0))
+        if next_index < 0 or next_index > len(process_dates):
+            raise TailDataError("resume_source_frontier_invalid")
+        _atomic_write_json(
+            run_dir / "progress.json",
+            {
+                "run_id": run_manifest["run_id"],
+                "status": "RUNNING",
+                "completed_target_dates": len(completed_target_dates),
+                "total_target_dates": len(target_dates),
+                "source_frontier": next_index,
+            },
+        )
+        allowed_daily_files = {str(item["relative_path"]) for item in manifest["daily_k_root"]["files"]}
+        for index in range(next_index, len(process_dates)):
+            trade_date = process_dates[index]
             statistics, source_record = load_day_statistics(minute_root, trade_date, allowed_years=allowed_years)
             source_by_date[trade_date] = statistics
             source_records[trade_date] = source_record
@@ -1451,7 +1898,7 @@ def run_development(
                     pending.pop(event_id)
             if index >= 4:
                 target_date = process_dates[index - 1]
-                if target_date in target_dates:
+                if target_date in target_dates and target_date not in completed_target_dates:
                     checkpoint_path = _checkpoint_path(run_dir, target_date)
                     checkpoint = _read_checkpoint(checkpoint_path, run_manifest["run_hash"])
                     if checkpoint is None:
@@ -1464,6 +1911,20 @@ def run_development(
                             daily_root,
                             {code: max(0, count - 1) for code, count in visible_history.items()},
                             listing_cache,
+                            allowed_daily_files=allowed_daily_files,
+                            on_listing_progress=lambda completed, total: _atomic_write_json(
+                                run_dir / "progress.json",
+                                {
+                                    "run_id": run_manifest["run_id"],
+                                    "status": "RUNNING",
+                                    "completed_target_dates": len(completed_target_dates),
+                                    "total_target_dates": len(target_dates),
+                                    "source_frontier": index,
+                                    "listing_target_date": target_date,
+                                    "listing_codes_completed": completed,
+                                    "listing_codes_total": total,
+                                },
+                            ),
                         )
                         checkpoint = {"run_hash": run_manifest["run_hash"], "target_date": target_date, "rows": rows, "source_record": source_records[target_date]}
                         _atomic_write_json(checkpoint_path, checkpoint)
@@ -1487,16 +1948,35 @@ def run_development(
                                 pending[row["event_id"]] = event
                             else:
                                 updates[row["event_id"]] = resolved
-                    completed_targets += 1
+                    completed_target_dates.add(target_date)
                     _atomic_write_json(
                         run_dir / "progress.json",
-                        {"run_id": run_manifest["run_id"], "status": "RUNNING", "completed_target_dates": completed_targets, "total_target_dates": len(target_dates)},
+                        {
+                            "run_id": run_manifest["run_id"],
+                            "status": "RUNNING",
+                            "completed_target_dates": len(completed_target_dates),
+                            "total_target_dates": len(target_dates),
+                            "source_frontier": index + 1,
+                        },
                     )
             for code in statistics:
                 visible_history[code] = int(visible_history.get(code, 0)) + 1
             _atomic_write_json(updates_path, updates)
             if index >= 4:
                 source_by_date.pop(process_dates[index - 4], None)
+                source_records.pop(process_dates[index - 4], None)
+            _write_resume_state(
+                run_dir,
+                run_hash=run_manifest["run_hash"],
+                next_index=index + 1,
+                last_trade_date=trade_date,
+                source_by_date=source_by_date,
+                source_records=source_records,
+                visible_history=visible_history,
+                pending=pending,
+                updates=updates,
+                completed_targets=completed_target_dates,
+            )
         for event_id, event in pending.items():
             updates[event_id] = _blocked_outcome(event["outcome"])
         _atomic_write_json(updates_path, updates)
@@ -1511,11 +1991,22 @@ def run_development(
                 if event_id in updates:
                     row["outcome"] = updates[event_id]
             daily_rows[target_date] = rows
-        economic, hashes = _finalize_economic_outputs(run_dir, mode=mode, canary=canary, target_dates=target_dates, daily_rows=daily_rows)
+        economic, hashes = _finalize_economic_outputs(
+            run_dir,
+            mode=mode,
+            canary=canary,
+            target_dates=target_dates,
+            daily_rows=daily_rows,
+            run_manifest=run_manifest,
+            approved_commit=approved,
+        )
         completion = {"status": "SUCCEEDED", "run_id": run_manifest["run_id"], "run_hash": run_manifest["run_hash"], "economic_artifacts": hashes}
         _atomic_write_json(completion_path, completion)
         _atomic_write_json(run_dir / "progress.json", {"run_id": run_manifest["run_id"], "status": "SUCCEEDED", "completed_target_dates": len(target_dates), "total_target_dates": len(target_dates)})
         return economic, run_dir
+    except KeyboardInterrupt:
+        _atomic_write_json(completion_path, {"status": "CANCELLED", "run_id": run_manifest["run_id"], "run_hash": run_manifest["run_hash"], "reason": "keyboard_interrupt"})
+        raise
     except Exception as exc:
         _atomic_write_json(completion_path, {"status": "FAILED", "run_id": run_manifest["run_id"], "run_hash": run_manifest["run_hash"], "reason": getattr(exc, "reason", type(exc).__name__)})
         raise
@@ -1658,6 +2149,7 @@ def main(argv: list[str] | None = None) -> int:
         command.add_argument("--daily-root", required=True)
         command.add_argument("--output-dir", required=True)
         command.add_argument("--resume-run-id")
+    dev_run.add_argument("--approved-commit", required=True)
     args = parser.parse_args(argv)
     if args.command == "preflight":
         result, report_path, digest = run_preflight(args.minute_root, args.daily_root, args.output_dir)
@@ -1674,6 +2166,7 @@ def main(argv: list[str] | None = None) -> int:
             args.output_dir,
             canary=canary,
             resume_run_id=args.resume_run_id,
+            approved_commit=None if canary else args.approved_commit,
         )
         print(
             f"status=verified label={'tnm2a_runner_verified' if canary else 'tnm2_development_completed'} "
