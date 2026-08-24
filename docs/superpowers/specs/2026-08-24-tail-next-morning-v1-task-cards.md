@@ -438,10 +438,23 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 旧失败批 `dev-run-166616198a049a1e` 未被 resume、改写或清理：仍为 `FAILED`、235 个 checkpoint，保留 `.progress.json.74yu6f6a`；其 `completion.json` SHA-256 `fadc749ac11d155ffd62301216464481066930582cfafb89e2018cff586b1afb` 与 temp SHA-256 `6ff9ab903ef67bcb6cf918c88e02e47bb25efe6a099917ad8583d6db29889191` 不变。
 - Terra 终态验收未发现已确认 P0/P1/P2；独立 Sol `TNM-2R` 尚未开始。TNM-3、2025/2026、provider/L2/生产 DB/交易继续锁定。
 
+#### TNM-2R：开发批独立终态审核（Sol）
+
+- verdict：`tnm2r_approve`；P0/P1/P2 均为 0。独立复算确认新 identity 批 `SUCCEEDED`、479/479 checkpoint、spec/source/input/run 身份与经济 artifact SHA-256 闭环一致；479 日 × 6 特征 × 10 桶 = 28,740 条 decile，Spearman rank IC 为 ready 2,868、unavailable 6。
+- 审核复核执行汇总：scheduled `181,105`、successful delayed `27`、阶段末 unresolved `1`；旧失败批 `dev-run-166616198a049a1e` 仍只读保留，含 235 个 checkpoint 与原 temp/FAILED 证据，未被 resume 或改写。
+- 接受结论：开发期可信结果为 `no_stable_development_signal` / `blocked_unresolved_exit`，selected features 为空且无 `frozen_rule.json`，所以不存在可唯一重放至 2025 的规则。
+
+### TNM V1 收口
+
+状态：`tnm_v1_closed_no_stable_development_signal`
+
+- 本次预注册流程至此结束：不启动 2025/2026，不在本流程内调参、重跑或补建规则。该结论只表示本次冻结口径未建立稳定信号，不代表市场绝对不存在信号。
+- 任何后续研究必须以新的任务卡重新冻结假设、样本和验收；不得复用本流程绕过 `no_stable_development_signal` 的停机结论。
+
 ### TNM-3 执行结果
 
-状态：`locked_until_tnm2r_approve`
+状态：`not_run_no_frozen_rule`
 
 ### TNM-4 执行结果
 
-状态：`locked_until_tnm3r_validation_go`
+状态：`not_run_no_frozen_rule`
