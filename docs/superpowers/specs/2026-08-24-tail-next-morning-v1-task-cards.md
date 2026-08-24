@@ -6,7 +6,7 @@
 - 唯一独立审核会话（Sol）：`01a03141-39e9-7dd1-a359-037346adf01b`
 - 仓库：`D:\BaiduNetdiskDownload\cursor workflow\adata_sentiment_dashboard`
 - 冻结起点：`codex/screening-v26@8c2b436`
-- 当前阶段：`TNM-2AF2 ready_after_threshold_contract_simplification`
+- 当前阶段：`TNM-2AF3 ready_after_tnm2ar2_changes_required`
 
 执行者和审核者把本文当完整合同。执行工作只能由 Terra 完成，独立审核只能由 Sol 完成；规划会话负责冻结定义、处理分歧、决定是否进入下一阶段。阶段严格串行，不允许执行与审核同时修改同一文件。
 
@@ -91,7 +91,7 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 - 同时报告 gross、15 bps、30 bps；策略主验收固定使用 round-trip `30 bps`；
 - 500 万容量诊断固定为 Top 10、50 万/股，报告买卖窗口参与率；`0.5%` 仅为保守 deployability 诊断线，不参与选股或 `signal_edge_verdict`。
 
-延迟卖出只使用固定 5 分钟连续竞价网格。先扫描 D+1 `[10:05,10:10)` 至 `[11:25,11:30)`，再扫描 `[13:00,13:05)` 至 `[14:55,15:00)`；仍不可执行则从下一交易日 `[09:30,09:35)` 起按相同网格继续。一个窗口只有在所需 bar 完整、OHLC/amount/volume 合法且 `sum(volume)>0`、`sum(amount)>0` 时才可作为 VWAP 退出。不得跨越当前研究阶段边界读取冻结期：到当年/阶段末仍无可执行退出时标记 `unresolved_exit_at_phase_end`，该阶段经济结论为 `blocked_unresolved_exit`，不得伪造价格或删除样本。
+延迟卖出只使用固定 5 分钟连续竞价网格。先扫描 D+1 `[10:05,10:10)` 至 `[11:25,11:30)`，再扫描 `[13:00,13:05)` 至 `[14:55,15:00)`；仍不可执行则从下一交易日 `[09:30,09:35)` 起按相同网格继续。一个窗口只有在所需 bar 完整、OHLC/amount/volume 合法且 `sum(volume)>0`、`sum(amount)>0` 时才可作为 VWAP 退出。成功延迟退出必须保留 `exit_kind=delayed`、实际交易日/窗口和延迟网格数，经济汇总从该身份计数，不得转成无法区分的普通 `ready`。不得跨越当前研究阶段边界读取冻结期：到当年/阶段末仍无可执行退出时标记 `unresolved_exit_at_phase_end`，该阶段经济结论为 `blocked_unresolved_exit`，不得伪造价格或删除样本。
 
 主信号研究采用事件组合，容量采用独立资金账本：
 
@@ -124,7 +124,7 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 ## 6. 冻结发现与评分程序
 
 - 2023～2024 是唯一开发区；不得读取 2025/2026 结果来选择特征或方向。
-- 每个特征按交易日做横截面 percentile rank，固定为 `rank(method="average", pct=True)`；Bottom decile 为 `rank<=0.10`，Top decile 为 `rank>=0.90`，并列不任意拆分，必须输出实际样本数。最终 Top 10 分数并列按 `sec_code` 升序。单独输出十分位表与每日 Spearman rank IC；IC 只做诊断，不参与选择。
+- 每个特征按交易日做横截面 percentile rank，固定为 `rank(method="average", pct=True)`；分桶必须与冻结尾部分界一致：第 1 桶为 `(0,0.10]`，第 10 桶为 `[0.90,1.00]`，第 2～8 桶为 `((k-1)/10,k/10]`，第 9 桶为 `(0.80,0.90)`。因此 `rank=0.10` 属第 1 桶，`rank=0.90` 和 `1.00` 属第 10 桶。Bottom decile 为 `rank<=0.10`，Top decile 为 `rank>=0.90`，并列不任意拆分。每桶必须输出 `member_count/resolved_count/unresolved_count`；未决成员保留在实际样本数中，且该桶经济均值为 `null + blocked_unresolved`，不得从分母删除。最终 Top 10 分数并列按 `sec_code` 升序。单独输出十分位表与每日 Spearman rank IC；IC 只做诊断，不参与选择。
 - 单日特征 spread 固定为该日 Top decile 全部成员与 Bottom decile 全部成员的 `net30` 算术平均之差；买入失败成员按现金 0 保留，已买入但阶段末未退出则阻断而非删除。年度 spread 是各合格交易日 spread 的等权算术平均。方向只由 2023 spread 的符号决定；2024 同方向才合格，spread 为 0 或任一年无可用日则不合格。
 - 三个预注册组：
   - `tail_price`：特征 1、2，最多选 1 个；
@@ -382,6 +382,14 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 唯一新真实只读 fixed canary：`output/tail-next-morning-v1/dev-preflight/dev-preflight-d98305b5731c58fd`；175.1 秒完成 10 个 target（`20230106,09-13,16-19`）、14 个 2023 ZIP 输入和 10 checkpoint，无完整 `dev-run`、无 2025/2026、provider/L2/ML/生产 DB/scanner。`run_hash=d98305b5731c58fd172d457ff35db3b501d9f878a74c491f44744691f3008da4`，`spec_hash=9c5c3caa01b50e515d40c8a7d1a8fadfd2da3d1fe1f8ad070470cf7fe65bf747`，`runner_source_hash=80b5d56874bca446efbbc805cd04e13e1958d9171f583cb75707f95ec7e60604`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`。输入含 5,532 个日 K XLSX、tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`。
 - 终态与可重启证据：`completion.json=SUCCEEDED`，`resume_state.json` frontier=`next_index:14,last_trade_date:20230120`，`progress.json=10/10`，无 `frozen_rule.json`；`development_results.json` SHA-256 `0fbf4220e36c7bfef4ca3fee528ef4272384017ca9c7541abd8a771b037dcb11`，`daily_results.csv.gz` SHA-256 `574c6f8405bc54e2b1c04977ada6daefbe8f66d8b183ae0782423b965419f462`。每日 eligible 数为 `340,362,344,300,289,266,279,379,271,245`；容量诊断 `capacity_constrained`，只作独立袖套报告。
 - 原 `dev-preflight-31f2a75b8db2112d` 和所有更早 attempt 原样保留；本轮未启动可见的后台 runner，TNM-2B/TNM-3 继续锁定，等待 Sol 只读复审。
+
+#### TNM-2AR2：第二次独立审核（Sol）
+
+- verdict：`tnm2ar2_changes_required`；原指定 Sol 会话已独立关闭 D+1 诊断/卖出隔离、上市阈值证明和完整输入哈希，后因会话 `notLoaded` 故障无法给最终 verdict；规划会话按进度上限改派全新、无上下文继承的 `gpt-5.6-sol` 只读补审，未降低执行/审核隔离。
+- 已关闭：双年正收益 ready gate，任一年负收益/no feature/unresolved 的 `no_stable_development_signal`，旧 `frozen_rule.json` 清除；resume 从 checkpoint frontier 继续且不重读已完成容器，状态含 rolling history、visible sessions、pending exits 和 completed targets。
+- P1-4a：十分位实现把 `rank=0.10` 放入第 2 桶，且 unresolved 成员从分桶样本数删除，导致每日十分位证据不能按冻结规则复算。
+- P1-4b：成功延迟卖出经完成态转换后丢失延迟身份，`_execution_summary` 会把真实延迟退出计为 0，导致开发产物低报延迟执行。
+- 最窄修复边界已回写第 4、6 节；只解锁 Terra 的 TNM-2AF3 分桶/退出身份修复、定向测试与新 fixed canary。TNM-2B、2025/2026 继续锁定。
 
 ### TNM-3 执行结果
 
