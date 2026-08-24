@@ -242,7 +242,14 @@ git diff --check
 
 ### TNM-1 执行结果
 
-状态：`not_started`
+状态：`tnm1_preflight_verified`
+
+- 执行者：Terra，会话 `01a03137-df48-7281-b7d7-b48f7e41f209`；未进入 TNM-2。
+- 定向验证通过：`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（7 tests）和 `-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py`。
+- 真实只读预检通过：固定 `2023-01-06` ZIP、`2024-01-05` 日目录、`2026-01-08` ZIP；每组只读 D-3～D+1 的 `000001,300750,600000`，未扫描 839 日，未读取任何冻结期结果、L2 或 provider。
+- 预检产物（ignored）：`output/tail-next-morning-v1/preflight/preflight-attempt-03.json`，SHA-256 `a4e76387e843f7f9d9b24f0a7d9063824e251f048def2d4597368e687cc2c792`；三组共 15 个日容器均为预期格式，9 个代码样本中 7 个特征就绪，2 个 `600000` 因 D-1 amount 未严格大于 5 亿隔离；日 K/分钟成交额比范围 `0.999934110`～`1.000012341`。
+- 降级边界已写入产物：`st_filter_applied=false`、`st_status=unavailable_not_filtered`、`corporate_action_filter=unproven_not_applied`、`capacity_verdict_5m=capacity_unproven_no_frozen_rank`；容量未影响排名，且尚无冻结 Top 10，因此不形成容量结论。
+- 已知限制：日 K 仅用于上市历史与成交额交叉核对，未用于 D 14:50 决策；公司行为没有可证明的字段合同，故未猜测或过滤；VWAP 仍只是小单基准。此前一次因同日 ZIP/目录并存触发的解析 partial 产物已保留在同目录，修正为 ZIP 确定性优先后才得到本结果。
 
 ### TNM-2 执行结果
 
