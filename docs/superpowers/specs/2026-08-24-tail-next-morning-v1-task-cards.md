@@ -6,7 +6,7 @@
 - 唯一独立审核会话（Sol）：`01a03141-39e9-7dd1-a359-037346adf01b`
 - 仓库：`D:\BaiduNetdiskDownload\cursor workflow\adata_sentiment_dashboard`
 - 冻结起点：`codex/screening-v26@8c2b436`
-- 当前阶段：`TNM-2AF3 ready_after_tnm2ar2_changes_required`
+- 当前阶段：`TNM-2B ready_after_tnm2ar3_approve`
 
 执行者和审核者把本文当完整合同。执行工作只能由 Terra 完成，独立审核只能由 Sol 完成；规划会话负责冻结定义、处理分歧、决定是否进入下一阶段。阶段严格串行，不允许执行与审核同时修改同一文件。
 
@@ -400,6 +400,13 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 唯一新真实只读 fixed canary（ignored）：`output/tail-next-morning-v1/dev-preflight/dev-preflight-bb6f5b513be53447`；228.652 秒完成 10 个 target（`20230106,09-13,16-19`）、14 个 2023 ZIP 输入容器和 10 checkpoint。每日 eligible 为 `340,362,344,300,289,266,279,379,271,245`，策略恒定 100 槽；`execution_summary` 为 scheduled `3074`、delayed `1`、unresolved `0`。实际分桶 CSV 有 600 行和全部冻结字段。
 - 身份与终态：`completion.json=SUCCEEDED`、`progress.json=10/10`、`resume_state.json` frontier=`next_index:14,last_trade_date:20230120`，无 `frozen_rule.json`、`run.lock` 或任务 runner 进程。`run_hash=bb6f5b513be53447e55250c9fed2a6e17989d690f5778e6794ba08ed962aa1a5`，`spec_hash=b14df854428a305bf05ffe9be2adbb46cf713732fcbb06430046c0998decf83f`，`runner_source_hash=f5632b022dc2d26a0721b2aa5a80ffe9e46217f4f2ea4669ddc831250249c898`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`（5,532 个日 K、tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`）。经济 artifact SHA-256：`development_results.json=e826a53fd0feaca9055c4247e1bcdd04c0d79498b07ebd73e4b49d7ce78eb3f5`、`daily_results.csv.gz=574c6f8405bc54e2b1c04977ada6daefbe8f66d8b183ae0782423b965419f462`、`daily_deciles.csv.gz=3bbc9c9353f80f029572a69c371720368e7ab56b2e37334de03e0eb32d61bb1e`。
 - 第 11 节追加后复算 `spec_hash/run_id` 保持不变；所有既有 attempts（含 cancelled/superseded evidence）原样保留。本轮未运行完整 `dev-run`、2025/2026、provider/L2/ML/生产 DB/scanner；TNM-2B 继续锁定，等待独立 Sol AR3 只读复审。
+
+#### TNM-2AR3：runner 最终独立批准（Sol）
+
+- verdict：`tnm2ar3_approve`；审核对象 `5997437`，无 P0/P1/P2。十分位边界/并列/未决成员阻断及 600 行 JSON/CSV 一致，scheduled/delayed/unresolved 身份与延迟计数正确，VWAP 和收益算法未改变。
+- canary 独立复算通过：`SUCCEEDED`、10 targets、14 ZIP、10 checkpoints、frontier 14；scheduled `3074`、delayed `1`、unresolved `0`；spec/source/input/run 与三个经济产物 SHA 全匹配，`daily_results.csv.gz` 与前一 canary 字节相同。
+- 24 tests、临时目录内 `py_compile`、`git diff --check` 通过；三路径白名单、10 个用户 dirty、空暂存区保持不变，无 `frozen_rule.json`、`run.lock` 或 runner 进程。
+- 六个原 P1 全部关闭。只解锁从批准 runner package 启动 TNM-2B detached 2023～2024 开发批；不授权 2025/2026、provider、L2、生产 DB 或交易。
 
 ### TNM-3 执行结果
 
