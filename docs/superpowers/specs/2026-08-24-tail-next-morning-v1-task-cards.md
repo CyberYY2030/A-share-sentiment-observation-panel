@@ -425,6 +425,19 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - `tests.test_tail_next_morning`（25 tests）、`py_compile`、`git diff --check` 通过；三路径白名单和并发 dirty 边界保持。
 - 旧 `dev-run-166616198a049a1e` 因 runner source/approved commit 变化必须触发 `resume_hash_mismatch`，继续只读保留，禁止接管或覆盖。当前阶段：`TNM-2B new-identity launch ready`；只允许以本审核结论后的 docs launch commit 启动一个新的 detached 2023～2024 开发批，2025/2026 继续锁定。
 
+### TNM-2B 执行结果
+
+状态：`tnm2b_completed_waiting_tnm2r`
+
+- 新 identity 批 `output/tail-next-morning-v1/development/dev-run-b1e3d0de27cd65ce` 已原子完成：`completion.json=SUCCEEDED`、`progress.json=479/479`，完成于 `2026-08-24 19:03:40 +08:00`；stdout 为 `tnm2_development_completed`，stderr 为 0 bytes。任务 PID `39704` 已退出，无 `run.lock`、无活跃 `mining.tail_next_morning dev-run` writer。
+- 身份闭环复算：launch `code_commit=fee83c041a065afe43767293b16c5365189e1757`，`run_id=dev-run-b1e3d0de27cd65ce`，`run_hash=b1e3d0de27cd65ce4d170efc4a4eda87105d06b689c7a5afcc695ff6242225f1`，`spec_hash=4688739f65f4df1d29e938d1684c59dc83816f6317d4d961ae3017778f664bf6`，`runner_source_hash=a1f06ad563448a6b46e819ed319178b2bc599e73bc0ca0a1596adaae30561d57`，`input_manifest_hash=45aaeaed69e27f44d53989085cee2893da64160d970e920b7416679cb7ff4a57`。输入固定为 484 个 2023～2024 分钟容器及 5,532 个日 K 候选文件（tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`）；未读取 2025/2026。
+- 完整性：479 个 checkpoint 均可解析、`run_hash/target_date/source_record.trade_date` 与文件名一致，共 2,380,091 行；`resume_state` 为 479 completed、frontier `next_index=484,last_trade_date=20241231`。终态 `outcome_updates` 比最后可恢复 state 多 1 条且无改写：`20241227|000016` 从 pending delayed 结算为 `unresolved_exit_at_phase_end`，符合阶段末阻断。经济 artifact SHA-256：`development_results.json=29ee72d34907bcca53148555e9b25b36cf52ed32f5065cef698d109f989f11af`，`daily_deciles.csv.gz=12bbbfd6fca30e1b513169962015f1f80519728140ae61f8cf59bcd18a853a37`，`daily_results.csv.gz=d30ed2ac82228d30294632e9202874178290e05fbbfd5154460f982e4ede3074`；均与 `completion.json`/`sha256_manifest.json` 一致。
+- 真实研究结论：`selection_status=no_stable_development_signal`，`feature_selection.status=blocked_unresolved_exit`，selected features 为空，未写 `frozen_rule.json`；因此没有产生正向 `signal_edge_verdict`，也没有策略、Top 10、随机或全体基准的可用 `mean_daily_net30`（2023/2024 均为 `null`、0 available days）。这是一项有效的 fail-closed 结果，不作调参或重跑。
+- 六特征 Top-minus-Bottom `net30` 年均 spread（2023 / 2024，%）：`tail_return_rel -0.0478/-0.0173`、`tail_end_location -0.1073/+0.0518`、`tail_amount_accel -0.1149/+0.0033`、`pre_tail_return_rel -0.2821/-0.1485`、`activity_ratio -0.3142/-0.3428`、`recent_3date_return_rel -0.3948/-0.4774`。十分位产物覆盖 479 日 × 6 特征 × 10 桶 = 28,740 条（ready 28,674、blocked_unresolved 6、unavailable 60；unresolved members 6）；每日 Spearman rank IC 为 ready 2,868、unavailable 6。
+- 执行/质量与容量：scheduled exit `181,105`、successful delayed `27`、阶段末 unresolved `1`、cash unfilled buy `0`、outcome unavailable `0`、feature isolated `2,198,958`。容量为 `capacity_unproven`（`no_selected_features`，500 万/10×50 万袖套）；`st_filter_applied=false`、`st_status=unavailable_not_filtered`、`corporate_action_filter=unproven_not_applied`、queue 为 VWAP 小单基准未建模。
+- 旧失败批 `dev-run-166616198a049a1e` 未被 resume、改写或清理：仍为 `FAILED`、235 个 checkpoint，保留 `.progress.json.74yu6f6a`；其 `completion.json` SHA-256 `fadc749ac11d155ffd62301216464481066930582cfafb89e2018cff586b1afb` 与 temp SHA-256 `6ff9ab903ef67bcb6cf918c88e02e47bb25efe6a099917ad8583d6db29889191` 不变。
+- Terra 终态验收未发现已确认 P0/P1/P2；独立 Sol `TNM-2R` 尚未开始。TNM-3、2025/2026、provider/L2/生产 DB/交易继续锁定。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`
