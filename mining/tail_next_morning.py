@@ -477,17 +477,31 @@ def capacity_diagnostic(ranked_rows: Iterable[Mapping[str, Any]]) -> dict[str, A
     }
 
 
+def _full_day_minute_amount(bars: pd.DataFrame) -> tuple[float | None, str | None]:
+    values = pd.to_numeric(bars["amount"], errors="coerce")
+    if values.isna().any() or not values.map(math.isfinite).all():
+        return None, "minute_amount_non_finite"
+    if values.lt(0).any():
+        return None, "minute_amount_negative"
+    return float(values.sum()), None
+
+
 def daily_minute_amount_ratio(daily_amount: float | None, bars: pd.DataFrame) -> float | None:
-    minute_amount = float(bars["amount"].sum())
-    if daily_amount is None or not math.isfinite(float(daily_amount)) or minute_amount <= 0:
+    minute_amount, reason = _full_day_minute_amount(bars)
+    if reason is not None or daily_amount is None or not math.isfinite(float(daily_amount)) or minute_amount is None or minute_amount <= 0:
         return None
     return float(daily_amount) / minute_amount
 
 
 def daily_minute_crosscheck(daily_amount: float | None, bars: pd.DataFrame) -> dict[str, Any]:
-    ratio = daily_minute_amount_ratio(daily_amount, bars)
-    if ratio is None:
-        return {"status": "unavailable", "ratio": None}
+    minute_amount, minute_reason = _full_day_minute_amount(bars)
+    if minute_reason is not None:
+        return {"status": "invalid", "reason": minute_reason, "ratio": None}
+    if daily_amount is None or not math.isfinite(float(daily_amount)):
+        return {"status": "unavailable", "reason": "daily_amount_missing_or_invalid", "ratio": None}
+    if minute_amount is None or minute_amount <= 0:
+        return {"status": "unavailable", "reason": "minute_amount_zero", "ratio": None}
+    ratio = float(daily_amount) / minute_amount
     status = "ready" if abs(ratio - 1.0) <= DAILY_MINUTE_AMOUNT_RATIO_TOLERANCE else "mismatch"
     return {"status": status, "ratio": ratio}
 
@@ -545,7 +559,8 @@ def _preflight_sample(minute_root: Path, daily_root: Path, sample: Mapping[str, 
         outcome = outcome_snapshot(day, next_day)
         amount_crosscheck = daily_minute_crosscheck(listing.get("daily_amount"), day) if day is not None else {"status": "unavailable", "ratio": None}
         if day is not None and amount_crosscheck["status"] != "ready":
-            sample_errors.append(f"daily_minute_amount_{amount_crosscheck['status']}:{code}")
+            reason = amount_crosscheck.get("reason", "ratio_out_of_tolerance")
+            sample_errors.append(f"daily_minute_amount_{amount_crosscheck['status']}:{code}:{reason}")
         rows.append(
             {
                 **snapshot,

@@ -39,7 +39,7 @@ def listing() -> dict[str, object]:
 class TailNextMorningTests(unittest.TestCase):
     _PREFLIGHT_DATES = ("20260105", "20260106", "20260107", "20260108", "20260109")
 
-    def _preflight_row(self, *, mutate=None, omit_next_day_code: bool = False, truncate_next_day_code: bool = False):
+    def _preflight_row(self, *, mutate=None, omit_next_day_code: bool = False, truncate_next_day_code: bool = False, include_preflight: bool = False):
         from mining.tail_next_morning import PREFLIGHT_CODES, _preflight_sample, rank_scored_rows
 
         sample = {
@@ -71,6 +71,8 @@ class TailNextMorningTests(unittest.TestCase):
             for code, row in rows.items()
             if row["feature_status"] == "ready"
         )
+        if include_preflight:
+            return rows["000001"], ranking, preflight
         return rows["000001"], ranking
 
     @staticmethod
@@ -153,6 +155,24 @@ class TailNextMorningTests(unittest.TestCase):
         self.assertEqual(row["feature_status"], "isolated")
         self.assertEqual(row["feature_reason"], "non_positive_ohlc")
         self.assertNotIn("000001", [ranked["sec_code"] for ranked in ranking])
+
+    def test_preflight_amount_crosscheck_rejects_future_nan_and_inf_without_changing_signal(self) -> None:
+        baseline, baseline_rank = self._preflight_row()
+        baseline_feature = self._feature_signature(baseline)
+        baseline_outcome = baseline["outcome"]
+        for value in (float("nan"), float("inf")):
+            with self.subTest(value=value):
+                def mutate(bars, date, *, changed_value=value):
+                    if date == "20260108":
+                        bars.loc[236, "amount"] = changed_value
+
+                row, ranking, preflight = self._preflight_row(mutate=mutate, include_preflight=True)
+                self.assertEqual(self._feature_signature(row), baseline_feature)
+                self.assertEqual(ranking, baseline_rank)
+                self.assertEqual(row["outcome"], baseline_outcome)
+                self.assertEqual(row["daily_minute_amount_crosscheck"]["status"], "invalid")
+                self.assertEqual(row["daily_minute_amount_crosscheck"]["reason"], "minute_amount_non_finite")
+                self.assertIn("daily_minute_amount_invalid:000001:minute_amount_non_finite", preflight["sample_errors"])
 
     def test_dplus1_changes_outcome_only(self) -> None:
         from mining.tail_next_morning import feature_snapshot, outcome_snapshot
@@ -238,6 +258,13 @@ class TailNextMorningTests(unittest.TestCase):
         bars = make_bars()
         self.assertAlmostEqual(daily_minute_amount_ratio(float(bars["amount"].sum()), bars), 1.0)
         self.assertEqual(daily_minute_crosscheck(float(bars["amount"].sum()), bars)["status"], "ready")
+        self.assertEqual(daily_minute_crosscheck(None, bars)["status"], "unavailable")
+        bars.loc[236, "amount"] = float("nan")
+        self.assertIsNone(daily_minute_amount_ratio(2_400_000_000.0, bars))
+        self.assertEqual(daily_minute_crosscheck(2_400_000_000.0, bars)["status"], "invalid")
+        negative = make_bars()
+        negative.loc[236, "amount"] = -1.0
+        self.assertEqual(daily_minute_crosscheck(2_400_000_000.0, negative)["reason"], "minute_amount_negative")
         degraded = feature_snapshot("000001", bars, [make_bars() for _ in range(3)], {"listing_age_source": "minute_source_visible_history", "listing_history_sessions": 3})
         self.assertEqual(degraded["feature_reason"], "listing_history_under_20")
         self.assertFalse(degraded["st_filter_applied"])
