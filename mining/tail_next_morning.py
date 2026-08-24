@@ -1009,7 +1009,17 @@ def feature_snapshot_from_statistics(
     }
 
 
-def _completed_outcome(buy: Mapping[str, Any], sell: Mapping[str, Any], mfe: float | None, mae: float | None, exit_date: str) -> dict[str, Any]:
+def _completed_outcome(
+    buy: Mapping[str, Any],
+    sell: Mapping[str, Any],
+    mfe: float | None,
+    mae: float | None,
+    exit_date: str,
+    *,
+    exit_kind: str,
+    exit_window: str,
+    delay_grid_count: int,
+) -> dict[str, Any]:
     gross = float(float(sell["vwap"]) / float(buy["vwap"]) - 1.0)
     return {
         "outcome_status": "ready",
@@ -1021,6 +1031,10 @@ def _completed_outcome(buy: Mapping[str, Any], sell: Mapping[str, Any], mfe: flo
         "mfe_0930_1000": mfe,
         "mae_0930_1000": mae,
         "exit_date": exit_date,
+        "exit_trade_date": exit_date,
+        "exit_kind": exit_kind,
+        "exit_window": exit_window,
+        "delay_grid_count": int(delay_grid_count),
     }
 
 
@@ -1038,6 +1052,10 @@ def outcome_from_statistics(day: Mapping[str, Any] | None, next_day: Mapping[str
             **_unavailable_outcome("delayed_exit_required", dict(buy)),
             "outcome_status": "delayed_exit_required",
             "exit_date": None,
+            "exit_trade_date": None,
+            "exit_kind": "pending_delayed",
+            "exit_window": None,
+            "delay_grid_count": 0,
         }
     diagnostic = next_day.get("morning_diagnostic", {})
     if diagnostic.get("status") == "ready":
@@ -1048,7 +1066,16 @@ def outcome_from_statistics(day: Mapping[str, Any] | None, next_day: Mapping[str
         mae = None
     sell = next_day.get("morning_sell", {})
     if sell.get("status") == "ready":
-        return _completed_outcome(buy, sell, mfe, mae, next_date)
+        return _completed_outcome(
+            buy,
+            sell,
+            mfe,
+            mae,
+            next_date,
+            exit_kind="scheduled",
+            exit_window="10:00-10:05",
+            delay_grid_count=0,
+        )
     return {
         "outcome_status": "delayed_exit_required",
         "buy": dict(buy),
@@ -1059,6 +1086,10 @@ def outcome_from_statistics(day: Mapping[str, Any] | None, next_day: Mapping[str
         "mfe_0930_1000": mfe,
         "mae_0930_1000": mae,
         "exit_date": None,
+        "exit_trade_date": None,
+        "exit_kind": "pending_delayed",
+        "exit_window": None,
+        "delay_grid_count": 0,
     }
 
 
@@ -1076,8 +1107,12 @@ def resolve_delayed_exit(
     if day_statistics is None or outcome.get("outcome_status") != "delayed_exit_required":
         return None
     allowed = set(DELAYED_FIRST_DAY_WINDOWS if first_delayed_day else DELAYED_LATER_DAY_WINDOWS)
+    delay_grid_count = int(outcome.get("delay_grid_count") or 0)
     for window in day_statistics.get("delayed_exit_windows", []):
-        if (window.get("start"), window.get("end")) not in allowed or window.get("status") != "ready":
+        if (window.get("start"), window.get("end")) not in allowed:
+            continue
+        delay_grid_count += 1
+        if window.get("status") != "ready":
             continue
         return _completed_outcome(
             outcome["buy"],
@@ -1085,7 +1120,12 @@ def resolve_delayed_exit(
             outcome.get("mfe_0930_1000"),
             outcome.get("mae_0930_1000"),
             str(trade_date),
+            exit_kind="delayed",
+            exit_window=f"{window['start']}-{window['end']}",
+            delay_grid_count=delay_grid_count,
         )
+    if isinstance(outcome, dict):
+        outcome["delay_grid_count"] = delay_grid_count
     return None
 
 
@@ -1587,6 +1627,9 @@ def _blocked_outcome(outcome: Mapping[str, Any]) -> dict[str, Any]:
         "net_return_15bps": None,
         "net_return_30bps": None,
         "exit_date": None,
+        "exit_trade_date": None,
+        "exit_kind": "unresolved",
+        "exit_window": None,
     }
 
 
@@ -1674,6 +1717,38 @@ def _write_economic_csv(path: Path, portfolios: list[dict[str, Any]]) -> None:
     _atomic_write_bytes(path, compressed.getvalue())
 
 
+def _write_daily_deciles_csv(path: Path, deciles: Mapping[str, Mapping[str, list[Mapping[str, Any]]]]) -> None:
+    stream = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        stream,
+        fieldnames=("trade_date", "feature", "decile", "bucket", "member_count", "resolved_count", "unresolved_count", "mean_net30", "status"),
+        lineterminator="\n",
+    )
+    writer.writeheader()
+    for trade_date, features in sorted(deciles.items()):
+        for feature in FEATURE_NAMES:
+            for bucket in features.get(feature, []):
+                writer.writerow({"trade_date": trade_date, "feature": feature, **dict(bucket)})
+    compressed = io.BytesIO()
+    with gzip.GzipFile(fileobj=compressed, mode="wb", filename="", mtime=0) as handle:
+        handle.write(stream.getvalue().encode("utf-8"))
+    _atomic_write_bytes(path, compressed.getvalue())
+
+
+def _frozen_decile_index(percentile: Any) -> int | None:
+    if not isinstance(percentile, (int, float)) or not math.isfinite(float(percentile)):
+        return None
+    value = float(percentile)
+    if not 0.0 < value <= 1.0:
+        return None
+    if value <= 0.10:
+        return 0
+    for index, upper in enumerate((0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80), start=1):
+        if value <= upper:
+            return index
+    return 8 if value < 0.90 else 9
+
+
 def _daily_deciles_and_rank_ic(daily_rows: Mapping[str, list[dict[str, Any]]]) -> tuple[dict[str, Any], dict[str, Any]]:
     deciles: dict[str, Any] = {}
     rank_ic: dict[str, Any] = {}
@@ -1683,18 +1758,30 @@ def _daily_deciles_and_rank_ic(daily_rows: Mapping[str, list[dict[str, Any]]]) -
         deciles[trade_date] = {}
         rank_ic[trade_date] = {}
         for feature in FEATURE_NAMES:
-            buckets: list[list[float]] = [[] for _ in range(10)]
+            buckets = [{"member_count": 0, "resolved_count": 0, "unresolved_count": 0, "values": []} for _ in range(10)]
             pairs: list[tuple[float, float]] = []
             for row, net30 in zip(ready, returns):
                 percentile = row.get("feature_percentiles", {}).get(feature)
-                if isinstance(percentile, (int, float)) and math.isfinite(float(percentile)):
-                    bucket = min(9, max(0, int(float(percentile) * 10)))
-                    if net30 is not None:
-                        buckets[bucket].append(float(net30))
+                bucket = _frozen_decile_index(percentile)
+                if bucket is not None:
+                    buckets[bucket]["member_count"] += 1
+                    if net30 is None:
+                        buckets[bucket]["unresolved_count"] += 1
+                    else:
+                        buckets[bucket]["resolved_count"] += 1
+                        buckets[bucket]["values"].append(float(net30))
                         pairs.append((float(percentile), float(net30)))
             deciles[trade_date][feature] = [
-                {"decile": index + 1, "count": len(values), "mean_net30": float(sum(values) / len(values)) if values else None}
-                for index, values in enumerate(buckets)
+                {
+                    "decile": index + 1,
+                    "bucket": f"d{index + 1}",
+                    "member_count": bucket["member_count"],
+                    "resolved_count": bucket["resolved_count"],
+                    "unresolved_count": bucket["unresolved_count"],
+                    "mean_net30": None if bucket["unresolved_count"] else (float(sum(bucket["values"]) / len(bucket["values"])) if bucket["values"] else None),
+                    "status": "blocked_unresolved" if bucket["unresolved_count"] else ("ready" if bucket["resolved_count"] else "unavailable"),
+                }
+                for index, bucket in enumerate(buckets)
             ]
             if len(pairs) < 2 or len(pairs) != len(ready):
                 rank_ic[trade_date][feature] = {"status": "unavailable", "spearman_rank_ic": None, "count": len(pairs)}
@@ -1762,16 +1849,19 @@ def _strategy_performance(portfolios: Iterable[Mapping[str, Any]]) -> dict[str, 
 
 
 def _execution_summary(daily_rows: Mapping[str, list[dict[str, Any]]]) -> dict[str, Any]:
-    counters = {"feature_isolated": 0, "cash_unfilled_buy": 0, "delayed_exit": 0, "unresolved_exit": 0, "outcome_unavailable": 0}
+    counters = {"feature_isolated": 0, "cash_unfilled_buy": 0, "scheduled_exit": 0, "delayed_exit": 0, "unresolved_exit": 0, "outcome_unavailable": 0}
     for rows in daily_rows.values():
         for row in rows:
             if row.get("feature_status") != "ready":
                 counters["feature_isolated"] += 1
                 continue
             status = (row.get("outcome") or {}).get("outcome_status")
+            outcome = row.get("outcome") or {}
             if status == "cash_unfilled_buy":
                 counters["cash_unfilled_buy"] += 1
-            elif status == "delayed_exit_required":
+            elif status == "ready" and outcome.get("exit_kind") == "scheduled":
+                counters["scheduled_exit"] += 1
+            elif status == "ready" and outcome.get("exit_kind") == "delayed":
                 counters["delayed_exit"] += 1
             elif status == "unresolved_exit_at_phase_end":
                 counters["unresolved_exit"] += 1
@@ -1848,11 +1938,14 @@ def _finalize_economic_outputs(
     }
     result_path = run_dir / "development_results.json"
     csv_path = run_dir / "daily_results.csv.gz"
+    deciles_csv_path = run_dir / "daily_deciles.csv.gz"
     _atomic_write_json(result_path, economic)
     _write_economic_csv(csv_path, portfolios)
+    _write_daily_deciles_csv(deciles_csv_path, deciles)
     artifact_hashes = {
         result_path.name: hashlib.sha256(result_path.read_bytes()).hexdigest(),
         csv_path.name: hashlib.sha256(csv_path.read_bytes()).hexdigest(),
+        deciles_csv_path.name: hashlib.sha256(deciles_csv_path.read_bytes()).hexdigest(),
     }
     frozen_path = run_dir / "frozen_rule.json"
     if not canary and selection_status == "ready":

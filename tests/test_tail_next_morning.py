@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import gzip
 import io
 import json
 import tempfile
@@ -458,21 +460,56 @@ class TailNextMorningTests(unittest.TestCase):
         self.assertEqual(tail_price["feature"], "tail_return_rel")
 
     def test_delayed_exit_grid_year_boundary_and_unresolved_block(self) -> None:
-        from mining.tail_next_morning import _blocked_outcome, minute_sufficient_statistics, outcome_from_statistics, resolve_delayed_exit
+        from mining.tail_next_morning import _blocked_outcome, _execution_summary, minute_sufficient_statistics, outcome_from_statistics, resolve_delayed_exit
 
         day = make_bars()
+        scheduled = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(make_bars()), "20231229")
+        self.assertEqual((scheduled["exit_kind"], scheduled["exit_trade_date"], scheduled["exit_window"], scheduled["delay_grid_count"]), ("scheduled", "20231229", "10:00-10:05", 0))
         next_day = make_bars()
         next_day.loc[30:34, ["amount", "volume"]] = 0.0
         delayed = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(next_day), "20231229")
         self.assertEqual(delayed["outcome_status"], "delayed_exit_required")
         resolved = resolve_delayed_exit(delayed, minute_sufficient_statistics(next_day), "20231229", "20231228", first_delayed_day=True)
         self.assertEqual(resolved["outcome_status"], "ready")
+        self.assertEqual((resolved["exit_kind"], resolved["exit_trade_date"], resolved["exit_window"], resolved["delay_grid_count"]), ("delayed", "20231229", "10:05-10:10", 1))
+        self.assertEqual(resolved["sell"]["vwap"], minute_sufficient_statistics(next_day)["delayed_exit_windows"][7]["vwap"])
         next_day.loc[35:, ["amount", "volume"]] = 0.0
         still_delayed = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(next_day), "20231229")
         later = resolve_delayed_exit(still_delayed, minute_sufficient_statistics(make_bars()), "20231230", "20231228", first_delayed_day=False)
         self.assertEqual(later["outcome_status"], "ready")
         self.assertIsNone(resolve_delayed_exit(delayed, minute_sufficient_statistics(next_day), "20240102", "20231228", first_delayed_day=False))
-        self.assertEqual(_blocked_outcome(delayed)["outcome_status"], "unresolved_exit_at_phase_end")
+        unresolved = _blocked_outcome(delayed)
+        self.assertEqual((unresolved["outcome_status"], unresolved["exit_kind"]), ("unresolved_exit_at_phase_end", "unresolved"))
+        summary = _execution_summary({"20231228": [
+            {"feature_status": "ready", "outcome": scheduled},
+            {"feature_status": "ready", "outcome": resolved},
+            {"feature_status": "ready", "outcome": unresolved},
+        ]})
+        self.assertEqual({key: summary[key] for key in ("scheduled_exit", "delayed_exit", "unresolved_exit")}, {"scheduled_exit": 1, "delayed_exit": 1, "unresolved_exit": 1})
+
+    def test_frozen_decile_boundaries_counts_and_unresolved_block(self) -> None:
+        from mining.tail_next_morning import FEATURE_NAMES, _daily_deciles_and_rank_ic
+
+        def row(code: str, rank: float, net30: float | None) -> dict[str, object]:
+            percentiles = {feature: rank for feature in FEATURE_NAMES}
+            outcome = {"outcome_status": "ready", "net_return_30bps": net30} if net30 is not None else {"outcome_status": "unresolved_exit_at_phase_end", "net_return_30bps": None}
+            return {"sec_code": code, "feature_status": "ready", "feature_percentiles": percentiles, "outcome": outcome}
+
+        rows = [row(f"600{index:03d}", index / 10.0, 0.001 * index) for index in range(1, 11)]
+        deciles, _ = _daily_deciles_and_rank_ic({"20230106": rows})
+        buckets = deciles["20230106"]["tail_return_rel"]
+        self.assertEqual([bucket["member_count"] for bucket in buckets], [1, 1, 1, 1, 1, 1, 1, 1, 0, 2])
+        self.assertEqual([bucket["bucket"] for bucket in buckets], [f"d{index}" for index in range(1, 11)])
+        self.assertEqual((buckets[0]["resolved_count"], buckets[9]["resolved_count"]), (1, 2))
+
+        ties = rows + [row("601000", 0.90, 0.011)]
+        tied_deciles, _ = _daily_deciles_and_rank_ic({"20230106": ties})
+        self.assertEqual(tied_deciles["20230106"]["tail_return_rel"][9]["member_count"], 3)
+
+        blocked_rows = [row("600000", 0.10, 0.001), row("600001", 0.10, None)]
+        blocked_deciles, _ = _daily_deciles_and_rank_ic({"20230106": blocked_rows})
+        blocked = blocked_deciles["20230106"]["tail_return_rel"][0]
+        self.assertEqual({key: blocked[key] for key in ("member_count", "resolved_count", "unresolved_count", "mean_net30", "status")}, {"member_count": 2, "resolved_count": 1, "unresolved_count": 1, "mean_net30": None, "status": "blocked_unresolved"})
 
     def test_checkpoint_hash_conflict_and_canary_no_frozen_rule(self) -> None:
         from mining.tail_next_morning import TailDataError, _prepare_development_run, run_dev_preflight
@@ -613,6 +650,13 @@ class TailNextMorningTests(unittest.TestCase):
             rule = json.loads((Path(tmp) / "frozen_rule.json").read_text(encoding="utf-8"))
             self.assertIn("execution_contract", rule)
             self.assertEqual(rule["binding"]["approved_commit"], "approved")
+            with gzip.open(Path(tmp) / "daily_deciles.csv.gz", "rt", encoding="utf-8", newline="") as handle:
+                decile_csv = list(csv.DictReader(handle))
+            self.assertEqual(decile_csv[0].keys(), {"trade_date", "feature", "decile", "bucket", "member_count", "resolved_count", "unresolved_count", "mean_net30", "status"})
+            json_d1 = economic["daily_deciles"]["20230106"]["tail_return_rel"][0]
+            csv_d1 = next(row for row in decile_csv if row["trade_date"] == "20230106" and row["feature"] == "tail_return_rel" and row["bucket"] == "d1")
+            self.assertEqual(csv_d1["member_count"], str(json_d1["member_count"]))
+            self.assertEqual(csv_d1["status"], json_d1["status"])
 
             blocked_rows = {"20230106": rows_for_year("2023", 0.001), "20240105": rows_for_year("2024", -0.020)}
             economic, _ = _finalize_economic_outputs(Path(tmp), mode="dev-run", canary=False, target_dates=sorted(blocked_rows), daily_rows=blocked_rows, run_manifest=manifest, approved_commit="approved")

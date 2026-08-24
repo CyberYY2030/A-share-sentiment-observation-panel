@@ -391,6 +391,16 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - P1-4b：成功延迟卖出经完成态转换后丢失延迟身份，`_execution_summary` 会把真实延迟退出计为 0，导致开发产物低报延迟执行。
 - 最窄修复边界已回写第 4、6 节；只解锁 Terra 的 TNM-2AF3 分桶/退出身份修复、定向测试与新 fixed canary。TNM-2B、2025/2026 继续锁定。
 
+### TNM-2AF3 执行结果
+
+状态：`tnm2af3_runner_verified`
+
+- 最窄修复：百分位按冻结边界写入 `d1=(0,.10]`、`d2..d8=((k-1)/10,k/10]`、`d9=(.80,.90)`、`d10=[.90,1]`；每桶 JSON 与 `daily_deciles.csv.gz` 一致包含 `member_count`、`resolved_count`、`unresolved_count`、`mean_net30`、`status`。未决成员保留在分母，桶均值为 `null` 且状态为 `blocked_unresolved`。成功的延迟卖出保留 `exit_kind=delayed`、实际 `exit_trade_date`、`exit_window`、`delay_grid_count`；按时卖出标为 `scheduled`，执行汇总据此计数，未改动 VWAP、收益、网格或未决规则。
+- 定向验收：`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（24 tests）、`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py` 与 `git diff --check` 全部通过。回归覆盖 `.10/.90` 边界和并列、未决桶阻断、scheduled/delayed/unresolved 身份及既有双年 gate、resume、输入身份、上市阈值、D+1 诊断隔离。
+- 唯一新真实只读 fixed canary（ignored）：`output/tail-next-morning-v1/dev-preflight/dev-preflight-bb6f5b513be53447`；228.652 秒完成 10 个 target（`20230106,09-13,16-19`）、14 个 2023 ZIP 输入容器和 10 checkpoint。每日 eligible 为 `340,362,344,300,289,266,279,379,271,245`，策略恒定 100 槽；`execution_summary` 为 scheduled `3074`、delayed `1`、unresolved `0`。实际分桶 CSV 有 600 行和全部冻结字段。
+- 身份与终态：`completion.json=SUCCEEDED`、`progress.json=10/10`、`resume_state.json` frontier=`next_index:14,last_trade_date:20230120`，无 `frozen_rule.json`、`run.lock` 或任务 runner 进程。`run_hash=bb6f5b513be53447e55250c9fed2a6e17989d690f5778e6794ba08ed962aa1a5`，`spec_hash=b14df854428a305bf05ffe9be2adbb46cf713732fcbb06430046c0998decf83f`，`runner_source_hash=f5632b022dc2d26a0721b2aa5a80ffe9e46217f4f2ea4669ddc831250249c898`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`（5,532 个日 K、tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`）。经济 artifact SHA-256：`development_results.json=e826a53fd0feaca9055c4247e1bcdd04c0d79498b07ebd73e4b49d7ce78eb3f5`、`daily_results.csv.gz=574c6f8405bc54e2b1c04977ada6daefbe8f66d8b183ae0782423b965419f462`、`daily_deciles.csv.gz=3bbc9c9353f80f029572a69c371720368e7ab56b2e37334de03e0eb32d61bb1e`。
+- 第 11 节追加后复算 `spec_hash/run_id` 保持不变；所有既有 attempts（含 cancelled/superseded evidence）原样保留。本轮未运行完整 `dev-run`、2025/2026、provider/L2/ML/生产 DB/scanner；TNM-2B 继续锁定，等待独立 Sol AR3 只读复审。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`
