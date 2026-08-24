@@ -6,7 +6,7 @@
 - 唯一独立审核会话（Sol）：`01a03141-39e9-7dd1-a359-037346adf01b`
 - 仓库：`D:\BaiduNetdiskDownload\cursor workflow\adata_sentiment_dashboard`
 - 冻结起点：`codex/screening-v26@8c2b436`
-- 当前阶段：`TNM-2AF ready_after_tnm2ar_changes_required`
+- 当前阶段：`TNM-2AF2 ready_after_threshold_contract_simplification`
 
 执行者和审核者把本文当完整合同。执行工作只能由 Terra 完成，独立审核只能由 Sol 完成；规划会话负责冻结定义、处理分歧、决定是否进入下一阶段。阶段严格串行，不允许执行与审核同时修改同一文件。
 
@@ -62,7 +62,7 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 
 - 沪深普通 A 股代码前缀：`000,001,002,003,300,301,600,601,603,605,688,689`；
 - 排除北交所、B 股、ETF、指数；
-- 至少 20 个历史交易日；日 K 可用时只读 `date` 列，按去重后的有效日期精确计算 `<D` 的交易日数，并核对最小日期；日 K 缺失或不可读时使用分钟源实际可见历史 session 数并标记 `listing_age_source`。不得用 60 日历日或其他启发式替代；
+- 至少 20 个历史交易日；日 K 可用时只读 `date` 列，对去重后的有效 `<D` 日期做精确阈值证明：发现第 20 个即可短路并记录 `listing_history_sessions_capped=20`、`listing_history_count_status=at_least_threshold`；读到文件末尾仍不足 20 时记录精确数量与 `exact_below_threshold`。日 K 缺失或不可读时按分钟源实际可见 session 用同一封顶口径降级并标记 `listing_age_source`。不得用 60 日历日、首日跨度或其他启发式替代；
 - D-1 日成交额严格 `> 500_000_000` 元，直接由分钟数据聚合；
 - D-3～D+1 必需窗口数据缺失或异常时隔离并计数，不得静默补值；
 - ST 暂不排除，显式报告限制。
@@ -168,7 +168,7 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 - 失败保留完成的只读 checkpoint 和异常，禁止盲目重跑；
 - 任务自有进程、临时缓存和测试产物在交付前按项目清理合同处理。
 
-TNM-2 是长批，必须拆成代码冻结与数据执行两张串行卡。先提交并审核 runner commit，批次只能从该 clean commit 启动；不得从未提交工作树运行后再补写“代码已冻结”。分钟输入 manifest 只允许选择 2023～2024 容器，并确定性优先同日 ZIP；日 K 只允许读取 `date` 列以精确计算 D 前历史 session，禁止读取 2025/2026 价格、收益、成交额或结果进入特征选择。每日分钟文件集合本身定义当日 point-in-time universe；不得与当前日 K 文件清单取交集，以免制造幸存者偏差。日 K 缺失时按分钟可见历史降级，不删除历史股票。
+TNM-2 是长批，必须拆成代码冻结与数据执行两张串行卡。先提交并审核 runner commit，批次只能从该 clean commit 启动；不得从未提交工作树运行后再补写“代码已冻结”。分钟输入 manifest 只允许选择 2023～2024 容器，并确定性优先同日 ZIP；日 K 只允许读取 `date` 列以精确证明 D 前历史 session 是否达到 20，达到即短路，禁止读取 2025/2026 价格、收益、成交额或结果进入特征选择。每日分钟文件集合本身定义当日 point-in-time universe；不得与当前日 K 文件清单取交集，以免制造幸存者偏差。日 K 缺失时按分钟可见历史降级，不删除历史股票。
 
 输入身份必须覆盖所有真实消费者：
 
@@ -366,6 +366,12 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 新真实只读 canary attempt 保留为取消证据：`output/tail-next-morning-v1/dev-preflight/dev-preflight-31f2a75b8db2112d`，`run_hash=31f2a75b8db2112da34432fba2b926bea14c42975ebda61e03084e693844127f`，`spec_hash=495a00ccdec0693aea761a4cfdd642630d130fe94283910a96188e3bcd820f0f`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`。manifest 已冻结 14 个 2023 ZIP 容器和 5,532 个日 K XLSX（tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`）；首 target `20230106` 的 minute universe 为 4,769。
 - 性能停止：现场在约 3 分钟仅完成日 K 精确 `date` 扫描 100/4,769，任务自有 Python PID `25332` 的 CPU 已约 148 秒，投影超过 30 分钟。已安全停止该 PID，写入 `completion.json=status:CANCELLED, reason=canary_listing_date_extraction_projection_exceeds_30_minutes`，并保留 `resume_state.json`、`progress.json`、`lock_evidence/cancelled-4dc22eab094ad70e.json`；没有删除或覆盖任何旧 attempt，也没有启动完整 `dev-run`、2025/2026、provider/L2/ML/生产 DB/scanner。
 - 新信号建议的“读取到第 20 个 `<D` session 即停止”可保持上市资格判断，却与第 4 节“按去重有效日期精确计算 `<D` 的交易日数”相冲突。未静默改变该冻结口径，等待规划会话裁决后才可继续 canary；TNM-2B/TNM-3 继续锁定。
+
+#### TNM-2AF 规划裁决：精确阈值证明
+
+- 回测资格只消费“历史交易日是否至少 20”这一布尔条件，第 21 日及以后精确总数不进入任何特征、排名、成交或结果；要求完整总数属于无收益计算。
+- 裁决为读取去重有效 `<D` 日期到第 20 个即短路；不足 20 时必须读到末尾并给出精确数量。这与全量计数产生完全相同的资格集合，不依赖日期排序，也没有引入近似或新参数。
+- 第 4、8 节已据此收窄合同。只解锁 Terra 的 TNM-2AF2 短路实现、定向测试与一个新固定 canary；TNM-2B、2025/2026 仍锁定。
 
 ### TNM-3 执行结果
 
