@@ -373,6 +373,16 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 裁决为读取去重有效 `<D` 日期到第 20 个即短路；不足 20 时必须读到末尾并给出精确数量。这与全量计数产生完全相同的资格集合，不依赖日期排序，也没有引入近似或新参数。
 - 第 4、8 节已据此收窄合同。只解锁 Terra 的 TNM-2AF2 短路实现、定向测试与一个新固定 canary；TNM-2B、2025/2026 仍锁定。
 
+### TNM-2AF2 执行结果
+
+状态：`tnm2af2_runner_verified`
+
+- 唯一业务改动为日 K 上市资格的精确阈值证明：流式读取 active sheet 声明的 `date` 列，不依赖行日期顺序；仅计不同、有效且 `<D` 的日期。第 20 个出现即短路，记录 `listing_history_sessions_capped=20` 与 `listing_history_count_status=at_least_threshold`；EOF 未达 20 时记录精确数量与 `exact_below_threshold`。未恢复 60 日历日、首日跨度或其他启发式。早期不足阈值的文件缓存完整有效日期集，后续 D 重新计数；早期达到阈值仅对不早于已证明 D 的 target 复用。分钟可见历史降级使用同一 capped/status 语义。其余 TNM-2AF 六项 P1 修复未变。
+- 定向验收：`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（23 tests）、`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py`、`git diff --check` 均通过。新增回归证明 20 个有效 `<D` 日期后即使后续有大量、无效或未来行也短路；无序/重复/无效日期不计；10 个 session 跨 60+ 日仍为 `exact_below_threshold`；以及早期不足、后续 D 达到 20 时从 EOF cache 正确重算。此前 Sol 的 6 项 P1 回归继续通过。
+- 唯一新真实只读 fixed canary：`output/tail-next-morning-v1/dev-preflight/dev-preflight-d98305b5731c58fd`；175.1 秒完成 10 个 target（`20230106,09-13,16-19`）、14 个 2023 ZIP 输入和 10 checkpoint，无完整 `dev-run`、无 2025/2026、provider/L2/ML/生产 DB/scanner。`run_hash=d98305b5731c58fd172d457ff35db3b501d9f878a74c491f44744691f3008da4`，`spec_hash=9c5c3caa01b50e515d40c8a7d1a8fadfd2da3d1fe1f8ad070470cf7fe65bf747`，`runner_source_hash=80b5d56874bca446efbbc805cd04e13e1958d9171f583cb75707f95ec7e60604`，`input_manifest_hash=6e024046e05f836642b5350fd943068630ccfc86a807944458399014e9763acd`。输入含 5,532 个日 K XLSX、tree digest `4ee865a94382255d225bc692bf75843208333b1cbb77a35a34790d5c828e890a`。
+- 终态与可重启证据：`completion.json=SUCCEEDED`，`resume_state.json` frontier=`next_index:14,last_trade_date:20230120`，`progress.json=10/10`，无 `frozen_rule.json`；`development_results.json` SHA-256 `0fbf4220e36c7bfef4ca3fee528ef4272384017ca9c7541abd8a771b037dcb11`，`daily_results.csv.gz` SHA-256 `574c6f8405bc54e2b1c04977ada6daefbe8f66d8b183ae0782423b965419f462`。每日 eligible 数为 `340,362,344,300,289,266,279,379,271,245`；容量诊断 `capacity_constrained`，只作独立袖套报告。
+- 原 `dev-preflight-31f2a75b8db2112d` 和所有更早 attempt 原样保留；本轮未启动可见的后台 runner，TNM-2B/TNM-3 继续锁定，等待 Sol 只读复审。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`

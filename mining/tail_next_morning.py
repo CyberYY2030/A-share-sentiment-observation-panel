@@ -9,7 +9,6 @@ outcomes are calculated by a separate function.
 from __future__ import annotations
 
 import argparse
-from bisect import bisect_left
 import csv
 from datetime import datetime, timedelta, timezone
 import gzip
@@ -297,6 +296,13 @@ def corporate_action_state(_daily_columns: Iterable[str]) -> str:
     return "unproven_not_applied"
 
 
+def _listing_meets_history_threshold(listing: Mapping[str, Any]) -> bool:
+    status = listing.get("listing_history_count_status")
+    if status is not None:
+        return status == "at_least_threshold"
+    return int(listing.get("listing_history_sessions") or 0) >= MIN_HISTORY_SESSIONS
+
+
 def _empty_feature_snapshot(code: str, reason: str, listing: Mapping[str, Any], d1_amount: float | None = None) -> dict[str, Any]:
     return {
         "sec_code": canonical_code(code),
@@ -307,6 +313,8 @@ def _empty_feature_snapshot(code: str, reason: str, listing: Mapping[str, Any], 
         "d1_amount": d1_amount,
         "listing_age_source": listing.get("listing_age_source"),
         "listing_history_sessions": listing.get("listing_history_sessions"),
+        "listing_history_sessions_capped": listing.get("listing_history_sessions_capped"),
+        "listing_history_count_status": listing.get("listing_history_count_status"),
         "st_filter_applied": False,
         "st_status": "unavailable_not_filtered",
         "corporate_action_filter": corporate_action_state(listing.get("daily_columns", [])),
@@ -331,7 +339,7 @@ def feature_snapshot(
         validate_minute_window(day_bars, "09:30", "14:50")
     except TailDataError as exc:
         return _empty_feature_snapshot(code, exc.reason, listing)
-    if int(listing.get("listing_history_sessions") or 0) < MIN_HISTORY_SESSIONS:
+    if not _listing_meets_history_threshold(listing):
         return _empty_feature_snapshot(code, "listing_history_under_20", listing)
 
     d1_amount = float(prior[-1]["amount"].sum())
@@ -372,6 +380,8 @@ def feature_snapshot(
         "d1_amount": d1_amount,
         "listing_age_source": listing.get("listing_age_source"),
         "listing_history_sessions": listing.get("listing_history_sessions"),
+        "listing_history_sessions_capped": listing.get("listing_history_sessions_capped"),
+        "listing_history_count_status": listing.get("listing_history_count_status"),
         "st_filter_applied": False,
         "st_status": "unavailable_not_filtered",
         "corporate_action_filter": corporate_action_state(listing.get("daily_columns", [])),
@@ -770,12 +780,32 @@ def _xlsx_column(cell_reference: str) -> str:
     return "".join(character for character in cell_reference if character.isalpha())
 
 
-def _xlsx_date_values(path: Path) -> tuple[str, ...]:
-    """Read the active sheet's declared `date` column without loading K-line values."""
+def _xlsx_date_value(raw: str) -> str | None:
+    try:
+        numeric = float(raw)
+    except (TypeError, ValueError):
+        numeric = None
+    parsed = (
+        datetime(1899, 12, 30) + timedelta(days=numeric)
+        if numeric is not None and math.isfinite(numeric) and abs(numeric) < 1_000_000
+        else pd.to_datetime(raw, errors="coerce")
+    )
+    return None if pd.isna(parsed) else parsed.date().isoformat()
+
+
+def _xlsx_listing_threshold(path: Path, trade_date: str) -> dict[str, Any]:
+    """Prove the only consumed listing predicate without assuming date order.
+
+    Once twenty distinct valid dates before D have been seen, further rows cannot
+    change eligibility and are deliberately not read.  A below-threshold scan
+    reaches EOF and returns its complete date set so a later D can be recomputed.
+    """
+    target = pd.Timestamp(str(trade_date)).date().isoformat()
     with zipfile.ZipFile(path) as archive:
         shared_strings = _xlsx_shared_strings(archive)
         dates: set[str] = set()
         date_column: str | None = None
+        rows_scanned = 0
         with archive.open(_xlsx_active_sheet_path(archive)) as payload:
             for _, row in ElementTree.iterparse(payload, events=("end",)):
                 if not row.tag.endswith("}row"):
@@ -786,24 +816,33 @@ def _xlsx_date_values(path: Path) -> tuple[str, ...]:
                         if _xlsx_cell_value(cell, shared_strings).strip().lower() == "date":
                             date_column = _xlsx_column(cell.attrib.get("r", ""))
                 elif date_column:
+                    rows_scanned += 1
                     for cell in cells:
                         if _xlsx_column(cell.attrib.get("r", "")) != date_column:
                             continue
-                        raw = _xlsx_cell_value(cell, shared_strings).strip()
-                        try:
-                            numeric = float(raw)
-                        except (TypeError, ValueError):
-                            numeric = None
-                        parsed = (
-                            datetime(1899, 12, 30) + timedelta(days=numeric)
-                            if numeric is not None and math.isfinite(numeric) and abs(numeric) < 1_000_000
-                            else pd.to_datetime(raw, errors="coerce")
-                        )
-                        if not pd.isna(parsed):
-                            dates.add(parsed.date().isoformat())
+                        parsed = _xlsx_date_value(_xlsx_cell_value(cell, shared_strings).strip())
+                        if parsed is not None:
+                            dates.add(parsed)
+                            if parsed < target and len({value for value in dates if value < target}) >= MIN_HISTORY_SESSIONS:
+                                return {
+                                    "status": "at_least_threshold",
+                                    "listing_history_sessions_capped": MIN_HISTORY_SESSIONS,
+                                    "dates": None,
+                                    "date_rows_scanned": rows_scanned,
+                                    "short_circuited": True,
+                                }
                         break
                 row.clear()
-    return tuple(sorted(dates))
+    if date_column is None:
+        raise ValueError("daily_k_date_missing")
+    history = sum(value < target for value in dates)
+    return {
+        "status": "exact_below_threshold",
+        "listing_history_sessions_capped": history,
+        "dates": tuple(sorted(dates)),
+        "date_rows_scanned": rows_scanned,
+        "short_circuited": False,
+    }
 
 
 def _listing_base(
@@ -821,20 +860,19 @@ def _listing_base(
     if allowed_daily_files is not None and relative_path is not None and relative_path not in allowed_daily_files:
         raise TailDataError("daily_k_read_outside_frozen_input")
     if not path.exists():
-        value = {"status": "missing", "daily_columns": [], "listing_first_date": None}
+        value = {"status": "missing", "daily_columns": [], "listing_first_date": None, "all_dates": None, "at_least_from": None}
     else:
         try:
-            # The only K-line field consumed by TNM is `date`.  Reading the
-            # active-sheet XML directly avoids materialising other indicators.
-            dates = _xlsx_date_values(path)
             value = {
-                "status": "ready" if dates else "unreadable",
+                "status": "ready",
                 "daily_columns": ["date"],
-                "listing_first_date": dates[0] if dates else None,
-                "daily_dates": dates,
+                "listing_first_date": None,
+                "all_dates": None,
+                "at_least_from": None,
+                "path": path,
             }
         except Exception:
-            value = {"status": "unreadable", "daily_columns": [], "listing_first_date": None, "daily_dates": ()}
+            value = {"status": "unreadable", "daily_columns": [], "listing_first_date": None, "all_dates": None, "at_least_from": None}
     cache[normalized] = value
     return value
 
@@ -850,19 +888,64 @@ def development_listing_evidence(
 ) -> dict[str, Any]:
     """Use only daily-K date evidence; never read K-line outcomes or amount."""
     base = _listing_base(daily_root, code, cache, allowed_daily_files=allowed_daily_files)
-    first_date = base.get("listing_first_date")
-    if base.get("status") == "ready" and first_date is not None:
-        history = bisect_left(base.get("daily_dates", ()), pd.Timestamp(str(trade_date)).date().isoformat())
-        return {
-            "listing_age_source": "daily_k_exact_date_sessions",
-            "listing_history_sessions": history,
-            "listing_first_date": first_date,
-            "daily_columns": base["daily_columns"],
-            "daily_amount": None,
-        }
+    target = pd.Timestamp(str(trade_date)).date().isoformat()
+    if base.get("status") == "ready":
+        all_dates = base.get("all_dates")
+        if base.get("at_least_from") is not None and target >= base["at_least_from"]:
+            history = MIN_HISTORY_SESSIONS
+            count_status = "at_least_threshold"
+            rows_scanned = 0
+            short_circuited = True
+        elif all_dates is not None:
+            exact_history = sum(value < target for value in all_dates)
+            history = min(exact_history, MIN_HISTORY_SESSIONS)
+            count_status = "at_least_threshold" if exact_history >= MIN_HISTORY_SESSIONS else "exact_below_threshold"
+            rows_scanned = 0
+            short_circuited = False
+            if count_status == "at_least_threshold":
+                base["at_least_from"] = target
+        else:
+            try:
+                threshold = _xlsx_listing_threshold(base["path"], target)
+            except Exception:
+                base["status"] = "unreadable"
+                threshold = None
+            if threshold is not None:
+                history = int(threshold["listing_history_sessions_capped"])
+                count_status = str(threshold["status"])
+                rows_scanned = int(threshold["date_rows_scanned"])
+                short_circuited = bool(threshold["short_circuited"])
+                if count_status == "at_least_threshold":
+                    base["at_least_from"] = target
+                else:
+                    base["all_dates"] = threshold["dates"]
+                    base["listing_first_date"] = threshold["dates"][0] if threshold["dates"] else None
+            else:
+                history = 0
+                count_status = "unavailable"
+                rows_scanned = 0
+                short_circuited = False
+        if base.get("status") == "ready":
+            return {
+                "listing_age_source": "daily_k_date_threshold_proof",
+                "listing_history_sessions": history,
+                "listing_history_sessions_capped": history,
+                "listing_history_count_status": count_status,
+                "listing_date_rows_scanned": rows_scanned,
+                "listing_date_short_circuited": short_circuited,
+                "listing_first_date": base.get("listing_first_date"),
+                "daily_columns": base["daily_columns"],
+                "daily_amount": None,
+            }
+    visible = int(minute_visible_sessions)
+    capped = min(visible, MIN_HISTORY_SESSIONS)
     return {
         "listing_age_source": "minute_source_visible_history",
-        "listing_history_sessions": int(minute_visible_sessions),
+        "listing_history_sessions": capped,
+        "listing_history_sessions_capped": capped,
+        "listing_history_count_status": "at_least_threshold" if visible >= MIN_HISTORY_SESSIONS else "exact_below_threshold",
+        "listing_date_rows_scanned": 0,
+        "listing_date_short_circuited": visible >= MIN_HISTORY_SESSIONS,
         "listing_first_date": None,
         "daily_columns": base.get("daily_columns", []),
         "daily_amount": None,
@@ -887,7 +970,7 @@ def feature_snapshot_from_statistics(
     signal = day.get("signal", {})
     if signal.get("status") != "ready":
         return _empty_feature_snapshot(code, signal.get("reason", "signal_session_invalid"), listing)
-    if int(listing.get("listing_history_sessions") or 0) < MIN_HISTORY_SESSIONS:
+    if not _listing_meets_history_threshold(listing):
         return _empty_feature_snapshot(code, "listing_history_under_20", listing)
     d1_amount = float(prior[-1]["history"]["full_amount"])
     if not d1_amount > MIN_D1_AMOUNT:
@@ -918,6 +1001,8 @@ def feature_snapshot_from_statistics(
         "d1_amount": d1_amount,
         "listing_age_source": listing.get("listing_age_source"),
         "listing_history_sessions": listing.get("listing_history_sessions"),
+        "listing_history_sessions_capped": listing.get("listing_history_sessions_capped"),
+        "listing_history_count_status": listing.get("listing_history_count_status"),
         "st_filter_applied": False,
         "st_status": "unavailable_not_filtered",
         "corporate_action_filter": corporate_action_state(listing.get("daily_columns", [])),

@@ -331,23 +331,43 @@ class TailNextMorningTests(unittest.TestCase):
         delayed = outcome_from_statistics(day, minute_sufficient_statistics(sell_bad), "20230109")
         self.assertEqual(delayed["outcome_status"], "delayed_exit_required")
 
-    def test_listing_uses_exact_daily_sessions_not_calendar_days(self) -> None:
+    def test_listing_threshold_short_circuits_after_twenty_valid_dates(self) -> None:
+        from mining.tail_next_morning import development_listing_evidence
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = Path(tmp) / "daily"
+            daily.mkdir()
+            values = list(pd.date_range("2022-01-01", periods=20, freq="D"))
+            values.extend(["not-a-date", *pd.date_range("2024-01-01", periods=500, freq="D")])
+            pd.DataFrame({"date": values}).to_excel(daily / "000001.xlsx", index=False)
+            cache: dict[str, dict[str, object]] = {}
+            evidence = development_listing_evidence(daily, "000001", "20230106", 0, cache)
+            self.assertEqual(evidence["listing_age_source"], "daily_k_date_threshold_proof")
+            self.assertEqual(evidence["listing_history_sessions_capped"], 20)
+            self.assertEqual(evidence["listing_history_count_status"], "at_least_threshold")
+            self.assertTrue(evidence["listing_date_short_circuited"])
+            self.assertEqual(evidence["listing_date_rows_scanned"], 20)
+            self.assertIsNone(cache["000001"]["all_dates"])
+
+    def test_listing_threshold_is_unordered_deduplicated_and_exact_below_threshold(self) -> None:
         from mining.tail_next_morning import development_listing_evidence, feature_snapshot_from_statistics, minute_sufficient_statistics
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             daily = root / "daily"
             daily.mkdir()
-            thirty_sessions_in_fifty_days = pd.date_range("2023-01-01", periods=30, freq="B")
-            pd.DataFrame({"date": thirty_sessions_in_fifty_days}).to_excel(daily / "000001.xlsx", index=False)
-            evidence = development_listing_evidence(daily, "000001", "20230220", 1, {})
-            self.assertEqual(evidence["listing_age_source"], "daily_k_exact_date_sessions")
-            self.assertEqual(evidence["listing_history_sessions"], 30)
+            unordered = ["bad", "2023-03-20", "2023-01-01", "2023-01-01", None, "2023-02-01", "2023-01-15", "2023-03-20"]
+            pd.DataFrame({"date": unordered}).to_excel(daily / "000001.xlsx", index=False)
+            evidence = development_listing_evidence(daily, "000001", "20230401", 1, {})
+            self.assertEqual(evidence["listing_history_sessions_capped"], 4)
+            self.assertEqual(evidence["listing_history_count_status"], "exact_below_threshold")
+            self.assertFalse(evidence["listing_date_short_circuited"])
 
             sparse_sessions = pd.date_range("2023-01-01", periods=10, freq="10D")
             pd.DataFrame({"date": sparse_sessions}).to_excel(daily / "600000.xlsx", index=False)
             sparse = development_listing_evidence(daily, "600000", "20230430", 99, {})
             self.assertEqual(sparse["listing_history_sessions"], 10)
+            self.assertEqual(sparse["listing_history_count_status"], "exact_below_threshold")
             isolated = feature_snapshot_from_statistics(
                 "600000",
                 minute_sufficient_statistics(make_bars()),
@@ -355,6 +375,22 @@ class TailNextMorningTests(unittest.TestCase):
                 sparse,
             )
             self.assertEqual(isolated["feature_reason"], "listing_history_under_20")
+
+    def test_listing_below_threshold_cache_recomputes_for_later_target(self) -> None:
+        from mining.tail_next_morning import development_listing_evidence
+
+        with tempfile.TemporaryDirectory() as tmp:
+            daily = Path(tmp) / "daily"
+            daily.mkdir()
+            initial = list(pd.date_range("2023-01-01", periods=10, freq="D"))
+            later = list(pd.date_range("2023-03-01", periods=10, freq="D"))
+            pd.DataFrame({"date": initial + later}).to_excel(daily / "000001.xlsx", index=False)
+            cache: dict[str, dict[str, object]] = {}
+            early = development_listing_evidence(daily, "000001", "20230201", 0, cache)
+            self.assertEqual((early["listing_history_sessions_capped"], early["listing_history_count_status"]), (10, "exact_below_threshold"))
+            later_evidence = development_listing_evidence(daily, "000001", "20230401", 0, cache)
+            self.assertEqual((later_evidence["listing_history_sessions_capped"], later_evidence["listing_history_count_status"]), (20, "at_least_threshold"))
+            self.assertEqual(later_evidence["listing_date_rows_scanned"], 0)
 
     def test_development_loader_opens_container_once_and_keeps_minute_universe_without_daily_k(self) -> None:
         from mining.tail_next_morning import development_listing_evidence, feature_snapshot_from_statistics, load_day_statistics, minute_sufficient_statistics
@@ -378,6 +414,7 @@ class TailNextMorningTests(unittest.TestCase):
             self.assertEqual((zip_record["source_kind"], set(zip_statistics)), ("zip", {"000001"}))
             evidence = development_listing_evidence(root / "daily_missing", "600000", "20230106", 20, {})
             self.assertEqual(evidence["listing_age_source"], "minute_source_visible_history")
+            self.assertEqual((evidence["listing_history_sessions_capped"], evidence["listing_history_count_status"]), (20, "at_least_threshold"))
             ready = feature_snapshot_from_statistics(
                 "600000", minute_sufficient_statistics(make_bars()), [minute_sufficient_statistics(make_bars()) for _ in range(3)], evidence
             )
