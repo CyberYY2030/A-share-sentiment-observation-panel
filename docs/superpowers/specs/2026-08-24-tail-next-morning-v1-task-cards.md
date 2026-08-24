@@ -408,6 +408,16 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 24 tests、临时目录内 `py_compile`、`git diff --check` 通过；三路径白名单、10 个用户 dirty、空暂存区保持不变，无 `frozen_rule.json`、`run.lock` 或 runner 进程。
 - 六个原 P1 全部关闭。只解锁从批准 runner package 启动 TNM-2B detached 2023～2024 开发批；不授权 2025/2026、provider、L2、生产 DB 或交易。
 
+### TNM-2BF 执行结果
+
+状态：`tnm2bf_fix_verified`
+
+- first-divergence：`dev-run-166616198a049a1e` 在目标 `20231226` 的上市进度回写中失败。最后正确 `progress.json` 为 235 个已完成 target、frontier `239`、listing `2700/5001`；首次失败门是写入同目录有效 temp `.progress.json.74yu6f6a`（payload 为 `2800/5001`）后 `os.replace(temp, progress.json)` 返回 `PermissionError: [WinError 5]`。235 个 checkpoint 的最后一份为 `20231225.json`（4,999 rows，run hash 匹配），`resume_state`、`outcome_updates` 与 manifest hash 绑定一致，且 `outcome_updates.json` 与 state 的 canonical bytes 相同。
+- 归因：同目录 temp 创建成功、此前数百次同路径原子写成功、同目录 `completion.json=FAILED` 在该错误后立即成功写入，目录 ACL 允许 Modify；最符合证据的首个错误是既有 `progress.json` 的可恢复 Windows 瞬时共享/占用冲突，而非经济计算、checkpoint、永久目录权限或路径创建。外部具体持有者无法证明：无 handle 检查工具，仅观察到未与该路径关联的 OneDrive 服务。FAILED、checkpoint、temp、logs、manifest 均未删除、覆盖或 resume。
+- 最窄修复：`_atomic_write_bytes` 对 `PermissionError` 在同一同目录 temp 上最多尝试 3 次 `os.replace`，退避为 50/100 ms；成功即返回，第 3 次仍失败则原样抛出并保留 temp，现有外层 `FAILED` 原子终态保持不变。未改动策略、经济、选择、checkpoint 或 hash 语义。
+- 验证：新增 monkeypatch 回归覆盖 1/2 次 `PermissionError` 后成功、连续 3 次失败时原目标字节不变且 temp 保留，以及 runner 写出 `completion.json=FAILED`。`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning` 为 25 tests 通过，`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py` 与 `git diff --check` 通过。
+- 恢复与锁：旧 FAILED run 的安全恢复点是 `20231225` 后、`20231226` 中断的 listing 进度；同一 run identity 的显式 resume 最多只应重读中断日容器。此次修复会改变 runner source/approved commit，hash-bound 合同会拒绝新代码接管旧 run；因此本轮未 resume，后续必须先经独立 Sol 审核新 commit，再从新 identity 启动开发批。2025/2026、provider/L2/生产 DB/交易继续锁定。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`

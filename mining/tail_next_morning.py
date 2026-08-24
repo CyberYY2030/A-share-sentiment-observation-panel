@@ -20,6 +20,7 @@ import os
 import socket
 import subprocess
 import tempfile
+import time
 import zipfile
 import xml.etree.ElementTree as ElementTree
 from pathlib import Path, PurePosixPath
@@ -1142,7 +1143,14 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
         handle.write(payload)
         temporary = Path(handle.name)
-    os.replace(temporary, path)
+    for attempt in range(3):
+        try:
+            os.replace(temporary, path)
+            return
+        except PermissionError:
+            if attempt == 2 or not temporary.exists():
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def _atomic_write_json(path: Path, value: Any) -> None:

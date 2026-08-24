@@ -669,6 +669,74 @@ class TailNextMorningTests(unittest.TestCase):
         with self.assertRaisesRegex(TailDataError, "dev_run_requires_approved_commit"):
             _validate_approved_development_commit(None)
 
+    def test_atomic_write_retries_permission_error_and_preserves_failed_evidence(self) -> None:
+        from mining import tail_next_morning as tail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for failures in (1, 2):
+                with self.subTest(failures=failures):
+                    target = root / f"success-{failures}.json"
+                    target.write_bytes(b"before")
+                    real_replace = tail.os.replace
+                    attempts: list[Path] = []
+
+                    def flaky_replace(source, destination):
+                        attempts.append(Path(source))
+                        if len(attempts) <= failures:
+                            raise PermissionError(5, "access_denied", str(source), str(destination))
+                        return real_replace(source, destination)
+
+                    with mock.patch("mining.tail_next_morning.os.replace", side_effect=flaky_replace), mock.patch(
+                        "mining.tail_next_morning.time.sleep"
+                    ) as sleep:
+                        tail._atomic_write_bytes(target, b"after")
+                    self.assertEqual(target.read_bytes(), b"after")
+                    self.assertEqual(len(attempts), failures + 1)
+                    self.assertTrue(all(path.parent == root for path in attempts))
+                    self.assertEqual(len(set(attempts)), 1)
+                    self.assertEqual(sleep.call_count, failures)
+                    self.assertFalse(list(root.glob(f".{target.name}.*")))
+
+            target = root / "progress.json"
+            target.write_bytes(b"last-correct")
+            attempts = []
+
+            def always_denied(source, destination):
+                attempts.append(Path(source))
+                raise PermissionError(5, "access_denied", str(source), str(destination))
+
+            with mock.patch("mining.tail_next_morning.os.replace", side_effect=always_denied), mock.patch(
+                "mining.tail_next_morning.time.sleep"
+            ) as sleep:
+                with self.assertRaises(PermissionError):
+                    tail._atomic_write_bytes(target, b"next-progress")
+            self.assertEqual(len(attempts), 3)
+            self.assertEqual(target.read_bytes(), b"last-correct")
+            failed_temp = list(root.glob(".progress.json.*"))
+            self.assertEqual(len(failed_temp), 1)
+            self.assertEqual(failed_temp[0].read_bytes(), b"next-progress")
+            self.assertEqual(sleep.call_count, 2)
+
+            dates = [f"202301{day:02d}" for day in range(3, 17)]
+            self._write_development_days(root / "source", dates, ("600000", "600001"))
+            system_replace = tail.os.replace
+
+            def deny_progress(source, destination):
+                if Path(destination).name == "progress.json":
+                    raise PermissionError(5, "access_denied", str(source), str(destination))
+                return system_replace(source, destination)
+
+            with mock.patch("mining.tail_next_morning.development_listing_evidence", return_value=listing()), mock.patch(
+                "mining.tail_next_morning.os.replace", side_effect=deny_progress
+            ), mock.patch("mining.tail_next_morning.time.sleep"):
+                with self.assertRaises(PermissionError):
+                    tail.run_dev_preflight(root / "source", root / "daily", root / "failed")
+            run_dir = next((root / "failed").iterdir())
+            completion = json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))
+            self.assertEqual((completion["status"], completion["reason"]), ("FAILED", "PermissionError"))
+            self.assertTrue(list(run_dir.glob(".progress.json.*")))
+
     def test_spec_hash_excludes_execution_results_but_covers_frozen_definition(self) -> None:
         from mining.tail_next_morning import _frozen_contract_hash
 
