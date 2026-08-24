@@ -6,7 +6,7 @@
 - 唯一独立审核会话（Sol）：`01a03141-39e9-7dd1-a359-037346adf01b`
 - 仓库：`D:\BaiduNetdiskDownload\cursor workflow\adata_sentiment_dashboard`
 - 冻结起点：`codex/screening-v26@8c2b436`
-- 当前阶段：`TNM-1 ready_for_implementation`
+- 当前阶段：`TNM-2A ready_for_implementation_after_tnm1r_approve`
 
 执行者和审核者把本文当完整合同。执行工作只能由 Terra 完成，独立审核只能由 Sol 完成；规划会话负责冻结定义、处理分歧、决定是否进入下一阶段。阶段严格串行，不允许执行与审核同时修改同一文件。
 
@@ -86,10 +86,20 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 
 - `VWAP = sum(amount) / sum(volume)`，只对 volume>0 的合法分钟计算；
 - 买入窗口零容量：该仓位为现金，不允许用事后第 11 名替换；
-- 卖出窗口零容量或无法卖出：延迟至第一个可执行窗口，继续占用资金并单独报告；
+- 卖出窗口零容量或数据不可用：按下述冻结网格延迟至第一个可执行窗口，继续占用资金并单独报告；不得用收盘价、下一根价格或事后最优价格强制平仓；
 - V1 无盘口队列，VWAP 只是小单基准，不能声称真实成交证明；
 - 同时报告 gross、15 bps、30 bps；策略主验收固定使用 round-trip `30 bps`；
 - 500 万容量诊断固定为 Top 10、50 万/股，报告买卖窗口参与率；`0.5%` 仅为保守 deployability 诊断线，不参与选股或 `signal_edge_verdict`。
+
+延迟卖出只使用固定 5 分钟连续竞价网格。先扫描 D+1 `[10:05,10:10)` 至 `[11:25,11:30)`，再扫描 `[13:00,13:05)` 至 `[14:55,15:00)`；仍不可执行则从下一交易日 `[09:30,09:35)` 起按相同网格继续。一个窗口只有在所需 bar 完整、OHLC/amount/volume 合法且 `sum(volume)>0`、`sum(amount)>0` 时才可作为 VWAP 退出。不得跨越当前研究阶段边界读取冻结期：到当年/阶段末仍无可执行退出时标记 `unresolved_exit_at_phase_end`，该阶段经济结论为 `blocked_unresolved_exit`，不得伪造价格或删除样本。
+
+主信号研究采用事件组合，容量采用独立资金账本：
+
+- 每个 D 日建立 10 个名义槽位，分母恒为 10；少于 10 个候选的空槽、买入失败或零容量槽记现金收益 0，不替补、不把权重摊给成交槽位；
+- 已买入且延迟卖出的最终收益仍归属原 D 事件日；主研究不以此冒充“每日同一笔 500 万可连续周转”，只回答信号边际；
+- 500 万容量账本固定 10 个 50 万资金袖套。跨日未退出的袖套保持占用；下一 D 日只用空闲袖套依次买当日最高排名，不借款、不加杠杆、不用第 11 名替换失败买入；
+- gross 为最终卖出 VWAP / 买入 VWAP - 1；15/30 bps 是每个已完成 round-trip 的总成本，直接从 gross 扣除。现金槽不收成本；主验收使用 30 bps；
+- 正收益判断使用等权交易日的 `mean_daily_net30`；同时输出复合曲线和最大回撤作诊断。延迟收益按原事件日归属，复合曲线不得作为资金可周转证明。
 
 ### 4.4 公司行为
 
@@ -100,7 +110,7 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 
 ## 5. 六个预注册候选特征
 
-所有相对市场值均减去同日合格股票横截面中位数。零分母必须返回显式缺失原因并隔离，不得无穷大或填 0。
+所有相对市场值均减去同日信号合格股票横截面中位数。合格横截面只由 D `14:50` 已知的股票范围、历史、D-1 流动性和信号窗口质量决定；买入、D+1 outcome 或未来可成交性不得改变中位数、percentile rank 或排名。零分母必须返回显式缺失原因并隔离，不得无穷大或填 0。
 
 1. `tail_return_rel`：D `[14:20,14:50)` 首价至末价收益减市场中位数。
 2. `tail_end_location`：`(末价-low_30)/(high_30-low_30)`。
@@ -114,24 +124,24 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 ## 6. 冻结发现与评分程序
 
 - 2023～2024 是唯一开发区；不得读取 2025/2026 结果来选择特征或方向。
-- 每个特征按交易日做横截面 percentile rank，并单独输出十分位表与每日 rank IC。
-- 方向先由 2023 的 Top-vs-Bottom decile spread 决定；只有 2024 同方向时才合格。
+- 每个特征按交易日做横截面 percentile rank，固定为 `rank(method="average", pct=True)`；Bottom decile 为 `rank<=0.10`，Top decile 为 `rank>=0.90`，并列不任意拆分，必须输出实际样本数。最终 Top 10 分数并列按 `sec_code` 升序。单独输出十分位表与每日 Spearman rank IC；IC 只做诊断，不参与选择。
+- 单日特征 spread 固定为该日 Top decile 全部成员与 Bottom decile 全部成员的 `net30` 算术平均之差；买入失败成员按现金 0 保留，已买入但阶段末未退出则阻断而非删除。年度 spread 是各合格交易日 spread 的等权算术平均。方向只由 2023 spread 的符号决定；2024 同方向才合格，spread 为 0 或任一年无可用日则不合格。
 - 三个预注册组：
   - `tail_price`：特征 1、2，最多选 1 个；
   - `tail_amount`：特征 3，合格才选；
   - `background`：特征 4、5、6，最多选 1 个。
-- 同组多候选时，用 `min(abs(spread_2023), abs(spread_2024))` 最大者；平手按本文编号靠前者。不得改变规则挑结果。
+- 同组多候选时，只在通过 2024 同向否决的候选中按 `abs(spread_2023)` 最大者选择；2024 的幅度不得参与排序。平手按本文编号靠前者。不得改变规则挑结果。
 - 最终 1～3 个特征，按已冻结方向做等权 rank 平均；每日 Top 10。
-- 若没有特征合格，或冻结组合在 2023 与 2024 的 30 bps 后组合收益不能同时为正，停止为 `no_stable_development_signal`，不得进入 2025。
+- 不增加 spread、p-value、胜率或 IC 的事后门槛。若没有特征合格，或冻结组合在 2023 与 2024 的 `mean_daily_net30` 不能同时为正，停止为 `no_stable_development_signal`，不得进入 2025。
 
-对照组必须共享相同资格和成交边界：合格池等权、固定种子 `20260824` 的随机 Top 10、只按 `tail_return_rel` 的 Top 10。
+对照组必须共享相同资格和成交边界：合格池等权；固定种子 `20260824` 的随机 Top 10 固定为按 `SHA256("20260824|trade_date|sec_code")` 升序取前 10，不调用版本相关 PRNG；`tail_return_rel` 基准固定按原值从高到低取 Top 10。两种 Top 10 基准都使用 10 槽恒定分母、相同不可成交规则和代码升序最终 tie-break。
 
 ## 7. 时间隔离与 Go/No-Go
 
 ### 2025 validation
 
 - 规则冻结后只运行一次；
-- 30 bps 后组合收益 >0；
+- `mean_daily_net30 > 0`；
 - 相对合格池等权和随机 Top 10 的超额点估计均 >0；
 - 任一失败：`validation_no_go`，停止，不得调参后重跑 2025。
 
@@ -157,6 +167,16 @@ V1 只回答“是否存在稳定、可复现、样本外仍成立的规律和�
 - 输出确定性 JSON/CSV.gz 和 SHA-256 manifest；时间戳、PID、路径不得进入经济结果哈希；
 - 失败保留完成的只读 checkpoint 和异常，禁止盲目重跑；
 - 任务自有进程、临时缓存和测试产物在交付前按项目清理合同处理。
+
+TNM-2 是长批，必须拆成代码冻结与数据执行两张串行卡。先提交并审核 runner commit，批次只能从该 clean commit 启动；不得从未提交工作树运行后再补写“代码已冻结”。分钟输入 manifest 只允许选择 2023～2024 容器，并确定性优先同日 ZIP；日 K 只允许提供 `listing_first_date`/列证据，禁止把 2025/2026 日收益、成交额或结果读入特征选择。每日分钟文件集合本身定义当日 point-in-time universe；不得与当前日 K 文件清单取交集，以免制造幸存者偏差。日 K 缺失时按分钟可见历史降级，不删除历史股票。
+
+### 8.1 Opus 方法论讨论后的裁决
+
+2026-08-24 通过 Claude Code/Opus 做了一次无写入方法论讨论。采纳两项能减少自由度的建议：Top 10 恒定 10 槽分母；组内强弱只用 2023 排序、2024 只作同向否决。不采纳以下会制造新假设的建议：
+
+- 不用 D+1 收盘价强制平仓；零成交时该价格不可执行，且违反“继续占用资金”。采用上文跨日固定 5 分钟网格，阶段末仍未退出则阻断；
+- 不新增 60 bps spread 门槛；开发年同向、组合两年净正和后续单次 OOS 已足够，额外阈值会形成新调参旋钮；
+- 不用 `abs(return)>11%` 猜测公司行为；主板、创业板/科创板及 ST 涨跌幅不同，该启发式会混淆真实行情。继续显式 `corporate_action_filter=unproven_not_applied`，并把相关经济结论降级为 provisional。
 
 ## 9. 串行任务卡
 
@@ -214,13 +234,39 @@ git diff --check
 
 只读审查 TNM-1 commit 和预检产物；独立重跑定向测试、检查因果变形测试、源只读、异常语义、白名单和进程清理。不得修复。输出 `approve|changes_required|blocked_evidence` 及 P0/P1/P2 findings。只有 `approve` 才能进入 TNM-2。
 
-### TNM-2：2023～2024 发现批与规则冻结（Terra）
+### TNM-2A：开发 runner、长批合同与全市场小 canary（Terra）
 
-在 TNM-1R approve 后另行派发。允许补齐 detached runner/checkpoint，但不得访问或汇总 2025/2026 outcome。运行完成后按第 6 节生成确定性 `frozen_rule.json`、特征十分位/IC、Top10 组合、三基准、成本/异常/容量诊断和 hash manifest；追加本文 `TNM-2 执行结果`，一个 commit 后停止。
+在 TNM-1R approve 后派发。白名单仍仅为 `mining/tail_next_morning.py`、`tests/test_tail_next_morning.py`、本文 TNM-2A 结果，以及 ignored `output/tail-next-morning-v1/dev-preflight/`。不得运行完整 2023～2024 发现批。
 
-### TNM-2R：冻结规则独立审核（Sol）
+必须实现：
 
-只读复算固定样本与聚合，核验 2025/2026 未被用于选择、规则唯一且可重放、结果没有多重候选偷换。只有 `approve` 才能进入 TNM-3。
+- 每个日容器只打开一次，按股票抽取满足六特征、买卖、延迟退出、诊断和容量所需的最小充分统计；不得为每只股票重复打开 ZIP；
+- 逐日 checkpoint、spec/code/input-manifest hash、hash-bound resume、单 writer、`progress.json`、原子 `completion.json`、确定性 JSON/CSV.gz 与 SHA-256 manifest；
+- 固定 `dev-preflight` canary 只跑 2023 年最早可形成 D-3～D+1 的 10 个目标日，但覆盖当日全 A 股文件；输出只验证全市场流式读取、日间连接、恒定 10 槽、三基准、延迟退出状态和 resume，不允许冻结规则；
+- `dev-run` 命令内部硬限制 target D、D+1 和延迟退出读取不越过各自 2023/2024 年界；任何 2025/2026 分钟 outcome 访问必须抛错；
+- 代表股票/日期的充分统计必须与 TNM-1 原始 240 bar 纯函数逐字段相等；测试覆盖 ZIP/目录、同日 ZIP 优先、全市场 universe 不依赖当前日 K 文件存在、未来数据不改变横截面、失败 checkpoint 可恢复、hash 不一致拒绝 resume；
+- 完整开发运行命令冻结为：
+
+```powershell
+C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m mining.tail_next_morning dev-run `
+  --minute-root "E:\分钟数据" `
+  --daily-root "E:\日K线全部至202606" `
+  --output-dir "output\tail-next-morning-v1\development"
+```
+
+TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-preflight`，创建一个 runner 本地 commit 后停止，不得启动完整批次。
+
+### TNM-2AR：runner 与 canary 独立审核（Sol）
+
+只读复算充分统计、时间/年份 guard、源只读、恒定分母、选择算法唯一性、checkpoint/resume/hash、白名单和 canary。只有 `approve` 才能启动 TNM-2B。
+
+### TNM-2B：2023～2024 detached 发现批与规则冻结（Terra）
+
+只能从 TNM-2AR 批准的 clean runner commit 启动。启动前写完整 manifest 和 `run_id`；以隐藏独立进程运行，Terra 记录 PID/命令/路径后停止模型轮询。批次不得访问或汇总 2025/2026 outcome。成功后 Terra 只验收 `completion.json` 与紧凑证据，生成确定性 `frozen_rule.json`、特征十分位/IC、Top10 组合、三基准、成本/异常/延迟退出/容量诊断和 hash manifest；追加本文 `TNM-2B 执行结果`，创建结果本地 commit 后停止。若开发门槛失败，按 `no_stable_development_signal` 正常停止，不得进入 2025。
+
+### TNM-2R：冻结规则与开发证据独立审核（Sol）
+
+只读复算固定样本与年度聚合，核验 2025/2026 未被用于选择、2023 负责方向与组内排序、2024 只作同向否决、规则唯一且可重放、恒定槽位与不可成交没有被删除、结果没有多重候选偷换。只有 `approve` 且开发门槛通过才可进入 TNM-3。
 
 ### TNM-3：2025 单次验证（Terra）
 
@@ -267,9 +313,16 @@ git diff --check
 - 真实预检复核通过：`output/tail-next-morning-v1/preflight/preflight-attempt-06.json`，SHA-256 `a4e76387e843f7f9d9b24f0a7d9063824e251f048def2d4597368e687cc2c792`，与 attempt-03 字节相同；仍为 `tnm1_preflight_verified`、7 ready、2 个 D-1 门槛隔离。
 - 审核锁：TNM-1R 尚未批准，TNM-2 继续锁定，等待 Sol R3 对本修复提交只读复审。
 
-### TNM-2 执行结果
+#### TNM-1R3：最终独立批准（Sol）
 
-状态：`locked_until_tnm1r_approve`
+- 最终 verdict：`tnm1r_approve`；审核对象 `8c580b424bc6ee9ff5646249e4bf6bb47b603be0`，会话 `01a03141-39e9-7dd1-a359-037346adf01b`。
+- R1 的 P1 因果泄漏和 R2 的 P2 amount 诊断误报均关闭；Sol 独立完成 960 个全位置 amount 异常注入、24 个真实 ZIP/preflight 代表注入及 P1 快速回归，未发现新 P0/P1/P2。
+- 10/10 定向测试、`py_compile`、`git diff --check` 和 attempt-06 manifest/SHA 独立通过；原有 10 个 dirty 文件未进入提交或暂存，无遗留进程。
+- TNM-1 审核锁解除；只解锁本文重新冻结后的 TNM-2A，不授权完整开发长批、2025 或 2026。
+
+### TNM-2A 执行结果
+
+状态：`ready_for_terra_implementation`
 
 ### TNM-3 执行结果
 
