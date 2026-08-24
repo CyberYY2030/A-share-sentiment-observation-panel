@@ -418,6 +418,13 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 - 验证：新增 monkeypatch 回归覆盖 1/2 次 `PermissionError` 后成功、连续 3 次失败时原目标字节不变且 temp 保留，以及 runner 写出 `completion.json=FAILED`。`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning` 为 25 tests 通过，`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py` 与 `git diff --check` 通过。
 - 恢复与锁：旧 FAILED run 的安全恢复点是 `20231225` 后、`20231226` 中断的 listing 进度；同一 run identity 的显式 resume 最多只应重读中断日容器。此次修复会改变 runner source/approved commit，hash-bound 合同会拒绝新代码接管旧 run；因此本轮未 resume，后续必须先经独立 Sol 审核新 commit，再从新 identity 启动开发批。2025/2026、provider/L2/生产 DB/交易继续锁定。
 
+#### TNM-2BF：独立审核结论（Sol）
+
+- verdict：`tnm2bf_approve`；审核提交 `dd89d995813db38e25d793d2873881d81f0e75ee`，无 P0/P1/P2。
+- 独立验收确认同一 temp 的 3 次有界 `PermissionError` 重试不会吞掉永久错误，最终失败保留 temp/原目标并由既有外层写 `FAILED`；策略、经济、checkpoint、hash 与 resume 语义未扩大。
+- `tests.test_tail_next_morning`（25 tests）、`py_compile`、`git diff --check` 通过；三路径白名单和并发 dirty 边界保持。
+- 旧 `dev-run-166616198a049a1e` 因 runner source/approved commit 变化必须触发 `resume_hash_mismatch`，继续只读保留，禁止接管或覆盖。当前阶段：`TNM-2B new-identity launch ready`；只允许以本审核结论后的 docs launch commit 启动一个新的 detached 2023～2024 开发批，2025/2026 继续锁定。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`
