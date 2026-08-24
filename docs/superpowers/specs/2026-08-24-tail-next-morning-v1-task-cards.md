@@ -324,6 +324,15 @@ TNM-2A 先运行定向测试、`py_compile`、`git diff --check` 和固定 `dev-
 
 状态：`ready_for_terra_implementation`
 
+- 执行结论：`tnm2a_runner_verified`。只实现 runner、重启/哈希治理与固定全市场 canary；未执行 `dev-run` 或完整 2023～2024 发现批，未读取 2025/2026 分钟 outcome、未联网/provider/L2/ML/生产 DB/scanner。
+- runner：日 ZIP/目录各容器单次枚举/打开，分钟文件集合定义当日 universe；240-bar 原始行立即压缩为信号、买入、D+1、延迟退出所需统计。D `14:50` 后和 D+1 只进入 outcome；六特征、横截面中位数、percentile rank、最终排名保持 TNM-1 因果隔离。实现 D-1 严格 >5 亿、2023 定方向/组内排序、2024 仅同向否决、平均 percentile/decile、恒定 10 槽、三基准、gross/15/30 bps、跨日 5 分钟退出、年末 unresolved 阻断、独立 10×50 万容量袖套，以及 ST/公司行为/queue 降级。
+- 治理修复：`spec_hash` 仅为本文开头至 `## 11. 执行结果` 标记前的冻结定义字节 SHA-256；执行证据不参与哈希，防止 `run_id` 自引用。单元回归已证明追加第 11 节内容不改变 hash、修改冻结第 4～10 节会改变 hash；run manifest 同时记录 `code_commit`、`runner_source_hash`、输入 `path,size,mtime_ns`、单 writer/checkpoint/resume hash。
+- 定向验收：`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（16 tests）、`-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py` 与 `git diff --check` 均通过。回归包含 2025 guard、单容器单开、ZIP/目录/ZIP 优先、无日 K 股票仍在 minute universe、10 槽与买入失败现金 0、SHA 随机基准、2023/2024 选择隔离、跨日/跨年延迟退出、unresolved、checkpoint hash 冲突、canary 禁写 frozen_rule 与充分统计逐字段对照 TNM-1 240-bar 纯函数。
+- 最终真实只读 canary（ignored）：`output/tail-next-morning-v1/dev-preflight/dev-preflight-4cc41a037e6aa449`；`run_hash=4cc41a037e6aa449b1b0a83d94a33653d11c43536f46a6278e905881b0658fa5`，`spec_hash=2286778eebaf43e7b693355536c5a1b91b6ba0a497d0b2c575f960082a6a678c`，`runner_source_hash=5a8f1fb3a0f3d63d097a9cea22e1d0dd719321f9ddc1bb9d55eb57563907d81d`。195 秒完成 20230106、09～13、16～19 的 10 target、14 个 ZIP 输入容器、10 checkpoint；每日 minute universe 4,766～4,770，ready 245～379，`selection_status=canary_probe_not_frozen`，`frozen_rule` 未写，容量为独立诊断 `capacity_constrained`。
+- 终态与哈希：`completion.json=SUCCEEDED`；`development_results.json` SHA-256 `fa67c3b535ed32f159aee81dcc158f3e4a69900b76afd5c620813f5276b9004c`，`daily_results.csv.gz` SHA-256 `22ce8541a5b0c13a93a9e0bdb212bba0340161dadb6b0394d4f46e10d2383740`。第 11 节证据追加后须复算并保持上述 `spec_hash/run_id` 不变。
+- 先前 ignored attempts 保留为 superseded evidence：`dev-preflight-b25f014afa3d8ad8`、`dev-preflight-d9bf2f7fba637e98` 为治理字段补全前的成功尝试；`dev-preflight-cef0d603978ed695` 在发现执行结果自引用缺陷后由任务自有 PID 安全停止，`completion.json=CANCELLED: superseded_spec_hash_execution_results_boundary`。未删除任何 attempt。
+- 审核锁：只允许 Sol TNM-2AR 对本 runner/canary 作只读审核；TNM-2B、2025/2026、规则冻结、任何 provider/DB/交易操作继续锁定。
+
 ### TNM-3 执行结果
 
 状态：`locked_until_tnm2r_approve`

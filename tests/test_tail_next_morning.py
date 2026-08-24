@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import tempfile
 import unittest
 import zipfile
@@ -81,6 +82,17 @@ class TailNextMorningTests(unittest.TestCase):
             key: row[key]
             for key in ("feature_status", "feature_reason", "raw_features", "features", "d1_amount")
         }
+
+    @staticmethod
+    def _write_development_days(root: Path, dates: list[str], codes: tuple[str, ...]) -> None:
+        payload = make_bars().to_csv(index=False).encode("utf-8")
+        for trade_date in dates:
+            archive_path = root / trade_date[:4] / trade_date[4:6] / f"{trade_date}.zip"
+            archive_path.parent.mkdir(parents=True, exist_ok=True)
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                for code in codes:
+                    archive.writestr(f"sz/{code}.csv", payload)
+                archive.writestr("bj/920001.csv", payload)
 
     def test_frozen_windows_have_exact_bar_counts_and_vwap(self) -> None:
         from mining.tail_next_morning import vwap_for_window, window_bars
@@ -276,6 +288,148 @@ class TailNextMorningTests(unittest.TestCase):
         result = capacity_diagnostic(ranked)
         self.assertEqual(result["capacity_verdict_5m"], "capacity_unproven")
         self.assertEqual(ranked, before)
+
+    def test_development_statistics_match_tnm1_raw_formula_and_year_guard(self) -> None:
+        from mining.tail_next_morning import (
+            TailDataError,
+            feature_snapshot,
+            feature_snapshot_from_statistics,
+            minute_sufficient_statistics,
+            outcome_from_statistics,
+            outcome_snapshot,
+        )
+
+        day = make_bars()
+        prior = [make_bars() for _ in range(3)]
+        from_statistics = feature_snapshot_from_statistics(
+            "000001", minute_sufficient_statistics(day), [minute_sufficient_statistics(value) for value in prior], listing()
+        )
+        self.assertEqual(from_statistics, feature_snapshot("000001", day, prior, listing()))
+        expected_outcome = outcome_snapshot(day, make_bars())
+        actual_outcome = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(make_bars()), "20230109")
+        for field in ("outcome_status", "gross_return", "net_return_15bps", "net_return_30bps", "mfe_0930_1000", "mae_0930_1000"):
+            self.assertEqual(actual_outcome[field], expected_outcome[field])
+        with tempfile.TemporaryDirectory() as tmp:
+            from mining.tail_next_morning import load_day_statistics
+
+            with self.assertRaisesRegex(TailDataError, "development_year_guard:20250102"):
+                load_day_statistics(tmp, "20250102", allowed_years=("2023",))
+
+    def test_development_loader_opens_container_once_and_keeps_minute_universe_without_daily_k(self) -> None:
+        from mining.tail_next_morning import development_listing_evidence, feature_snapshot_from_statistics, load_day_statistics, minute_sufficient_statistics
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._write_development_days(root, ["20230103"], ("000001", "600000"))
+            with mock.patch("mining.tail_next_morning.zipfile.ZipFile", wraps=zipfile.ZipFile) as opened:
+                statistics, record = load_day_statistics(root, "20230103", allowed_years=("2023",))
+            self.assertEqual(opened.call_count, 1)
+            self.assertEqual(record["container_open_count"], 1)
+            self.assertEqual(set(statistics), {"000001", "600000"})
+            directory = root / "2023" / "01" / "20230104" / "sh"
+            directory.mkdir(parents=True)
+            (directory / "600000.csv").write_bytes(make_bars().to_csv(index=False).encode("utf-8"))
+            directory_statistics, directory_record = load_day_statistics(root, "20230104", allowed_years=("2023",))
+            self.assertEqual((directory_record["source_kind"], set(directory_statistics)), ("directory", {"600000"}))
+            with zipfile.ZipFile(root / "2023" / "01" / "20230104.zip", "w") as archive:
+                archive.writestr("sz/000001.csv", make_bars().to_csv(index=False).encode("utf-8"))
+            zip_statistics, zip_record = load_day_statistics(root, "20230104", allowed_years=("2023",))
+            self.assertEqual((zip_record["source_kind"], set(zip_statistics)), ("zip", {"000001"}))
+            evidence = development_listing_evidence(root / "daily_missing", "600000", "20230106", 20, {})
+            self.assertEqual(evidence["listing_age_source"], "minute_source_visible_history")
+            ready = feature_snapshot_from_statistics(
+                "600000", minute_sufficient_statistics(make_bars()), [minute_sufficient_statistics(make_bars()) for _ in range(3)], evidence
+            )
+            self.assertEqual(ready["feature_status"], "ready")
+
+    def test_fixed_slots_random_sha_and_2023_only_group_order(self) -> None:
+        from mining.tail_next_morning import _fixed_ten_slots, _random_top10, select_development_features
+
+        one = {"sec_code": "000001", "outcome": {"outcome_status": "cash_unfilled_buy"}}
+        slots = _fixed_ten_slots([one])
+        self.assertEqual(len(slots["slots"]), 10)
+        self.assertEqual(slots["net30"], 0.0)
+        random_rows = [{"sec_code": f"6000{index:02d}"} for index in range(12)]
+        expected = sorted(
+            random_rows,
+            key=lambda row: (__import__("hashlib").sha256(f"20260824|20230106|{row['sec_code']}".encode()).hexdigest(), row["sec_code"]),
+        )[:10]
+        self.assertEqual([row["sec_code"] for row in _random_top10(random_rows, "20230106")], [row["sec_code"] for row in expected])
+
+        def rows_for_year(year: str) -> list[dict[str, object]]:
+            rows = []
+            for index in range(10):
+                net = 0.0
+                if index == 9:
+                    net = 0.03 if year == "2023" else 0.001
+                if index == 8:
+                    net = 0.01 if year == "2023" else 0.99
+                percentiles = {
+                    "tail_return_rel": (index + 1) / 10,
+                    "tail_end_location": 1.0 if index == 8 else (index + 1) / 20,
+                    "tail_amount_accel": (index + 1) / 10,
+                    "pre_tail_return_rel": (index + 1) / 10,
+                    "activity_ratio": (index + 1) / 10,
+                    "recent_3date_return_rel": (index + 1) / 10,
+                }
+                rows.append({"sec_code": f"6000{index:02d}", "feature_status": "ready", "feature_percentiles": percentiles, "outcome": {"outcome_status": "ready", "net_return_30bps": net}})
+            return rows
+
+        selection = select_development_features({"20230106": rows_for_year("2023"), "20240105": rows_for_year("2024")})
+        tail_price = next(row for row in selection["selected_features"] if row["group"] == "tail_price")
+        self.assertEqual(tail_price["feature"], "tail_return_rel")
+
+    def test_delayed_exit_grid_year_boundary_and_unresolved_block(self) -> None:
+        from mining.tail_next_morning import _blocked_outcome, minute_sufficient_statistics, outcome_from_statistics, resolve_delayed_exit
+
+        day = make_bars()
+        next_day = make_bars()
+        next_day.loc[30:34, ["amount", "volume"]] = 0.0
+        delayed = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(next_day), "20231229")
+        self.assertEqual(delayed["outcome_status"], "delayed_exit_required")
+        resolved = resolve_delayed_exit(delayed, minute_sufficient_statistics(next_day), "20231229", "20231228", first_delayed_day=True)
+        self.assertEqual(resolved["outcome_status"], "ready")
+        next_day.loc[35:, ["amount", "volume"]] = 0.0
+        still_delayed = outcome_from_statistics(minute_sufficient_statistics(day), minute_sufficient_statistics(next_day), "20231229")
+        later = resolve_delayed_exit(still_delayed, minute_sufficient_statistics(make_bars()), "20231230", "20231228", first_delayed_day=False)
+        self.assertEqual(later["outcome_status"], "ready")
+        self.assertIsNone(resolve_delayed_exit(delayed, minute_sufficient_statistics(next_day), "20240102", "20231228", first_delayed_day=False))
+        self.assertEqual(_blocked_outcome(delayed)["outcome_status"], "unresolved_exit_at_phase_end")
+
+    def test_checkpoint_hash_conflict_and_canary_no_frozen_rule(self) -> None:
+        from mining.tail_next_morning import TailDataError, _prepare_development_run, run_dev_preflight
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = [{"trade_date": "20230103", "path": "a", "source_kind": "zip", "size_bytes": 1, "mtime_ns": 1}]
+            _prepare_development_run(root, mode="dev-preflight", input_manifest=manifest, resume_run_id="resume-target")
+            changed = [{**manifest[0], "size_bytes": 2}]
+            with self.assertRaisesRegex(TailDataError, "resume_hash_mismatch"):
+                _prepare_development_run(root, mode="dev-preflight", input_manifest=changed, resume_run_id="resume-target")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dates = [f"202301{day:02d}" for day in range(3, 17)]
+            codes = tuple(f"600{index:03d}" for index in range(12))
+            self._write_development_days(root, dates, codes)
+            with mock.patch("mining.tail_next_morning.development_listing_evidence", return_value=listing()):
+                result, run_dir = run_dev_preflight(root, root / "daily", root / "out")
+            self.assertEqual(len(result["target_dates"]), 10)
+            self.assertFalse((run_dir / "frozen_rule.json").exists())
+            self.assertEqual(json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"], "SUCCEEDED")
+
+    def test_spec_hash_excludes_execution_results_but_covers_frozen_definition(self) -> None:
+        from mining.tail_next_morning import _frozen_contract_hash
+
+        with tempfile.TemporaryDirectory() as tmp:
+            card = Path(tmp) / "card.md"
+            card.write_bytes("# contract\r\n## 4. frozen rule\r\nvalue=one\r\n## 11. 执行结果\r\ninitial\r\n".encode("utf-8"))
+            baseline = _frozen_contract_hash(card)
+            with card.open("ab") as handle:
+                handle.write("TNM-2A evidence\r\n".encode("utf-8"))
+            self.assertEqual(_frozen_contract_hash(card), baseline)
+            card.write_bytes(card.read_bytes().replace(b"value=one", b"value=two"))
+            self.assertNotEqual(_frozen_contract_hash(card), baseline)
 
 
 MIN_D1_AMOUNT = 500_000_000.0
