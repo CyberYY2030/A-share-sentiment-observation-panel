@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest import mock
 
 import pandas as pd
 
@@ -27,10 +28,58 @@ def make_bars(*, amount: float = 10_000_000.0, volume: float = 1_000_000.0) -> p
 
 
 def listing() -> dict[str, object]:
-    return {"listing_age_source": "daily_k_first_date", "listing_history_sessions": 20, "daily_columns": ["date", "amount"]}
+    return {
+        "listing_age_source": "daily_k_first_date",
+        "listing_history_sessions": 20,
+        "daily_amount": 2_400_000_000.0,
+        "daily_columns": ["date", "amount"],
+    }
 
 
 class TailNextMorningTests(unittest.TestCase):
+    _PREFLIGHT_DATES = ("20260105", "20260106", "20260107", "20260108", "20260109")
+
+    def _preflight_row(self, *, mutate=None, omit_next_day_code: bool = False, truncate_next_day_code: bool = False):
+        from mining.tail_next_morning import PREFLIGHT_CODES, _preflight_sample, rank_scored_rows
+
+        sample = {
+            "sample_id": "causal_loader_regression",
+            "target_date": self._PREFLIGHT_DATES[3],
+            "dates": self._PREFLIGHT_DATES,
+            "expected_source_kind": "zip",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for trade_date in self._PREFLIGHT_DATES:
+                archive_path = root / trade_date[:4] / trade_date[4:6] / f"{trade_date}.zip"
+                archive_path.parent.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(archive_path, "w") as archive:
+                    for code in PREFLIGHT_CODES:
+                        if omit_next_day_code and trade_date == self._PREFLIGHT_DATES[-1] and code == "000001":
+                            continue
+                        bars = make_bars()
+                        if mutate is not None and code == "000001":
+                            mutate(bars, trade_date)
+                        if truncate_next_day_code and trade_date == self._PREFLIGHT_DATES[-1] and code == "000001":
+                            bars = bars.iloc[:-1]
+                        archive.writestr(f"sz/{code}.csv", bars.to_csv(index=False).encode("utf-8"))
+            with mock.patch("mining.tail_next_morning.listing_evidence", return_value=listing()):
+                preflight = _preflight_sample(root, root, sample)
+        rows = {row["sec_code"]: row for row in preflight["rows"]}
+        ranking = rank_scored_rows(
+            {"sec_code": code, "score": row["raw_features"].get("tail_return", -1.0)}
+            for code, row in rows.items()
+            if row["feature_status"] == "ready"
+        )
+        return rows["000001"], ranking
+
+    @staticmethod
+    def _feature_signature(row: dict[str, object]) -> dict[str, object]:
+        return {
+            key: row[key]
+            for key in ("feature_status", "feature_reason", "raw_features", "features", "d1_amount")
+        }
+
     def test_frozen_windows_have_exact_bar_counts_and_vwap(self) -> None:
         from mining.tail_next_morning import vwap_for_window, window_bars
 
@@ -55,6 +104,55 @@ class TailNextMorningTests(unittest.TestCase):
         ranked_before = rank_scored_rows([{"sec_code": "000001", "score": before["raw_features"]["tail_return"]}, {"sec_code": "600000", "score": 0.0}])
         ranked_after = rank_scored_rows([{"sec_code": "000001", "score": after["raw_features"]["tail_return"]}, {"sec_code": "600000", "score": 0.0}])
         self.assertEqual(ranked_before, ranked_after)
+
+    def test_preflight_loader_isolates_future_windows_without_changing_signal(self) -> None:
+        baseline, baseline_rank = self._preflight_row()
+        baseline_feature = self._feature_signature(baseline)
+        baseline_outcome = baseline["outcome"]
+        self.assertEqual(baseline["outcome"]["outcome_status"], "ready")
+
+        cases = (
+            ("d_1450_buffer_non_numeric", "20260108", 230, "not-a-number", "feature_and_outcome_unchanged"),
+            ("d_buy_nan", "20260108", 231, float("nan"), "unavailable_buy_window_invalid"),
+            ("d_after_buy_inf", "20260108", 236, float("inf"), "feature_and_outcome_unchanged"),
+            ("dplus1_outcome_non_numeric", "20260109", 30, "not-a-number", "unavailable_next_day_window_invalid"),
+            ("dplus1_after_outcome_nan", "20260109", 35, float("nan"), "feature_and_outcome_unchanged"),
+        )
+        for name, trade_date, index, value, expected in cases:
+            with self.subTest(name=name):
+                def mutate(bars, date, *, target=trade_date, bar_index=index, changed_value=value):
+                    if date == target:
+                        if isinstance(changed_value, str):
+                            bars["close"] = bars["close"].astype(object)
+                        bars.loc[bar_index, "close"] = changed_value
+
+                row, ranking = self._preflight_row(mutate=mutate)
+                self.assertEqual(self._feature_signature(row), baseline_feature)
+                self.assertEqual(ranking, baseline_rank)
+                if expected == "feature_and_outcome_unchanged":
+                    self.assertEqual(row["outcome"], baseline_outcome)
+                else:
+                    self.assertEqual(row["outcome"]["outcome_status"], expected)
+
+        row, ranking = self._preflight_row(omit_next_day_code=True)
+        self.assertEqual(self._feature_signature(row), baseline_feature)
+        self.assertEqual(ranking, baseline_rank)
+        self.assertEqual(row["outcome"]["outcome_status"], "unavailable_next_day_session")
+
+        row, ranking = self._preflight_row(truncate_next_day_code=True)
+        self.assertEqual(self._feature_signature(row), baseline_feature)
+        self.assertEqual(ranking, baseline_rank)
+        self.assertEqual(row["outcome"]["outcome_status"], "unavailable_next_day_session")
+
+    def test_preflight_loader_keeps_signal_window_fail_closed(self) -> None:
+        def mutate(bars, date):
+            if date == "20260108":
+                bars.loc[229, "close"] = 0.0
+
+        row, ranking = self._preflight_row(mutate=mutate)
+        self.assertEqual(row["feature_status"], "isolated")
+        self.assertEqual(row["feature_reason"], "non_positive_ohlc")
+        self.assertNotIn("000001", [ranked["sec_code"] for ranked in ranking])
 
     def test_dplus1_changes_outcome_only(self) -> None:
         from mining.tail_next_morning import feature_snapshot, outcome_snapshot

@@ -251,6 +251,14 @@ git diff --check
 - 降级边界已写入产物：`st_filter_applied=false`、`st_status=unavailable_not_filtered`、`corporate_action_filter=unproven_not_applied`、`capacity_verdict_5m=capacity_unproven_no_frozen_rank`；容量未影响排名，且尚无冻结 Top 10，因此不形成容量结论。
 - 已知限制：日 K 仅用于上市历史与成交额交叉核对，未用于 D 14:50 决策；公司行为没有可证明的字段合同，故未猜测或过滤；VWAP 仍只是小单基准。此前一次因同日 ZIP/目录并存触发的解析 partial 产物已保留在同目录，修正为 ZIP 确定性优先后才得到本结果。
 
+#### TNM-1F：因果用途隔离修复（Terra）
+
+- 修复背景：Sol 的 TNM-1R 为 `tnm1r_changes_required`（P1）。首个分歧是 loader 在用途切分前整日验证 OHLC/有限数值，使 D 14:50 后或 D+1 无关区的坏值删除 D 信号。
+- 最小修复：保留全局 240 行、六列、时间映射和可数值转换的结构检查；把有限数值、正 OHLC、amount/volume 非负移至各自消费窗口。D 信号只严格校验 `[09:30,14:50)` 与完整 D-3～D-1；买入只校验 `[14:51,14:56)`；D+1 标签/卖出只校验 `[09:30,10:05)`。D+1 文件缺失或 239 行未知缺口保留 D feature，并把 outcome 标记为 unavailable。
+- 定向验证通过：同一真实 ZIP loader + `_preflight_sample` 控制流覆盖 D `14:50` 字符串、买入窗 `NaN`、D `14:56` 后 `Inf`、D+1 结果窗字符串、D+1 `10:05` 后 `NaN`、缺失 D+1 文件、239 行 D+1 与 D `<14:50` 非法。前五类未来变形保持 D feature/eligibility/rank；相关 outcome 正确降级；D `<14:50` 仍 fail-closed。`C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m unittest tests.test_tail_next_morning`（9 tests）和 `-m py_compile mining\tail_next_morning.py tests\test_tail_next_morning.py` 均通过。
+- 真实预检复核通过：`output/tail-next-morning-v1/preflight/preflight-attempt-05.json`，SHA-256 `a4e76387e843f7f9d9b24f0a7d9063824e251f048def2d4597368e687cc2c792`，与 attempt-03 字节相同；仍为 `tnm1_preflight_verified`、7 ready、2 个 D-1 门槛隔离。
+- 审核锁：本修复不是审核批准；TNM-1R 仍为 `changes_required`，TNM-2 继续锁定，必须等待 Sol 对本修复提交只读复审。
+
 ### TNM-2 执行结果
 
 状态：`locked_until_tnm1r_approve`

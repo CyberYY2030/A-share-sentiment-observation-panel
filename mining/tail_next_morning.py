@@ -77,8 +77,8 @@ def window_bars(bars: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
     return bars.iloc[start_index:end_index].copy()
 
 
-def normalize_minute_frame(raw: pd.DataFrame) -> pd.DataFrame:
-    """Validate the fixed 240-bar positional minute-source contract."""
+def parse_minute_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Parse fixed session structure without making an outcome window a signal gate."""
     if raw is None:
         raise TailDataError("minute_frame_missing")
     columns_by_lower = {str(column).strip().lower(): column for column in raw.columns}
@@ -105,20 +105,37 @@ def normalize_minute_frame(raw: pd.DataFrame) -> pd.DataFrame:
     result = pd.DataFrame()
     for name in MINUTE_COLUMNS:
         value = pd.to_numeric(raw[columns_by_lower[name]], errors="coerce")
-        if value.isna().any() or not value.map(math.isfinite).all():
-            raise TailDataError(f"non_numeric_minute_{name}")
         result[name] = value.astype(float)
 
-    prices = result[["open", "high", "low", "close"]]
+    return result.reset_index(drop=True)
+
+
+def validate_minute_window(bars: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
+    """Fail closed only for the window consumed by the caller."""
+    if len(bars) != len(SESSION_LABELS):
+        raise TailDataError(f"session_bar_count:{len(bars)}")
+    window = window_bars(bars, start, end)
+    for name in MINUTE_COLUMNS:
+        values = window[name]
+        if values.isna().any() or not values.map(math.isfinite).all():
+            raise TailDataError(f"non_numeric_minute_{name}")
+    prices = window[["open", "high", "low", "close"]]
     if prices.le(0).any().any():
         raise TailDataError("non_positive_ohlc")
-    if result[["amount", "volume"]].lt(0).any().any():
+    if window[["amount", "volume"]].lt(0).any().any():
         raise TailDataError("negative_amount_or_volume")
-    if (result["high"] < prices[["open", "close", "low"]].max(axis=1)).any() or (
-        result["low"] > prices[["open", "close", "high"]].min(axis=1)
+    if (window["high"] < prices[["open", "close", "low"]].max(axis=1)).any() or (
+        window["low"] > prices[["open", "close", "high"]].min(axis=1)
     ).any():
         raise TailDataError("invalid_ohlc_range")
-    return result.reset_index(drop=True)
+    return window.copy()
+
+
+def normalize_minute_frame(raw: pd.DataFrame) -> pd.DataFrame:
+    """Strict full-session validation retained for callers that need all 240 bars."""
+    result = parse_minute_frame(raw)
+    validate_minute_window(result, "09:30", "15:00")
+    return result
 
 
 def locate_day_source(minute_root: str | Path, trade_date: str) -> tuple[Path, str]:
@@ -179,7 +196,7 @@ def load_minute_session(source: str | Path, code: str) -> pd.DataFrame:
         raw = pd.read_csv(io.BytesIO(payload))
     except Exception as exc:  # pandas provides the parse detail; callers only expose the reason code.
         raise TailDataError(f"minute_csv_unreadable:{canonical_code(code)}") from exc
-    return normalize_minute_frame(raw)
+    return parse_minute_frame(raw)
 
 
 def load_day_sessions(minute_root: str | Path, trade_date: str, codes: Iterable[str]) -> tuple[dict[str, pd.DataFrame], dict[str, Any]]:
@@ -278,6 +295,12 @@ def feature_snapshot(
         return _empty_feature_snapshot(code, "non_a_share_prefix", listing)
     if len(prior) != 3:
         return _empty_feature_snapshot(code, "missing_d3_to_d1_sessions", listing)
+    try:
+        for session in prior:
+            validate_minute_window(session, "09:30", "15:00")
+        validate_minute_window(day_bars, "09:30", "14:50")
+    except TailDataError as exc:
+        return _empty_feature_snapshot(code, exc.reason, listing)
     if int(listing.get("listing_history_sessions") or 0) < MIN_HISTORY_SESSIONS:
         return _empty_feature_snapshot(code, "listing_history_under_20", listing)
 
@@ -348,20 +371,36 @@ def add_market_relative_features(snapshots: Iterable[dict[str, Any]]) -> list[di
     return rows
 
 
-def outcome_snapshot(day_bars: pd.DataFrame, next_day_bars: pd.DataFrame) -> dict[str, Any]:
+def _unavailable_outcome(status: str, buy: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "outcome_status": status,
+        "buy": buy,
+        "sell": None,
+        "gross_return": None,
+        "net_return_15bps": None,
+        "net_return_30bps": None,
+        "mfe_0930_1000": None,
+        "mae_0930_1000": None,
+    }
+
+
+def outcome_snapshot(day_bars: pd.DataFrame | None, next_day_bars: pd.DataFrame | None) -> dict[str, Any]:
     """Compute labels and executable VWAPs; this path never feeds feature eligibility."""
+    if day_bars is None:
+        return _unavailable_outcome("unavailable_day_session")
+    try:
+        validate_minute_window(day_bars, "14:51", "14:56")
+    except TailDataError:
+        return _unavailable_outcome("unavailable_buy_window_invalid")
     buy = vwap_for_window(day_bars, "14:51", "14:56")
     if buy["status"] != "ready":
-        return {
-            "outcome_status": "cash_unfilled_buy",
-            "buy": buy,
-            "sell": None,
-            "gross_return": None,
-            "net_return_15bps": None,
-            "net_return_30bps": None,
-            "mfe_0930_1000": None,
-            "mae_0930_1000": None,
-        }
+        return _unavailable_outcome("cash_unfilled_buy", buy)
+    if next_day_bars is None:
+        return _unavailable_outcome("unavailable_next_day_session", buy)
+    try:
+        validate_minute_window(next_day_bars, "09:30", "10:05")
+    except TailDataError:
+        return _unavailable_outcome("unavailable_next_day_window_invalid", buy)
     sell = vwap_for_window(next_day_bars, "10:00", "10:05")
     potential = window_bars(next_day_bars, "09:30", "10:00")
     entry = float(buy["vwap"])
@@ -496,16 +535,16 @@ def _preflight_sample(minute_root: Path, daily_root: Path, sample: Mapping[str, 
     target = sample["target_date"]
     rows: list[dict[str, Any]] = []
     for code in PREFLIGHT_CODES:
-        required_days = [sessions_by_day[day].get(code) for day in sample["dates"]]
-        if any(session is None for session in required_days):
-            rows.append({"sec_code": code, "sample_status": "isolated_missing_or_invalid_session"})
-            continue
-        d3, d2, d1, day, next_day = required_days
+        d3, d2, d1, day = [sessions_by_day[date].get(code) for date in sample["dates"][:4]]
+        next_day = sessions_by_day[sample["dates"][4]].get(code)
         listing = listing_evidence(daily_root, code, target, minute_visible_sessions=3)
-        snapshot = feature_snapshot(code, day, (d3, d2, d1), listing)
+        if any(session is None for session in (d3, d2, d1, day)):
+            snapshot = _empty_feature_snapshot(code, "signal_session_missing_or_invalid", listing)
+        else:
+            snapshot = feature_snapshot(code, day, (d3, d2, d1), listing)
         outcome = outcome_snapshot(day, next_day)
-        amount_crosscheck = daily_minute_crosscheck(listing.get("daily_amount"), day)
-        if amount_crosscheck["status"] != "ready":
+        amount_crosscheck = daily_minute_crosscheck(listing.get("daily_amount"), day) if day is not None else {"status": "unavailable", "ratio": None}
+        if day is not None and amount_crosscheck["status"] != "ready":
             sample_errors.append(f"daily_minute_amount_{amount_crosscheck['status']}:{code}")
         rows.append(
             {
