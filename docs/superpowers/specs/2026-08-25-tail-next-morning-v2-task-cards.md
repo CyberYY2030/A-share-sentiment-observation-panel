@@ -367,3 +367,10 @@ Terra 必须记录前后 `git status --short`、实际命令、测试数、canar
 ## 11. 执行结果
 
 尚未执行。Terra 完成 TNM-V2-1 后只能在本节追加紧凑证据，不得改写第 1～10 节。
+
+### TNM-V2-1（2026-08-25，Terra）
+
+- 状态：`tnm_v2_1_blocked`。实现和合成验证完成，但固定真实五日 canary 未能在 30 分钟硬上限内写出任何经济产物，未进入 fixture 判断，更未调参或重跑。
+- 已通过：`python -m unittest tests.test_tail_next_morning_v2`（18 tests）、`python -m unittest tests.test_tail_next_morning`（25 tests）、`python -m py_compile mining\\tail_next_morning_v2.py tests\\test_tail_next_morning_v2.py`、`git diff --check`。
+- 唯一真实运行：`2026-08-25 11:51:35+08:00` 启动 `canary-6e902c20182f-9f411fda0d04`，参数仅为冻结的 `E:\\分钟数据`、`E:\\日K线全部至202606`、五个 2024 target；PID `24040` 在 `12:21:48+08:00` 经命令行身份核验后安全停止。该 ignored 目录保留为空工作目录；无 `canary_summary.json`、候选、fixture、daily top 或 manifest，故无 fixture 结论、artifact hash 或可审核的经济结果。
+- 身份：运行目录前缀记录 `spec_hash=6e902c20182f…`、执行前 `code_hash=9f411fda0d04…`；未读取 2025/2026，未写 E:，未启动第二个 canary。V1 代码、测试、任务卡和产物未修改；TNM-V2-2/完整开发期继续锁定，等待独立 Sol 审核此阻塞证据。
