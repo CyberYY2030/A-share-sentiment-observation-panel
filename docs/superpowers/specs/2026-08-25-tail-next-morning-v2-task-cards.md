@@ -6,7 +6,7 @@
 - 唯一独立审核会话（Sol）：`01a03141-39e9-7dd1-a359-037346adf01b`
 - 仓库：`D:\BaiduNetdiskDownload\cursor workflow\adata_sentiment_dashboard`
 - V1 终态：`tnm_v1_closed_no_stable_development_signal`
-- 当前阶段：`TNM-V2-1 ready_for_terra`
+- 当前阶段：`TNM-V2-1F ready_for_terra_after_blocked_canary`
 
 执行者和审核者把本文当完整合同。规划会话负责业务定义、任务拆分、分歧裁决和最终接受；Terra 只负责实现与执行；Sol 只负责独立只读审核。阶段严格串行，任何阶段未通过都不得读取或运行后续冻结区。
 
@@ -181,11 +181,11 @@ B 排序只在 `b_shape_pass && liquidity_pass && common_quality_pass` 且未进
 - 正常每日最终 0～5 只；无合格者输出空列表，禁止补位；完全经济并列时可因保留边界并列略高于 5，并单独计数；
 - 最终输出顺序为 A rank 后 B rank，只是展示分组，不代表 A 永远优于 B。
 
-## 6. TNM-V2-1：实现、定向测试与五日全市场 canary（Terra）
+## 6. TNM-V2-1：实现、定向测试与二日全市场 + 三单股 canary（Terra）
 
 ### 6.1 唯一目标
 
-证明公式、时间隔离、流动性门和经济排序按本文运行，并用用户给出的五个日期做全市场 canary。不得运行完整 2023～2024 回测，不得读取 2025/2026 outcome。
+证明公式、时间隔离、流动性门和经济排序按本文运行。只有需要验证横截面 Top 3 身份的 `20240923`、`20240926` 做全市场排序；另外三个日期只验证固定单股的绝对形态和流动性谓词。不得运行完整 2023～2024 回测，不得读取 2025/2026 outcome。
 
 ### 6.2 白名单与实现约束
 
@@ -196,6 +196,16 @@ B 排序只在 `b_shape_pass && liquidity_pass && common_quality_pass` 且未进
 
 V2 应导入并复用 V1 已审核的源定位、分钟解析、窗口/VWAP和充分统计能力；只新增 V2 业务纯函数和最小 canary runner。若现有公开函数不能满足需求，先报告阻塞，不得修改 V1 或复制整套 loader。
 
+性能修复只能改变读取拓扑，不得改变第 4～5 节任何公式、gate、rank、Top N、tie 或 outcome：
+
+1. 全市场目标固定为 `20240923,20240926`。每个目标先只加载 D 与 D-1 的当日 minute universe；D-1 完整分钟 amount、prev close 和 D 的 14:50 特征仍来自分钟源，不改用当前 DB/日 K 股票清单；
+2. 共用必要条件先检查数据质量与 `D-1 amount > 2亿`。A 的本地必要条件固定为 `ret1450>=4% && position1450>=0.55 && vwap_dist>=1%`；B 的本地必要条件固定为 `close1450>open_D && close1450>prev_close && position1450>=0.55`。只有满足 A 或 B 本地必要条件的代码才可进入历史读取；
+3. 对幸存代码按依赖日分组；每个 D-2～D-10 容器只枚举/打开一次，只读取该日所需成员并即时压缩。随后调用同一最终 gate 函数做全保真判断；预筛不得拥有另一套阈值字面量，不得计算 percentile 或提前决定 rank；
+4. `20240813|300328`、`20240826|300972`、`20240827|300972` 只按单股读取其 D-10～D+1；它们不进入当日全市场 rank，形态/流动性断言与第 6.3 节完全一致；
+5. 上市历史仍只对最终 shape+liquidity 幸存者核验；minute universe 不与当前日 K 文件集合取交集。
+
+必须新增原子运行证据：`run_manifest.json` 在计算前落盘；`progress.json` 在每个完整单元（两个全市场日、三个 fixture）后原子更新，至少含阶段、完成单元、各级幸存数、耗时和异常计数；每单元写 hash-bound checkpoint；终态原子写 `completion.json=SUCCEEDED|FAILED|CANCELLED`。同 identity 只允许显式 resume，hash 不同拒绝；旧空运行 `canary-6e902c20182f-9f411fda0d04` 永久只读保留。
+
 固定命令界面：
 
 ```powershell
@@ -205,7 +215,7 @@ C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m mining
   --output-dir "output\tail-next-morning-v2\canary"
 ```
 
-canary 仅允许目标 D：`20240813,20240826,20240827,20240923,20240926`。可读取计算这些 D 所必需的 D 前历史和 D+1，不得顺带扫描其他 target D。
+canary 的经济 target 仍严格为 `20240813,20240826,20240827,20240923,20240926`；全市场 target 只允许 `20240923,20240926`，其余三日只允许读取固定 fixture 代码。可读取计算这些断言所必需的 D 前历史和 D+1，不得顺带扫描其他 target D。
 
 ### 6.3 必须测试
 
@@ -222,9 +232,14 @@ canary 仅允许目标 D：`20240813,20240826,20240827,20240923,20240926`。可�
 9. 修改 D 14:50 后或 D+1 任意数据不改变 D 资格、特征、score、rank 和成员；
 10. 次日开盘后 MFE、隔夜 gap、从买价 MFE、MAE 与固定退出收益公式分别正确；
 11. invalid/zero-volume outcome 只降级 outcome，不删除信号；
-12. ST/公司行为状态按本文显式降级。
+12. ST/公司行为状态按本文显式降级；
+13. 固定种子的 300 代码 × 12 session 合成宇宙中，朴素全量 gate/rank 与必要条件预筛路径的 `eligible set/channel/score/order/selected set` 逐项相等；
+14. 对每个预筛谓词覆盖阈值等于、上下一个最小变动、NaN、缺 D-1、零振幅和历史缺失；预筛不得放过不满足自身必要条件的股票，也不得排除任何最终合格股票；
+15. 固定 64 代码真实小宇宙（必须含五个 fixture，其他代码按固定 SHA-256 选取）中，全量读取与选择性读取的充分统计、最终 gate/rank/成员逐项相等；
+16. 两个全市场日的 B Top 2 只做结构断言：成员数不超过 2（边界完全经济并列除外）、全员通过 B gate、score/rank 单调、无 NaN、outcome 分离；不预设具体代码；
+17. manifest/progress/checkpoint/completion 原子写、hash-bound resume、旧 identity 拒绝、异常/取消可恢复，且 D/D-1 全市场容器和各历史选择性容器每日期只打开一次。
 
-真实五日 canary 必须断言：
+真实 canary 必须断言：
 
 | D | 股票 | 冻结预期 |
 |---|---|---|
@@ -232,7 +247,7 @@ canary 仅允许目标 D：`20240813,20240826,20240827,20240923,20240926`。可�
 | 2024-09-26 | 300339 | `a_shape_pass=true`、流动性通过、最终 A Top 3 入选 |
 | 2024-08-26 | 300972 | `b_shape_pass=true`；因 D-1 amount 不足 2 亿元，最终不入选 |
 | 2024-08-27 | 300972 | `b_shape_pass=false`，主要失败项应含 `position1450<0.55`；流动性亦不通过 |
-| 2024-08-13 | 300328 | `b_shape_pass=true`、流动性通过；报告 B rank/是否进入 Top 2，不强制 Top 2 |
+| 2024-08-13 | 300328 | 单股 fixture：`b_shape_pass=true`、流动性通过；不计算/声称全市场 B rank |
 
 任一必选 A 未进入 Top 3，或任一固定形态断言不符，结论必须为 `changes_required_by_frozen_canary` 并停止。Terra 不得自行调参。
 
@@ -240,10 +255,11 @@ canary 仅允许目标 D：`20240813,20240826,20240827,20240923,20240926`。可�
 
 产物至少包含：
 
-- `canary_summary.json`：状态、代码/任务卡 hash、五日候选数、断言结果、异常计数；
-- `canary_candidates.csv.gz`：五日所有 A/B 最终候选及通道、rank、score、原始指标、outcome；
+- `run_manifest.json`、`progress.json`、分单元 checkpoints、原子 `completion.json`；
+- `canary_summary.json`：状态、代码/任务卡 hash、两日全市场候选数、三条单股断言、异常计数与性能统计；
+- `canary_candidates.csv.gz`：两个全市场日所有 A/B 最终候选及通道、rank、score、原始指标、outcome；
 - `canary_fixture_rows.json`：五个指定股票日的全部 gate、失败原因、原始指标、D-1 amount、排名与 outcome；
-- `canary_daily_top.json`：每天 A/B 完整 Top 列表与边界并列状态；
+- `canary_daily_top.json`：两个全市场日的 A/B 完整 Top 列表与边界并列状态；
 - `artifact_manifest.json`：文件大小与 SHA-256；
 - 输出显式写 `capacity_filter_applied=false`、`st_filter_applied=false`、`corporate_action_filter=unproven_not_applied`。
 
@@ -264,6 +280,8 @@ Terra 必须记录前后 `git status --short`、实际命令、测试数、canar
 - `changes_required_by_frozen_canary`
 - `tnm_v2_1_blocked`
 
+修复后 canary 目标为 10 分钟内完成，外部硬上限 15 分钟。只要 `progress.json` 持续前进就不是死锁；超过 15 分钟仍必须安全停止并返回规划会话，不得自行放宽时限、重跑或转完整长批。完整 2023～2024、2025、2026 从一开始即按 HEAVY-BATCH detached 合同运行，禁止模型轮询。
+
 ## 7. TNM-V2-1R：独立只读审核（Sol）
 
 仅在 Terra 停止并提交后派发。Sol 不改任何文件，独立核验：
@@ -274,7 +292,7 @@ Terra 必须记录前后 `git status --short`、实际命令、测试数、canar
 - A/B 分池 percentile、无代码经济 tie-break、无补位；
 - 14:50/D+1 未来变形不改变 selection；
 - outcome 标签确实区分开盘后拉升、隔夜 gap 与从买价收益；
-- canary target 严格限五日、2025/2026 未被读取、E: 未写；
+- 全市场 target 严格限两日、另外三日严格限 fixture 代码、2025/2026 未被读取、E: 未写；
 - artifact hashes、测试证据和任务自有进程清理。
 
 结论只能为 `approve|changes_required|blocked_evidence`，findings 分 P0/P1/P2，并提供最小复现。只有 `approve` 才解锁 TNM-V2-2；Terra 不得自审，规划会话不得代替独立审核。
@@ -374,3 +392,10 @@ Terra 必须记录前后 `git status --short`、实际命令、测试数、canar
 - 已通过：`python -m unittest tests.test_tail_next_morning_v2`（18 tests）、`python -m unittest tests.test_tail_next_morning`（25 tests）、`python -m py_compile mining\\tail_next_morning_v2.py tests\\test_tail_next_morning_v2.py`、`git diff --check`。
 - 唯一真实运行：`2026-08-25 11:51:35+08:00` 启动 `canary-6e902c20182f-9f411fda0d04`，参数仅为冻结的 `E:\\分钟数据`、`E:\\日K线全部至202606`、五个 2024 target；PID `24040` 在 `12:21:48+08:00` 经命令行身份核验后安全停止。该 ignored 目录保留为空工作目录；无 `canary_summary.json`、候选、fixture、daily top 或 manifest，故无 fixture 结论、artifact hash 或可审核的经济结果。
 - 身份：运行目录前缀记录 `spec_hash=6e902c20182f…`、执行前 `code_hash=9f411fda0d04…`；未读取 2025/2026，未写 E:，未启动第二个 canary。V1 代码、测试、任务卡和产物未修改；TNM-V2-2/完整开发期继续锁定，等待独立 Sol 审核此阻塞证据。
+
+### TNM-V2-1R 阻塞审计与规划裁决（2026-08-25）
+
+- 规划会话已把 `8db1dd0`、空 run 目录和完整审核范围派给原独立 Sol 会话 `01a03141-39e9-7dd1-a359-037346adf01b`。Sol 主审核回合及两次纯输出恢复回合均显示 completed，但 Codex 客户端未保存任何 message/tool item；超过三次无新信号后停止重试。该阶段只能记为 `blocked_evidence_due_client_output_loss`，不得冒充 `approve` 或 `changes_required`。
+- 首个可复现分歧位于读取拓扑：旧 runner 在 gate 前对五个离散 target 的全部 D-10～D+1 依赖日做全市场逐 CSV/Pandas 解析；实际并集为 37 个全市场容器，约 18 万份 CSV。进程持续 CPU 增长证明不是锁死，但任务结束前才写产物，使 30 分钟安全停止变成零进度/零经济证据。
+- 规划会话通过 Claude Code/Opus 做只读方法讨论。采纳：策略定义不变；canary 收窄为两个必须验证 Top 3 身份的全市场日加三个单股 fixture；必要条件预筛后按日批读幸存代码；增加等价性属性/边界/真实小宇宙对拍与原子 progress/checkpoint/completion。拒绝直接用当前 DB/日 K 股票清单代替分钟 universe；D/D-1 point-in-time universe、成交额和 14:50 特征继续来自分钟源。
+- 当前裁决：只解锁 Terra 的 `TNM-V2-1F` 性能与证据治理修复，严格按第 6 节；不得改变第 4～5 节经济定义，不得运行完整 2023～2024、2025/2026。修复 commit 与成功 canary 必须再次交原 Sol；若客户端仍无法返回可见审核证据，规划会话停止并向用户申请更换独立审核任务，而不自行批准。
