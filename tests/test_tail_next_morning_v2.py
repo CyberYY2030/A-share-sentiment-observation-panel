@@ -3,20 +3,31 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import math
+import random
 import tempfile
 import unittest
+from unittest.mock import patch
+import zipfile
 from pathlib import Path
 
 import pandas as pd
 
-from mining.tail_next_morning import SESSION_LABELS
+from mining.tail_next_morning import SESSION_LABELS, canonical_code, is_a_share_code, locate_day_source
 from mining.tail_next_morning_v2 import (
+    A_RET1450_MIN,
     MIN_D1_AMOUNT,
+    _checkpoint,
+    _prepare_canary_run,
     _spec_hash,
     _v2_statistics_from_frame,
     build_signal_row,
+    load_day_v2_statistics,
+    necessary_preselection,
     outcome_from_frames,
     rank_channels,
+    run_canary,
 )
 
 
@@ -160,6 +171,19 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertEqual(3, len(ranked["b_pool"]))
         self.assertTrue(all("pool_rank" in row for row in ranked["b_pool"]))
 
+    def test_b_top2_structure_has_only_valid_monotone_members(self) -> None:
+        rows = []
+        for index, close in enumerate((11.0, 10.98, 10.96, 10.94)):
+            day, prior = b_inputs()
+            day["signal"]["close"] = close
+            day["signal"]["high"] = 11.2
+            rows.append(build_signal_row(f"30012{index}", day, prior, LISTED))
+        ranked = rank_channels(rows)
+        members = ranked["b_selected"]
+        self.assertLessEqual(len(members), 2)
+        self.assertTrue(all(row["b_shape_pass"] and row["eligible_pass"] and math.isfinite(row["score_B"]) for row in members))
+        self.assertEqual(sorted(row["pool_rank"] for row in members), [row["pool_rank"] for row in members])
+
     def test_post_1450_values_do_not_change_signal_statistics(self) -> None:
         baseline = raw_frame()
         future = baseline.copy()
@@ -249,6 +273,140 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertFalse(row["st_filter_applied"])
         self.assertEqual("unavailable_not_filtered", row["st_status"])
         self.assertEqual("unproven_not_applied", row["corporate_action_filter"])
+
+    def test_preselection_thresholds_invalid_inputs_and_no_false_negative(self) -> None:
+        day, prior = a_inputs()
+        d1 = prior[-1]
+        exact = copy.deepcopy(day)
+        exact["signal"]["close"] = d1["history"]["close"] * (1 + A_RET1450_MIN)
+        exact["signal"]["high"] = exact["signal"]["close"] + .1
+        self.assertTrue(necessary_preselection("300401", exact, d1)["a_local_necessary"])
+        below = copy.deepcopy(exact)
+        below["signal"]["close"] = math.nextafter(exact["signal"]["close"], -math.inf)
+        self.assertFalse(necessary_preselection("300401", below, d1)["a_local_necessary"])
+        above = copy.deepcopy(exact)
+        above["signal"]["close"] = math.nextafter(exact["signal"]["close"], math.inf)
+        self.assertTrue(necessary_preselection("300401", above, d1)["a_local_necessary"])
+        nan_day = copy.deepcopy(day)
+        nan_day["signal"]["amount"] = float("nan")
+        self.assertFalse(necessary_preselection("300401", nan_day, d1)["survives"])
+        zero_range = copy.deepcopy(day)
+        zero_range["signal"]["high"] = zero_range["signal"]["low"]
+        self.assertFalse(necessary_preselection("300401", zero_range, d1)["survives"])
+        self.assertFalse(necessary_preselection("300401", day, None)["survives"])
+
+    def test_300x12_preselection_is_economically_equivalent(self) -> None:
+        generator = random.Random(20260825)
+        full_rows, selected_rows = [], []
+        for index in range(300):
+            code = f"300{index:03d}"
+            if index % 3 == 0:
+                day, prior = a_inputs()
+                day["signal"]["close"] += generator.random() * .03
+                day["signal"]["high"] = day["signal"]["close"] + .1
+            elif index % 3 == 1:
+                day, prior = b_inputs()
+                day["signal"]["close"] -= generator.random() * .02
+            else:
+                day, prior = a_inputs(d1_amount=MIN_D1_AMOUNT)
+                day["signal"]["close"] = 10.1
+            row = build_signal_row(code, day, prior, LISTED)
+            full_rows.append(row)
+            if necessary_preselection(code, day, prior[-1])["survives"]:
+                selected_rows.append(build_signal_row(code, day, prior, LISTED))
+        full_ranked, selective_ranked = rank_channels(full_rows), rank_channels(selected_rows)
+        self.assertEqual(
+            {row["sec_code"] for row in full_rows if row["eligible_pass"]},
+            {row["sec_code"] for row in selected_rows if row["eligible_pass"]},
+        )
+        for channel in ("a_pool", "b_pool", "a_selected", "b_selected"):
+            self.assertEqual(
+                [(row["sec_code"], row.get("channel"), row.get("score_A"), row.get("score_B"), row.get("pool_rank")) for row in full_ranked[channel]],
+                [(row["sec_code"], row.get("channel"), row.get("score_A"), row.get("score_B"), row.get("pool_rank")) for row in selective_ranked[channel]],
+            )
+
+    def test_selective_loader_opens_one_container_and_matches_small_full_universe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "minute"
+            day_dir = root / "2024" / "08" / "20240813"
+            day_dir.mkdir(parents=True)
+            raw_frame().to_csv(day_dir / "sz300501.csv", index=False)
+            raw_frame(close=11).to_csv(day_dir / "sz300502.csv", index=False)
+            full, full_record = load_day_v2_statistics(root, "20240813")
+            selective, selective_record = load_day_v2_statistics(root, "20240813", {"300501", "300502"})
+            self.assertEqual(1, full_record["container_open_count"])
+            self.assertEqual(1, selective_record["container_open_count"])
+            self.assertEqual(full, selective)
+
+    def test_manifest_checkpoint_and_identity_resume_guard(self) -> None:
+        manifest = {"minute_containers": [], "daily_root": "synthetic", "targets": [], "market_targets": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            run_dir, run_manifest = _prepare_canary_run(base, manifest, resume_run_id=None)
+            self.assertTrue((run_dir / "run_manifest.json").exists())
+            _checkpoint(run_dir, run_manifest["run_hash"], "fixture:20240813|300328", {"ok": True})
+            saved = (run_dir / "checkpoints" / "fixture_20240813_300328.json").read_text(encoding="utf-8")
+            self.assertIn(run_manifest["run_hash"], saved)
+            resumed, _ = _prepare_canary_run(base, manifest, resume_run_id=run_manifest["run_id"])
+            self.assertEqual(run_dir, resumed)
+            with self.assertRaisesRegex(Exception, "resume_identity_mismatch"):
+                _prepare_canary_run(base, manifest, resume_run_id="canary-old-identity")
+
+    def test_shared_dplus1_and_history_container_is_opened_once(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"2024F{index:04d}" for index in range(60)]
+        positions = {"20240813": 10, "20240826": 22, "20240827": 34, "20240923": 46, "20240926": 49}
+        for target, index in positions.items():
+            calendar[index] = target
+        calendar[47] = "20240924"  # 20240923 D+1 and 20240926 D-2
+        calendar[48] = "20240925"
+        calls: dict[str, int] = {}
+
+        def fake_load(_root, trade_date, codes=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            requested = {"300085", "300339", "300972", "300328"} if codes is None else set(codes)
+            return {code: copy.deepcopy(stat()) for code in requested}, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0}
+
+        manifest = {"minute_containers": [], "daily_root": "synthetic", "targets": list(positions), "market_targets": ["20240923", "20240926"]}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_calendar_for_targets", return_value=(calendar, positions)), patch.object(module, "_canary_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            run_canary("synthetic", "synthetic", temporary)
+        self.assertEqual(1, calls["20240924"])
+
+    @unittest.skipUnless(Path(r"E:\分钟数据").exists(), "real minute source unavailable")
+    def test_fixed_64_code_real_small_universe_full_vs_selective(self) -> None:
+        source, kind = locate_day_source(r"E:\分钟数据", "20240923")
+        available: dict[str, tuple[str, bytes]] = {}
+        if kind == "zip":
+            with zipfile.ZipFile(source) as archive:
+                for name in archive.namelist():
+                    if name.lower().endswith(".csv"):
+                        code = canonical_code(Path(name).stem)
+                        if is_a_share_code(code):
+                            available.setdefault(code, (Path(name).name, archive.read(name)))
+        else:
+            for item in source.rglob("*.csv"):
+                code = canonical_code(item.stem)
+                if is_a_share_code(code):
+                    available.setdefault(code, (item.name, item.read_bytes()))
+        must = {"300085", "300339", "300972", "300328"}
+        self.assertTrue(must.issubset(available))
+        others = sorted((code for code in available if code not in must), key=lambda code: hashlib.sha256(f"TNM-V2-1F|{code}".encode()).hexdigest())[: 64 - len(must)]
+        codes = sorted(must | set(others))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "minute"
+            day_dir = root / "2024" / "09" / "20240923"
+            day_dir.mkdir(parents=True)
+            for code in codes:
+                name, payload = available[code]
+                (day_dir / name).write_bytes(payload)
+            full, _ = load_day_v2_statistics(root, "20240923")
+            selective, _ = load_day_v2_statistics(root, "20240923", codes)
+            self.assertEqual(full, selective)
+            full_rows = [build_signal_row(code, full[code], [full[code]] * 10, LISTED) for code in codes]
+            selective_rows = [build_signal_row(code, selective[code], [selective[code]] * 10, LISTED) for code in codes if necessary_preselection(code, selective[code], selective[code])["survives"]]
+            full_ranked, selective_ranked = rank_channels(full_rows), rank_channels(selective_rows)
+            self.assertEqual([row["sec_code"] for row in full_ranked["a_selected"]], [row["sec_code"] for row in selective_ranked["a_selected"]])
+            self.assertEqual([row["sec_code"] for row in full_ranked["b_selected"]], [row["sec_code"] for row in selective_ranked["b_selected"]])
 
 
 if __name__ == "__main__":

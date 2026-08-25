@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import csv
 import gzip
 import hashlib
 import io
 import json
 import math
+import os
 from pathlib import Path, PurePosixPath
 import subprocess
+import tempfile
+import time
 from typing import Any, Iterable, Mapping
 import zipfile
 
@@ -42,9 +45,14 @@ from mining.tail_next_morning import (
 
 TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-25-tail-next-morning-v2-task-cards.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
+MARKET_TARGETS = ("20240923", "20240926")
+FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
 MIN_D1_AMOUNT = 200_000_000.0
 A_LIMIT = 3
 B_LIMIT = 2
+A_RET1450_MIN = 0.04
+POSITION1450_MIN = 0.55
+A_VWAP_DIST_MIN = 0.01
 FIXTURES = {
     ("20240923", "300085"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
     ("20240926", "300339"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
@@ -67,7 +75,15 @@ def _json_bytes(value: Any) -> bytes:
 
 
 def _write_json(path: Path, value: Any) -> None:
-    path.write_bytes(_json_bytes(value))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=f".{path.name}.", delete=False) as handle:
+        handle.write(_json_bytes(value))
+        temporary = Path(handle.name)
+    try:
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
 
 
 def _sha256(path: Path) -> str:
@@ -179,6 +195,20 @@ def _v2_statistics_from_frame(raw: pd.DataFrame) -> dict[str, Any]:
         result["buy"] = vwap_for_window(bars, "14:51", "14:56")
     except TailDataError as exc:
         result["buy"] = {"status": "invalid_window", "reason": exc.reason, "vwap": None, "amount": None, "volume": None}
+    try:
+        opening = validate_minute_window(bars, "09:30", "09:31")
+        morning = validate_minute_window(bars, "09:30", "10:00")
+        result["morning_label"] = {
+            "status": "ready", "next_open": float(opening.iloc[0]["open"]),
+            "high": float(morning["high"].max()), "low": float(morning["low"].min()),
+        }
+    except TailDataError as exc:
+        result["morning_label"] = {"status": "invalid", "reason": exc.reason, "next_open": None, "high": None, "low": None}
+    try:
+        validate_minute_window(bars, "10:00", "10:05")
+        result["fixed_sell"] = vwap_for_window(bars, "10:00", "10:05")
+    except TailDataError as exc:
+        result["fixed_sell"] = {"status": "invalid_window", "reason": exc.reason, "vwap": None, "amount": None, "volume": None}
     return result
 
 
@@ -189,12 +219,15 @@ def _stats_from_payload(payload: bytes) -> dict[str, Any]:
         return {"status": "invalid", "reason": "minute_csv_unreadable"}
 
 
-def load_day_v2_statistics(minute_root: str | Path, trade_date: str) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
-    """Enumerate one day once and reuse V1's location/parser/causal validation."""
+def load_day_v2_statistics(
+    minute_root: str | Path, trade_date: str, codes: Iterable[str] | None = None,
+) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
+    """Open one daily container once; optionally parse only named A-share members."""
     key = str(trade_date).replace("-", "")
     if key[:4] != "2024":
         raise TailDataError(f"v2_canary_year_guard:{key}")
     source, source_kind = locate_day_source(minute_root, key)
+    requested = None if codes is None else {canonical_code(code) for code in codes if is_a_share_code(code)}
     result: dict[str, dict[str, Any]] = {}
     duplicates: set[str] = set()
     if source_kind == "zip":
@@ -204,7 +237,7 @@ def load_day_v2_statistics(minute_root: str | Path, trade_date: str) -> tuple[di
                 if name.endswith("/") or PurePosixPath(name).suffix.lower() != ".csv":
                     continue
                 code = canonical_code(PurePosixPath(name).stem)
-                if not is_a_share_code(code):
+                if not is_a_share_code(code) or (requested is not None and code not in requested):
                     continue
                 if code in members:
                     duplicates.add(code)
@@ -216,7 +249,7 @@ def load_day_v2_statistics(minute_root: str | Path, trade_date: str) -> tuple[di
         members: dict[str, Path] = {}
         for item in sorted(source.rglob("*.csv")):
             code = canonical_code(item.stem)
-            if not is_a_share_code(code):
+            if not is_a_share_code(code) or (requested is not None and code not in requested):
                 continue
             if code in members:
                 duplicates.add(code)
@@ -224,6 +257,9 @@ def load_day_v2_statistics(minute_root: str | Path, trade_date: str) -> tuple[di
                 members[code] = item
         for code, item in members.items():
             result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"} if code in duplicates else _stats_from_payload(item.read_bytes())
+    if requested is not None:
+        for code in requested - set(result):
+            result[code] = {"status": "invalid", "reason": "minute_code_missing"}
     stat = source.stat()
     return result, {
         "trade_date": key,
@@ -232,6 +268,7 @@ def load_day_v2_statistics(minute_root: str | Path, trade_date: str) -> tuple[di
         "mtime_ns": stat.st_mtime_ns,
         "container_open_count": 1,
         "universe_count": len(result),
+        "parsed_code_count": len(result),
         "invalid_file_count": sum(value.get("status") != "ready" for value in result.values()),
     }
 
@@ -325,9 +362,9 @@ def _a_shape(row: dict[str, Any]) -> None:
         row["a_failure_reasons"].append("common_quality_failed")
         return
     gates = (
-        (row["ret1450"] >= 0.04, "ret1450<0.04"),
-        (row["position1450"] >= 0.55, "position1450<0.55"),
-        (row["vwap_dist"] >= 0.01, "vwap_dist<0.01"),
+        (row["ret1450"] >= A_RET1450_MIN, "ret1450<0.04"),
+        (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
+        (row["vwap_dist"] >= A_VWAP_DIST_MIN, "vwap_dist<0.01"),
         (row["activity"] >= 1.50, "activity<1.50"),
         (row["close1450"] > row["prev_ma10"], "close1450<=prev_ma10"),
     )
@@ -345,7 +382,7 @@ def _b_shape(row: dict[str, Any]) -> None:
         (row["close1450"] > row["prev_ma10"], "close1450<=prev_ma10"),
         (row["pullback_volume_ratio"] <= 0.80, "pullback_volume_ratio>0.80"),
         (row["close1450"] > max(row["prev_close"], row["open_D"]), "close1450<=max(open_D,prev_close)"),
-        (row["position1450"] >= 0.55, "position1450<0.55"),
+        (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
     )
     row["b_failure_reasons"] = [reason for passed, reason in gates if not passed]
     row["b_shape_pass"] = not row["b_failure_reasons"]
@@ -365,6 +402,30 @@ def build_signal_row(code: str, day: Mapping[str, Any] | None, prior: Iterable[M
         row["failure_reasons"].append("listing_history_under_20")
     row["eligible_pass"] = bool(row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"] and row["listing_pass"])
     return row
+
+
+def necessary_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The frozen, deliberately incomplete local gates used only to save history reads."""
+    result = {"sec_code": canonical_code(code), "quality_pass": False, "liquidity_pass": False, "a_local_necessary": False, "b_local_necessary": False, "survives": False, "reason": None}
+    if not is_a_share_code(code) or not _signal_ready(day) or not _history_ready(d1):
+        result["reason"] = "missing_or_invalid_d_or_d1"
+        return result
+    signal, previous = day["signal"], d1["history"]
+    close, high, low = float(signal["close"]), float(signal["high"]), float(signal["low"])
+    volume, amount, previous_close = float(signal["volume"]), float(signal["amount"]), float(previous["close"])
+    if not all(_finite(value) for value in (close, high, low, volume, amount, previous_close, previous["full_amount"], signal["open"])) or volume <= 0 or amount <= 0 or previous_close <= 0 or high <= low:
+        result["reason"] = "non_positive_local_denominator"
+        return result
+    position = (close - low) / (high - low)
+    vwap_dist = close / (amount / volume) - 1.0
+    ret = close / previous_close - 1.0
+    result.update({"quality_pass": True, "liquidity_pass": float(previous["full_amount"]) > MIN_D1_AMOUNT, "ret1450": ret, "position1450": position, "vwap_dist": vwap_dist})
+    result["a_local_necessary"] = ret >= A_RET1450_MIN and position >= POSITION1450_MIN and vwap_dist >= A_VWAP_DIST_MIN
+    result["b_local_necessary"] = close > float(signal["open"]) and close > previous_close and position >= POSITION1450_MIN
+    result["survives"] = bool(result["liquidity_pass"] and (result["a_local_necessary"] or result["b_local_necessary"]))
+    if not result["survives"]:
+        result["reason"] = "local_necessary_condition_failed"
+    return result
 
 
 def _percentiles(rows: list[dict[str, Any]], key: str, *, higher_is_better: bool = True) -> None:
@@ -469,6 +530,31 @@ def outcome_from_frames(day_stat: Mapping[str, Any] | None, next_bars: pd.DataFr
     return result
 
 
+def outcome_from_statistics(day_stat: Mapping[str, Any] | None, next_stat: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Same outcome contract as frame mode, using an already selectively parsed D+1 member."""
+    buy = (day_stat or {}).get("buy", {})
+    empty = {"outcome_status": "unavailable_buy", "buy_vwap": None, "next_open": None, "intraday_mfe_0930_1000": None, "gap_return": None, "mfe_from_buy": None, "mae_from_buy": None, "sell_vwap": None, "gross_fixed_exit": None, "net30": None}
+    if buy.get("status") != "ready":
+        return empty
+    result = {**empty, "outcome_status": "ready", "buy_vwap": float(buy["vwap"])}
+    if not next_stat:
+        result["outcome_status"] = "unavailable_next_day"
+        return result
+    morning, sell = next_stat.get("morning_label", {}), next_stat.get("fixed_sell", {})
+    if morning.get("status") != "ready":
+        result["outcome_status"] = "unavailable_morning_label"
+        return result
+    next_open, high, low = float(morning["next_open"]), float(morning["high"]), float(morning["low"])
+    buy_vwap = float(buy["vwap"])
+    result.update({"next_open": next_open, "intraday_mfe_0930_1000": high / next_open - 1.0, "gap_return": next_open / buy_vwap - 1.0, "mfe_from_buy": high / buy_vwap - 1.0, "mae_from_buy": low / buy_vwap - 1.0})
+    if sell.get("status") != "ready":
+        result["outcome_status"] = "unavailable_fixed_exit"
+        return result
+    gross = float(sell["vwap"]) / buy_vwap - 1.0
+    result.update({"sell_vwap": float(sell["vwap"]), "gross_fixed_exit": gross, "net30": gross - 0.003})
+    return result
+
+
 def _load_next_frame(minute_root: str | Path, next_date: str, code: str, cache: dict[tuple[str, str], pd.DataFrame | None]) -> pd.DataFrame | None:
     key = (next_date, code)
     if key not in cache:
@@ -493,7 +579,7 @@ def _write_csv_gz(path: Path, rows: list[Mapping[str, Any]]) -> None:
                 writer = csv.DictWriter(text, fieldnames=columns, extrasaction="ignore")
                 writer.writeheader()
                 for row in rows:
-                    writer.writerow({key: "" if value is None else value for key, value in row.items()})
+                    writer.writerow({key: "" if value is None else json.dumps(value, ensure_ascii=False, sort_keys=True) if isinstance(value, (dict, list)) else value for key, value in row.items()})
 
 
 def _fixture_assertions(rows_by_key: Mapping[tuple[str, str], Mapping[str, Any]], daily_top: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
@@ -505,7 +591,7 @@ def _fixture_assertions(rows_by_key: Mapping[tuple[str, str], Mapping[str, Any]]
         checks: dict[str, bool] = {}
         for field, expected_value in expected.items():
             if field == "a_top":
-                checks[field] = code in {item["sec_code"] for item in daily_top[date_key]["A"]}
+                checks[field] = code in {item["sec_code"] for item in daily_top.get(date_key, {}).get("A", [])}
             elif field == "not_selected":
                 checks[field] = not bool(actual.get("selected"))
             elif field == "reason_contains":
@@ -516,119 +602,195 @@ def _fixture_assertions(rows_by_key: Mapping[tuple[str, str], Mapping[str, Any]]
     return results
 
 
-def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path) -> tuple[dict[str, Any], Path]:
-    """Run the five frozen 2024 canary targets and no other target D."""
+def _current_commit() -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _canary_input_manifest(minute_root: str | Path, daily_root: str | Path, calendar: list[str], positions: Mapping[str, int]) -> dict[str, Any]:
+    needed = set()
+    for target in TARGET_DATES:
+        index = positions[target]
+        needed.update(calendar[index - 10:index + 2])
+    records = []
+    for trade_date in sorted(needed):
+        source, kind = locate_day_source(minute_root, trade_date)
+        stat = source.stat()
+        records.append({"trade_date": trade_date, "source_kind": kind, "path": str(source), "size_bytes": stat.st_size if source.is_file() else None, "mtime_ns": stat.st_mtime_ns})
+    return {"minute_containers": records, "daily_root": str(Path(daily_root)), "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS)}
+
+
+def _prepare_canary_run(output_dir: str | Path, manifest: Mapping[str, Any], *, resume_run_id: str | None) -> tuple[Path, dict[str, Any]]:
+    identity = {"mode": "tnm-v2-1f-canary", "spec_hash": _spec_hash(), "code_commit": _current_commit(), "code_identity": _code_identity(), "input_manifest_hash": hashlib.sha256(_json_bytes(manifest)).hexdigest()}
+    run_hash = hashlib.sha256(_json_bytes(identity)).hexdigest()
+    calculated = f"canary-{identity['spec_hash'][:12]}-{run_hash[:12]}"
+    if resume_run_id is not None and resume_run_id != calculated:
+        raise TailDataError("resume_identity_mismatch")
+    run_dir = Path(output_dir) / calculated
+    run_manifest = {**identity, "run_hash": run_hash, "run_id": calculated, "input_manifest": manifest}
+    path = run_dir / "run_manifest.json"
+    if path.exists():
+        if resume_run_id is None:
+            raise TailDataError("canary_output_exists_requires_explicit_resume")
+        if json.loads(path.read_text(encoding="utf-8")).get("run_hash") != run_hash:
+            raise TailDataError("resume_hash_mismatch")
+    else:
+        if resume_run_id is not None:
+            raise TailDataError("resume_run_manifest_missing")
+        _write_json(path, run_manifest)
+    return run_dir, run_manifest
+
+
+def _checkpoint(run_dir: Path, run_hash: str, unit: str, result: Mapping[str, Any]) -> None:
+    _write_json(run_dir / "checkpoints" / f"{unit.replace('|', '_').replace(':', '_')}.json", {"run_hash": run_hash, "unit": unit, "result": result})
+
+
+def _final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
+    row = build_signal_row(code, day, prior, provisional)
+    if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
+        listing = development_listing_evidence(daily_root, code, target, minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS), cache=listing_cache)
+        row = build_signal_row(code, day, prior, listing)
+    else:
+        row.update({"listing_pass": False, "listing_age_source": "not_evaluated_shape_or_liquidity_failed", "listing_history_sessions": None, "listing_history_count_status": "not_evaluated", "eligible_pass": False})
+    row["trade_date"] = target
+    return row
+
+
+def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
+    """Two full-market scans plus three frozen single-code fixtures; no other target D."""
+    started = time.monotonic()
     calendar, positions = _calendar_for_targets(minute_root, TARGET_DATES)
-    identity = _code_identity()
-    spec_hash = _spec_hash()
-    code_hash = _code_hash(identity)
-    run_dir = Path(output_dir) / f"canary-{spec_hash[:12]}-{code_hash[:12]}"
-    if run_dir.exists():
-        raise TailDataError(f"canary_output_exists:{run_dir.name}")
-    run_dir.mkdir(parents=True)
+    input_manifest = _canary_input_manifest(minute_root, daily_root, calendar, positions)
+    run_dir, run_manifest = _prepare_canary_run(output_dir, input_manifest, resume_run_id=resume_run_id)
+    run_hash = run_manifest["run_hash"]
+    progress_path, completion_path = run_dir / "progress.json", run_dir / "completion.json"
+    _write_json(progress_path, {"run_hash": run_hash, "stage": "initializing", "completed_units": [], "elapsed_seconds": 0.0, "exception_counts": {}})
     stats_cache: dict[str, dict[str, dict[str, Any]]] = {}
     source_records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
-    next_frames: dict[tuple[str, str], pd.DataFrame | None] = {}
-    daily_top: dict[str, Any] = {}
-    fixture_rows: dict[str, Any] = {}
-    candidate_rows: list[dict[str, Any]] = []
-    all_rows_by_key: dict[tuple[str, str], dict[str, Any]] = {}
 
-    for target in TARGET_DATES:
-        index = positions[target]
-        dependency_dates = calendar[index - 10:index + 2]
-        if any(day[:4] != "2024" for day in dependency_dates):
-            raise TailDataError("v2_canary_dependency_year_guard")
-        for dependency in dependency_dates:
-            if dependency not in stats_cache:
-                stats_cache[dependency], source_records[dependency] = load_day_v2_statistics(minute_root, dependency)
-        day_stats = stats_cache[target]
-        prior_dates = calendar[index - 10:index]
-        next_date = calendar[index + 1]
-        rows: list[dict[str, Any]] = []
-        for code in sorted(day_stats):
-            prior = [stats_cache[day].get(code) for day in prior_dates]
-            # Listing evidence is consumed only after the independent shape and
-            # D-1 liquidity gates.  This keeps the all-minute-file universe
-            # complete without opening thousands of unrelated daily workbooks.
-            provisional_listing = {
-                "listing_history_count_status": "at_least_threshold",
-                "listing_history_sessions": MIN_HISTORY_SESSIONS,
-                "listing_age_source": "deferred_until_shape_and_liquidity_pass",
-            }
-            row = build_signal_row(code, day_stats.get(code), prior, provisional_listing)
-            if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
-                listing = development_listing_evidence(
-                    daily_root,
-                    code,
-                    target,
-                    minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS),
-                    cache=listing_cache,
-                )
-                row = build_signal_row(code, day_stats.get(code), prior, listing)
+    def load_once(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
+        requested = None if codes is None else {canonical_code(code) for code in codes}
+        if trade_date in stats_cache:
+            if requested is not None and not requested.issubset(stats_cache[trade_date]):
+                raise TailDataError(f"container_reopen_forbidden:{trade_date}")
+            return stats_cache[trade_date]
+        values, record = load_day_v2_statistics(minute_root, trade_date, requested)
+        stats_cache[trade_date], source_records[trade_date] = values, record
+        return values
+
+    try:
+        market_pre: dict[str, dict[str, dict[str, Any]]] = {}
+        for target in MARKET_TARGETS:
+            index = positions[target]
+            day, d1 = load_once(target, None), load_once(calendar[index - 1], None)
+            market_pre[target] = {code: necessary_preselection(code, day.get(code), d1.get(code)) for code in day}
+        required_history: dict[str, set[str]] = defaultdict(set)
+        evaluation_codes: dict[str, set[str]] = {}
+        for target in MARKET_TARGETS:
+            index = positions[target]
+            fixture_codes = {code for (day, code) in FIXTURES if day == target}
+            survivors = {code for code, proof in market_pre[target].items() if proof["survives"]}
+            evaluation_codes[target] = survivors | fixture_codes
+            for history_date in calendar[index - 10:index - 1]:
+                required_history[history_date].update(evaluation_codes[target])
+            # D+1 may also be another full-market target's historical day
+            # (20240924 in the frozen pair).  Reserve every possible outcome
+            # consumer now, before the single open for that shared container.
+            required_history[calendar[index + 1]].update(evaluation_codes[target])
+        for target, code in FIXTURE_TARGETS:
+            index = positions[target]
+            # Fixtures are single-code, but their D/D-1 can be another
+            # fixture's history.  Plan the complete D-10..D+1 union before
+            # opening any of these containers so each date opens once.
+            for dependency_date in calendar[index - 10:index + 2]:
+                required_history[dependency_date].add(code)
+        for history_date, codes in sorted(required_history.items()):
+            load_once(history_date, codes)
+
+        completed: dict[str, Any] = {}
+        for path in sorted((run_dir / "checkpoints").glob("*.json")) if (run_dir / "checkpoints").exists() else []:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            if saved.get("run_hash") != run_hash:
+                raise TailDataError("checkpoint_hash_mismatch")
+            completed[saved["unit"]] = saved["result"]
+        daily_top: dict[str, Any] = {}
+        fixture_rows: dict[str, Any] = {}
+        candidate_rows: list[dict[str, Any]] = []
+        unit_survivors: dict[str, Any] = {}
+
+        def progress(stage: str) -> None:
+            _write_json(progress_path, {"run_hash": run_hash, "stage": stage, "completed_units": sorted(completed), "survivor_counts": unit_survivors, "elapsed_seconds": round(time.monotonic() - started, 6), "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}})
+
+        for target in MARKET_TARGETS:
+            unit = f"market:{target}"
+            if unit in completed:
+                result = completed[unit]
             else:
-                row["listing_pass"] = False
-                row["listing_age_source"] = "not_evaluated_shape_or_liquidity_failed"
-                row["listing_history_sessions"] = None
-                row["listing_history_count_status"] = "not_evaluated"
-                row["eligible_pass"] = False
-            row["trade_date"] = target
-            rows.append(row)
-            all_rows_by_key[(target, code)] = row
-        ranked = rank_channels(rows)
-        selected = ranked["a_selected"] + ranked["b_selected"]
-        for row in selected:
-            row["outcome"] = outcome_from_frames(day_stats.get(row["sec_code"]), _load_next_frame(minute_root, next_date, row["sec_code"], next_frames))
-            candidate_rows.append(_public_row(row))
-        fixture_codes = [code for (day, code) in FIXTURES if day == target]
-        for code in fixture_codes:
-            fixture = all_rows_by_key[(target, code)]
-            fixture["outcome"] = outcome_from_frames(day_stats.get(code), _load_next_frame(minute_root, next_date, code, next_frames))
-            fixture_rows[f"{target}|{code}"] = fixture
-        daily_top[target] = {
-            "A": [_public_row(row) for row in ranked["a_selected"]],
-            "B": [_public_row(row) for row in ranked["b_selected"]],
-            "a_candidate_count": len(ranked["a_pool"]),
-            "b_candidate_count": len(ranked["b_pool"]),
-            "a_boundary_tie_expanded": ranked["a_boundary_tie_expanded"],
-            "b_boundary_tie_expanded": ranked["b_boundary_tie_expanded"],
-            "selected_count": len(selected),
-        }
-        # No next target can need a day before its own D-10 dependency.
-        next_target_index = positions[TARGET_DATES[TARGET_DATES.index(target) + 1]] if target != TARGET_DATES[-1] else None
-        if next_target_index is not None:
-            keep_from = calendar[next_target_index - 10]
-            for cached in list(stats_cache):
-                if cached < keep_from:
-                    stats_cache.pop(cached)
+                index = positions[target]
+                day, d1 = stats_cache[target], stats_cache[calendar[index - 1]]
+                rows = []
+                for code in sorted(evaluation_codes[target]):
+                    prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
+                    rows.append(_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache))
+                ranked = rank_channels(rows)
+                selected = ranked["a_selected"] + ranked["b_selected"]
+                outcome_codes = {row["sec_code"] for row in selected} | {code for (date_key, code) in FIXTURES if date_key == target}
+                next_stats = load_once(calendar[index + 1], outcome_codes)
+                for row in selected:
+                    row["outcome"] = outcome_from_statistics(day.get(row["sec_code"]), next_stats.get(row["sec_code"]))
+                fixture_subset = {}
+                for code in sorted({code for (date_key, code) in FIXTURES if date_key == target}):
+                    row = next(row for row in rows if row["sec_code"] == code)
+                    row["outcome"] = outcome_from_statistics(day.get(code), next_stats.get(code))
+                    fixture_subset[f"{target}|{code}"] = row
+                top = {"A": [_public_row(row) for row in ranked["a_selected"]], "B": [_public_row(row) for row in ranked["b_selected"]], "a_candidate_count": len(ranked["a_pool"]), "b_candidate_count": len(ranked["b_pool"]), "a_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "b_boundary_tie_expanded": ranked["b_boundary_tie_expanded"], "selected_count": len(selected)}
+                result = {"daily_top": top, "candidate_rows": [_public_row(row) for row in selected], "fixture_rows": fixture_subset, "preselection": {"universe": len(day), "survivors": sum(proof["survives"] for proof in market_pre[target].values()), "evaluated": len(rows)}}
+                _checkpoint(run_dir, run_hash, unit, result)
+                completed[unit] = result
+            daily_top[target] = result["daily_top"]
+            candidate_rows.extend(result["candidate_rows"])
+            fixture_rows.update(result["fixture_rows"])
+            unit_survivors[unit] = result["preselection"]
+            progress(unit)
 
-    assertions = _fixture_assertions(all_rows_by_key, daily_top)
-    label = "tnm_v2_1_canary_verified" if all(value["passed"] for value in assertions.values()) else "changes_required_by_frozen_canary"
-    summary = {
-        "execution_label": label,
-        "contract": "TNM-V2-1 fixed five-day canary",
-        "targets": list(TARGET_DATES),
-        "read_years": ["2024"],
-        "spec_hash": spec_hash,
-        "code_identity": identity,
-        "code_hash": code_hash,
-        "capacity_filter_applied": False,
-        "st_filter_applied": False,
-        "st_status": "unavailable_not_filtered",
-        "corporate_action_filter": "unproven_not_applied",
-        "source_records": {day: source_records[day] for day in sorted(source_records)},
-        "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in TARGET_DATES},
-        "fixture_assertions": assertions,
-        "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())},
-    }
-    _write_json(run_dir / "canary_summary.json", summary)
-    _write_csv_gz(run_dir / "canary_candidates.csv.gz", candidate_rows)
-    _write_json(run_dir / "canary_fixture_rows.json", fixture_rows)
-    _write_json(run_dir / "canary_daily_top.json", daily_top)
-    manifest = {path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)} for path in sorted(run_dir.iterdir()) if path.is_file()}
-    _write_json(run_dir / "artifact_manifest.json", manifest)
-    return summary, run_dir
+        for target, code in FIXTURE_TARGETS:
+            unit = f"fixture:{target}|{code}"
+            if unit in completed:
+                result = completed[unit]
+            else:
+                index = positions[target]
+                day, d1 = stats_cache[target], stats_cache[calendar[index - 1]]
+                prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
+                row = _final_row(code, target, index, day.get(code), prior, daily_root, listing_cache)
+                next_stats = load_once(calendar[index + 1], {code})
+                row["outcome"] = outcome_from_statistics(day.get(code), next_stats.get(code))
+                row["selected"] = False
+                row["channel"] = None
+                result = {"fixture_row": row, "preselection": necessary_preselection(code, day.get(code), d1.get(code))}
+                _checkpoint(run_dir, run_hash, unit, result)
+                completed[unit] = result
+            fixture_rows[f"{target}|{code}"] = result["fixture_row"]
+            unit_survivors[unit] = result["preselection"]
+            progress(unit)
+
+        assertions = _fixture_assertions({tuple(key.split("|")): value for key, value in fixture_rows.items()}, daily_top)
+        label = "tnm_v2_1_canary_verified" if all(value["passed"] for value in assertions.values()) else "changes_required_by_frozen_canary"
+        summary = {"execution_label": label, "contract": "TNM-V2-1F two-market-three-fixture canary", "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS), "fixture_targets": [f"{day}|{code}" for day, code in FIXTURE_TARGETS], "read_years": ["2024"], "spec_hash": run_manifest["spec_hash"], "code_identity": run_manifest["code_identity"], "run_hash": run_hash, "input_manifest_hash": run_manifest["input_manifest_hash"], "capacity_filter_applied": False, "st_filter_applied": False, "st_status": "unavailable_not_filtered", "corporate_action_filter": "unproven_not_applied", "source_records": {day: source_records[day] for day in sorted(source_records)}, "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in MARKET_TARGETS}, "fixture_assertions": assertions, "performance": {"elapsed_seconds": round(time.monotonic() - started, 6), "container_open_total": sum(record["container_open_count"] for record in source_records.values())}, "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}}
+        _write_json(run_dir / "canary_summary.json", summary)
+        _write_csv_gz(run_dir / "canary_candidates.csv.gz", candidate_rows)
+        _write_json(run_dir / "canary_fixture_rows.json", fixture_rows)
+        _write_json(run_dir / "canary_daily_top.json", daily_top)
+        artifact_manifest = {path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)} for path in sorted(run_dir.iterdir()) if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}}
+        _write_json(run_dir / "artifact_manifest.json", artifact_manifest)
+        _write_json(completion_path, {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": label, "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
+        return summary, run_dir
+    except KeyboardInterrupt:
+        _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash})
+        raise
+    except Exception as exc:
+        _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        raise
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -638,10 +800,11 @@ def main(argv: list[str] | None = None) -> int:
     canary.add_argument("--minute-root", required=True)
     canary.add_argument("--daily-root", required=True)
     canary.add_argument("--output-dir", required=True)
+    canary.add_argument("--resume-run-id")
     args = parser.parse_args(argv)
     if args.command != "canary":
         raise TailDataError("unsupported_v2_command")
-    summary, run_dir = run_canary(args.minute_root, args.daily_root, args.output_dir)
+    summary, run_dir = run_canary(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     print(f"status={summary['execution_label']} run_dir={run_dir}")
     return 0 if summary["execution_label"] == "tnm_v2_1_canary_verified" else 2
 

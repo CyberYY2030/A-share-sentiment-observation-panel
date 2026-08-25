@@ -399,3 +399,13 @@ Terra 必须记录前后 `git status --short`、实际命令、测试数、canar
 - 首个可复现分歧位于读取拓扑：旧 runner 在 gate 前对五个离散 target 的全部 D-10～D+1 依赖日做全市场逐 CSV/Pandas 解析；实际并集为 37 个全市场容器，约 18 万份 CSV。进程持续 CPU 增长证明不是锁死，但任务结束前才写产物，使 30 分钟安全停止变成零进度/零经济证据。
 - 规划会话通过 Claude Code/Opus 做只读方法讨论。采纳：策略定义不变；canary 收窄为两个必须验证 Top 3 身份的全市场日加三个单股 fixture；必要条件预筛后按日批读幸存代码；增加等价性属性/边界/真实小宇宙对拍与原子 progress/checkpoint/completion。拒绝直接用当前 DB/日 K 股票清单代替分钟 universe；D/D-1 point-in-time universe、成交额和 14:50 特征继续来自分钟源。
 - 当前裁决：只解锁 Terra 的 `TNM-V2-1F` 性能与证据治理修复，严格按第 6 节；不得改变第 4～5 节经济定义，不得运行完整 2023～2024、2025/2026。修复 commit 与成功 canary 必须再次交原 Sol；若客户端仍无法返回可见审核证据，规划会话停止并向用户申请更换独立审核任务，而不自行批准。
+
+### TNM-V2-1F（2026-08-25，Terra）
+
+- 终态：`changes_required_by_frozen_canary`。读取拓扑和原子证据治理已完成，但两条冻结 A Top 3 断言不成立；依合同停止，未修改第 4～5 节公式、gate、rank、Top N、tie 或 outcome，更未启动完整开发期或 2025/2026。
+- 验证：`python -m unittest tests.test_tail_next_morning_v2`（25 tests，含 300×12 合成等价、预筛边界、固定 64 代码真实小宇宙、共享 D+1/历史容器单开、manifest/checkpoint/resume）；`python -m unittest tests.test_tail_next_morning`（25 tests）；`py_compile` 与 `git diff --check` 通过。
+- 保留失败证据：`canary-96205293d9b8-f948b317e7b2` 原子 `FAILED`，原因 `container_reopen_forbidden:20240924`；最小修复把 20240924（9/23 D+1、9/26 D-2）的代码需求在首次打开前合并。旧五日空运行 `canary-6e902c20182f-9f411fda0d04` 继续只读保留。
+- 成功执行身份：`canary-96205293d9b8-c01711a25535`，`SUCCEEDED`，耗时 `408.125s`；`spec_hash=96205293d9b845511cca9264070003af63737f0832ec6623cfaa335556879031`，`run_hash=c01711a25535f5c6a11601072a8263d1ffbeba778058b0d383eba04e703593a2`，`input_manifest_hash=338bcd39567876ca273bf5afbcee0ba0f261afcdb7352c3c3388f5bad4574c99`，artifact manifest SHA-256=`01606f71f4facbb18e5bef4cc2c12c1f7ea3f2959c34d1ef9e3934cebccccd8b`。run manifest、5 checkpoints、progress、completion、经济产物与 manifest 均在 ignored 目录；37 个已读日期容器各 `container_open_count=1`。
+- 两日全市场：20240923 A=`600619,002405,600203`、B=`300990,603189`；20240926 A=`002583,300100,600208`、B=`002786,300333`。B Top 2 均为结构性通过（最多两只、B gate/score/rank 有效、outcome 分离）。
+- 五个 fixture：`300328/20240813` B 形态/流动性/资格均通过（单股 fixture，无全市场 rank）；`300972/20240826` B 形态通过、流动性不通过且未入选；`300972/20240827` B 形态不通过且含 `position1450<0.55`、流动性不通过。`300085/20240923` 与 `300339/20240926` 均 A 形态和流动性通过，但 A `pool_rank` 分别为 11 与 42，未进 Top 3，故冻结断言失败。
+- 未读 2025/2026，E: 只读；无任务进程或临时缓存遗留。V1 未改，TNM-V2-2 继续锁定，等待独立 Sol 复审。
