@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import math
+import os
 import random
 import tempfile
 import unittest
@@ -20,9 +22,13 @@ from mining.tail_next_morning_v2 import (
     MIN_D1_AMOUNT,
     _checkpoint,
     _content_identity,
+    _gate_counts,
     _prepare_canary_run,
     _spec_hash,
     _standard_limit_evidence,
+    _unit_minute_members,
+    _unit_consumed_input,
+    _verify_checkpoint_consumed_input,
     _v2_statistics_from_frame,
     build_signal_row,
     load_day_v2_statistics,
@@ -152,6 +158,78 @@ class TailNextMorningV2Tests(unittest.TestCase):
         before = _content_identity({"minute_members": {"sha256": hashlib.sha256(b"before").hexdigest()}})
         after = _content_identity({"minute_members": {"sha256": hashlib.sha256(b"after").hexdigest()}})
         self.assertNotEqual(before, after)
+
+    def test_checkpoint_content_identity_rejects_equal_size_member_and_daily_rewrites(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            minute_root, daily_root = root / "minute", root / "daily"
+            day_dir = minute_root / "2024" / "08" / "20240813"
+            day_dir.mkdir(parents=True)
+            member = day_dir / "sz300001.csv"
+            raw_frame().to_csv(member, index=False)
+            daily_root.mkdir()
+            workbook = daily_root / "300001.xlsx"
+            workbook.write_bytes(b"daily-A")
+            _, record = load_day_v2_statistics(minute_root, "20240813", {"300001"})
+            expected = _unit_consumed_input({"20240813": record["consumed_member_sha256"]}, {"300001": {"path": str(workbook), "sha256": hashlib.sha256(b"daily-A").hexdigest()}})
+            result = {"unit_consumed_input": expected}
+            self.assertEqual(expected["unit_consumed_input_identity"], _verify_checkpoint_consumed_input("market:20240813", result, {"20240813": record}))
+            member_stat, directory_stat = member.stat(), day_dir.stat()
+            member.write_bytes(member.read_bytes().replace(b"10.0", b"11.0", 1))
+            os.utime(member, ns=(member_stat.st_atime_ns, member_stat.st_mtime_ns))
+            os.utime(day_dir, ns=(directory_stat.st_atime_ns, directory_stat.st_mtime_ns))
+            _, rewritten_record = load_day_v2_statistics(minute_root, "20240813", {"300001"})
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240813"):
+                _verify_checkpoint_consumed_input("market:20240813", result, {"20240813": rewritten_record})
+            workbook_stat = workbook.stat()
+            workbook.write_bytes(b"daily-B")
+            os.utime(workbook, ns=(workbook_stat.st_atime_ns, workbook_stat.st_mtime_ns))
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240813"):
+                _verify_checkpoint_consumed_input("market:20240813", result, {"20240813": record})
+
+    def test_missing_selective_member_is_stable_checkpoint_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            minute_root = root / "minute"
+            day_dir = minute_root / "2024" / "08" / "20240813"
+            day_dir.mkdir(parents=True)
+            raw_frame().to_csv(day_dir / "sz300001.csv", index=False)
+            requested = {"300001", "300002", "300003"}
+            (day_dir / "sz300003.csv").write_text("unparseable", encoding="utf-8")
+            _, record = load_day_v2_statistics(minute_root, "20240813", requested)
+            minute_members = _unit_minute_members({"20240813": record}, {"20240813": requested})
+            self.assertEqual("missing:300002", minute_members["20240813"]["300002"])
+            self.assertEqual("missing:300003", minute_members["20240813"]["300003"])
+            result = {"unit_consumed_input": _unit_consumed_input(minute_members, {})}
+            _checkpoint(root, "run", "fixture:20240813|300002", result)
+            saved = json.loads((root / "checkpoints" / "fixture_20240813_300002.json").read_text(encoding="utf-8"))
+            self.assertEqual(
+                result["unit_consumed_input"]["unit_consumed_input_identity"],
+                _verify_checkpoint_consumed_input(saved["unit"], saved["result"], {"20240813": record}),
+            )
+            raw_frame(close=11).to_csv(day_dir / "sz300002.csv", index=False)
+            _, appeared_record = load_day_v2_statistics(minute_root, "20240813", requested)
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:fixture:20240813\\|300002"):
+                _verify_checkpoint_consumed_input(saved["unit"], saved["result"], {"20240813": appeared_record})
+
+    def test_runtime_gate_counts_are_overlapping_and_first_failures_exclusive(self) -> None:
+        good_day, good_prior = a_inputs()
+        liquidity_day, liquidity_prior = a_inputs(d1_amount=MIN_D1_AMOUNT)
+        failed_day, failed_prior = a_inputs()
+        failed_day["signal"].update({"tail_return": -0.04, "range1450": .01})
+        rows = [
+            build_signal_row("300701", good_day, good_prior, LISTED),
+            build_signal_row("300702", liquidity_day, liquidity_prior, LISTED),
+            build_signal_row("300703", failed_day, failed_prior, LISTED),
+        ]
+        ranked = rank_channels(rows)
+        counts = _gate_counts(rows, ranked, {"universe": 10, "survivors": 3})
+        self.assertEqual(3, counts["evaluated_final_gate_rows"])
+        self.assertEqual(3, counts["first_failure_total"])
+        self.assertEqual(1, counts["A_eligible"])
+        self.assertEqual(1, counts["predicate_fail_counts"]["d1_liquidity_failed"])
+        self.assertEqual(1, counts["predicate_fail_counts"]["A"]["tail_return<-0.03"])
+        self.assertEqual(1, counts["predicate_fail_counts"]["A"]["range_expansion<1.50"])
 
     def test_a_shape_and_strict_d1_liquidity(self) -> None:
         day, prior = a_inputs(d1_amount=MIN_D1_AMOUNT)
@@ -330,7 +408,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
             module.TASK_CARD = copied
             try:
                 self.assertEqual(original, _spec_hash())
-                copied.write_text(text.replace("ret1450", "ret1450_changed", 1), encoding="utf-8")
+                copied.write_text(text.replace("checkpoint", "checkpoint_changed", 1), encoding="utf-8")
                 self.assertNotEqual(original, _spec_hash())
             finally:
                 module.TASK_CARD = original_card
@@ -441,12 +519,17 @@ class TailNextMorningV2Tests(unittest.TestCase):
         def fake_load(_root, trade_date, codes=None):
             calls[trade_date] = calls.get(trade_date, 0) + 1
             requested = {"300085", "300339", "300972", "300328"} if codes is None else set(codes)
-            return {code: copy.deepcopy(stat()) for code in requested}, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0}
+            digests = {code: hashlib.sha256(f"{trade_date}|{code}".encode()).hexdigest() for code in requested}
+            return {code: copy.deepcopy(stat()) for code in requested}, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": digests}
 
         manifest = {"minute_containers": [], "daily_root": "synthetic", "targets": list(positions), "market_targets": ["20240923", "20240926"]}
         with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_calendar_for_targets", return_value=(calendar, positions)), patch.object(module, "_canary_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
-            run_canary("synthetic", "synthetic", temporary)
-        self.assertEqual(1, calls["20240924"])
+            summary, run_dir = run_canary("synthetic", "synthetic", temporary)
+            with patch.object(module, "rank_channels", side_effect=AssertionError("SUCCEEDED fast path recalculated rankings")):
+                resumed, resumed_dir = run_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+            self.assertEqual(summary, resumed)
+            self.assertEqual(run_dir, resumed_dir)
+        self.assertEqual(2, calls["20240924"])
 
     @unittest.skipUnless(Path(r"E:\分钟数据").exists(), "real minute source unavailable")
     def test_fixed_64_code_real_small_universe_full_vs_selective(self) -> None:

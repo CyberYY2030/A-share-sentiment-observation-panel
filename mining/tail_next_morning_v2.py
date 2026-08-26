@@ -44,7 +44,7 @@ from mining.tail_next_morning import (
 )
 
 
-TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-revision-task-card.md"
+TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-recovery-task-card.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
@@ -93,8 +93,13 @@ def _sha256(path: Path) -> str:
 
 def _spec_hash() -> str:
     text = TASK_CARD.read_text(encoding="utf-8").replace("\r\n", "\n")
-    definition, marker, _ = text.partition("## 11. 执行证据")
-    if not marker:
+    definition = None
+    for marker in ("## 4. 执行证据", "## 6. 执行证据", "## 11. 执行证据"):
+        before, found, _ = text.partition(marker)
+        if found:
+            definition = before
+            break
+    if definition is None:
         raise TailDataError("v2_task_card_execution_marker_missing")
     return hashlib.sha256(definition.encode("utf-8")).hexdigest()
 
@@ -116,9 +121,52 @@ def _code_identity() -> dict[str, str]:
     return {"module_blob": _git_blob(module), "test_blob": _git_blob(test)}
 
 
-def _content_identity(records: Mapping[str, Mapping[str, str]]) -> str:
+def _content_identity(records: Mapping[str, Any]) -> str:
     """Stable identity of exactly the source members/workbooks actually read."""
     return hashlib.sha256(_json_bytes({key: dict(value) for key, value in sorted(records.items())})).hexdigest()
+
+
+def _unit_consumed_input(minute_members: Mapping[str, Mapping[str, str]], daily_workbooks: Mapping[str, Mapping[str, str]]) -> dict[str, Any]:
+    """The checkpoint-owned, canonical content proof for exactly one unit."""
+    values = {
+        "minute_members": {day: dict(sorted(codes.items())) for day, codes in sorted(minute_members.items())},
+        "daily_workbooks": {code: dict(value) for code, value in sorted(daily_workbooks.items())},
+    }
+    return {**values, "unit_consumed_input_identity": _content_identity(values)}
+
+
+def _unit_minute_members(source_records: Mapping[str, Mapping[str, Any]], dependencies: Mapping[str, set[str] | None]) -> dict[str, dict[str, str]]:
+    """Select the members truly consumed by a unit from one-open source records."""
+    result: dict[str, dict[str, str]] = {}
+    for trade_date, codes in sorted(dependencies.items()):
+        available = source_records[trade_date].get("consumed_member_sha256", {})
+        # A requested-but-absent member is itself input evidence.  The stable
+        # sentinel changes to a content SHA if that member later appears.
+        selected = available if codes is None else {code: available.get(code, f"missing:{code}") for code in sorted(codes)}
+        result[trade_date] = dict(sorted(selected.items()))
+    return result
+
+
+def _verify_checkpoint_consumed_input(unit: str, result: Mapping[str, Any], source_records: Mapping[str, Mapping[str, Any]]) -> str:
+    """Fail closed before a resume or completed fast path trusts an old result."""
+    expected = result.get("unit_consumed_input")
+    if not isinstance(expected, Mapping):
+        raise TailDataError(f"consumed_input_identity_mismatch:{unit}")
+    try:
+        dependencies = {day: set(codes) for day, codes in expected["minute_members"].items()}
+        minute_members = _unit_minute_members(source_records, dependencies)
+        daily_workbooks: dict[str, dict[str, str]] = {}
+        for code, saved in expected["daily_workbooks"].items():
+            path = Path(str(saved["path"]))
+            daily_workbooks[str(code)] = {"path": str(path), "sha256": _sha256(path)}
+        actual = _unit_consumed_input(minute_members, daily_workbooks)
+    except Exception as exc:
+        if isinstance(exc, TailDataError) and str(exc).startswith("consumed_input_identity_mismatch:"):
+            raise
+        raise TailDataError(f"consumed_input_identity_mismatch:{unit}") from exc
+    if actual != dict(expected):
+        raise TailDataError(f"consumed_input_identity_mismatch:{unit}")
+    return str(actual["unit_consumed_input_identity"])
 
 
 def _standard_limit_rate(code: str) -> float:
@@ -278,8 +326,9 @@ def load_day_v2_statistics(
                     result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"}
                 else:
                     payload = archive.read(name)
-                    member_digests[code] = hashlib.sha256(payload).hexdigest()
                     result[code] = _stats_from_payload(payload)
+                    if result[code].get("status") == "ready":
+                        member_digests[code] = hashlib.sha256(payload).hexdigest()
     else:
         members: dict[str, Path] = {}
         for item in sorted(source.rglob("*.csv")):
@@ -295,8 +344,9 @@ def load_day_v2_statistics(
                 result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"}
             else:
                 payload = item.read_bytes()
-                member_digests[code] = hashlib.sha256(payload).hexdigest()
                 result[code] = _stats_from_payload(payload)
+                if result[code].get("status") == "ready":
+                    member_digests[code] = hashlib.sha256(payload).hexdigest()
     if requested is not None:
         for code in requested - set(result):
             result[code] = {"status": "invalid", "reason": "minute_code_missing"}
@@ -553,6 +603,58 @@ def rank_channels(rows: Iterable[dict[str, Any]], *, a_limit: int = A_LIMIT, b_l
     }
 
 
+def _gate_counts(rows: Iterable[Mapping[str, Any]], ranked: Mapping[str, Any], preselection: Mapping[str, Any]) -> dict[str, Any]:
+    """Runtime counts: predicate failures overlap; first failures are exclusive."""
+    evaluated = list(rows)
+    a_fail: defaultdict[str, int] = defaultdict(int)
+    b_fail: defaultdict[str, int] = defaultdict(int)
+    first: defaultdict[str, int] = defaultdict(int)
+    overlap = 0
+    for row in evaluated:
+        for reason in row.get("a_failure_reasons", []):
+            a_fail[str(reason)] += 1
+        for reason in row.get("b_failure_reasons", []):
+            b_fail[str(reason)] += 1
+        a_qualified = bool(row.get("a_shape_pass") and row.get("liquidity_pass") and row.get("listing_pass") and row.get("common_quality_pass"))
+        b_qualified = bool(row.get("b_shape_pass") and row.get("liquidity_pass") and row.get("listing_pass") and row.get("common_quality_pass"))
+        if a_qualified and b_qualified:
+            overlap += 1
+        if not row.get("common_quality_pass"):
+            first["common_quality"] += 1
+        elif not row.get("liquidity_pass"):
+            first["d1_liquidity"] += 1
+        elif not row.get("listing_pass"):
+            first["listing"] += 1
+        elif a_qualified:
+            first["eligible_A"] += 1
+        elif b_qualified:
+            first["eligible_B"] += 1
+        else:
+            first["both_channel_shape_failed"] += 1
+    predicate = {
+        "A": dict(sorted(a_fail.items())),
+        "B": dict(sorted(b_fail.items())),
+        "common_quality_failed": sum(not bool(row.get("common_quality_pass")) for row in evaluated),
+        "d1_liquidity_failed": sum(not bool(row.get("liquidity_pass")) for row in evaluated),
+        "listing_failed": sum(not bool(row.get("listing_pass")) for row in evaluated),
+        "a_b_overlap_excluded_from_B": overlap,
+        "tail_limit_touch_before_channel": sum(bool(row.get("tail_limit_touch")) for row in evaluated if row.get("common_quality_pass")),
+    }
+    return {
+        "counting_contract": "predicate_fail_counts overlap; first_failure_counts are exclusive and first_failure_total equals evaluated_final_gate_rows",
+        "predicate_fail_counts": predicate,
+        "first_failure_counts": dict(sorted(first.items())),
+        "first_failure_total": sum(first.values()),
+        "evaluated_final_gate_rows": len(evaluated),
+        "universe": int(preselection["universe"]),
+        "preselection_survivors": int(preselection["survivors"]),
+        "A_eligible": len(ranked["a_pool"]),
+        "B_eligible": len(ranked["b_pool"]),
+        "A_top10": len(ranked["a_selected"]),
+        "B_top10": len(ranked["b_selected"]),
+    }
+
+
 def outcome_from_frames(day_stat: Mapping[str, Any] | None, next_bars: pd.DataFrame | None) -> dict[str, Any]:
     """Keep next-open continuation labels separate from gap and fixed exit P&L."""
     buy = (day_stat or {}).get("buy", {})
@@ -720,7 +822,6 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
     stats_cache: dict[str, dict[str, dict[str, Any]]] = {}
     source_records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
-    daily_consumed: dict[str, dict[str, str]] = {}
 
     def load_once(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
         requested = None if codes is None else {canonical_code(code) for code in codes}
@@ -766,7 +867,28 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
             saved = json.loads(path.read_text(encoding="utf-8"))
             if saved.get("run_hash") != run_hash:
                 raise TailDataError("checkpoint_hash_mismatch")
+            _verify_checkpoint_consumed_input(str(saved["unit"]), saved["result"], source_records)
             completed[saved["unit"]] = saved["result"]
+        if completion_path.exists():
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            expected_units = {f"market:{target}" for target in MARKET_TARGETS} | {f"fixture:{target}|{code}" for target, code in FIXTURE_TARGETS}
+            if completion.get("status") == "SUCCEEDED":
+                if completion.get("run_hash") != run_hash:
+                    raise TailDataError("completion_hash_mismatch")
+                if set(completed) != expected_units:
+                    raise TailDataError("succeeded_checkpoint_set_mismatch")
+                verified_unit_identities = {
+                    unit: _verify_checkpoint_consumed_input(unit, result, source_records)
+                    for unit, result in sorted(completed.items())
+                }
+                summary = json.loads((run_dir / "diagnostic_summary.json").read_text(encoding="utf-8"))
+                if (
+                    summary.get("run_hash") != run_hash
+                    or summary.get("verified_checkpoint_consumed_identities") != verified_unit_identities
+                    or summary.get("consumed_input_identity") != hashlib.sha256(_json_bytes(verified_unit_identities)).hexdigest()
+                ):
+                    raise TailDataError("succeeded_summary_identity_mismatch")
+                return summary, run_dir
         daily_top: dict[str, Any] = {}
         fixture_rows: dict[str, Any] = {}
         eligible_rows: list[dict[str, Any]] = []
@@ -784,9 +906,10 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
                 index = positions[target]
                 day, d1 = stats_cache[target], stats_cache[calendar[index - 1]]
                 rows = []
+                unit_daily_consumed: dict[str, dict[str, str]] = {}
                 for code in sorted(evaluation_codes[target]):
                     prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
-                    rows.append(_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, daily_consumed))
+                    rows.append(_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, unit_daily_consumed))
                 ranked = rank_channels(rows)
                 selected = ranked["a_selected"] + ranked["b_selected"]
                 pool = ranked["a_pool"] + ranked["b_pool"]
@@ -806,7 +929,11 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
                         evidence = _standard_limit_evidence(code, float(d1[code]["history"]["close"]), float(value["signal"].get("tail_high", value["signal"]["high"])))
                         if evidence["tail_limit_touch"]:
                             touch_rows.append({"trade_date": target, "sec_code": code, "failure_reason": "tail_limit_touch", **evidence})
-                result = {"daily_top": top, "eligible_rows": [_public_row(row) for row in pool], "fixture_rows": fixture_subset, "excluded_limit_touch": touch_rows, "preselection": {"universe": len(day), "survivors": sum(proof["survives"] for proof in market_pre[target].values()), "evaluated": len(rows)}}
+                preselection = {"universe": len(day), "survivors": sum(proof["survives"] for proof in market_pre[target].values()), "evaluated": len(rows)}
+                unit_dependencies: dict[str, set[str] | None] = {target: None, calendar[index - 1]: None}
+                unit_dependencies.update({history_date: set(evaluation_codes[target]) for history_date in calendar[index - 10:index - 1]})
+                unit_dependencies[calendar[index + 1]] = set(outcome_codes)
+                result = {"daily_top": top, "eligible_rows": [_public_row(row) for row in pool], "fixture_rows": fixture_subset, "excluded_limit_touch": touch_rows, "preselection": preselection, "gate_counts": _gate_counts(rows, ranked, preselection), "unit_consumed_input": _unit_consumed_input(_unit_minute_members(source_records, unit_dependencies), unit_daily_consumed)}
                 _checkpoint(run_dir, run_hash, unit, result)
                 completed[unit] = result
             daily_top[target] = result["daily_top"]
@@ -824,12 +951,14 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
                 index = positions[target]
                 day, d1 = stats_cache[target], stats_cache[calendar[index - 1]]
                 prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
-                row = _final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, daily_consumed)
+                unit_daily_consumed: dict[str, dict[str, str]] = {}
+                row = _final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, unit_daily_consumed)
                 next_stats = load_once(calendar[index + 1], {code})
                 row["outcome"] = outcome_from_statistics(day.get(code), next_stats.get(code))
                 row["selected"] = False
                 row["channel"] = None
-                result = {"fixture_row": row, "preselection": necessary_preselection(code, day.get(code), d1.get(code))}
+                unit_dependencies = {dependency_date: {code} for dependency_date in calendar[index - 10:index + 2]}
+                result = {"fixture_row": row, "preselection": necessary_preselection(code, day.get(code), d1.get(code)), "unit_consumed_input": _unit_consumed_input(_unit_minute_members(source_records, unit_dependencies), unit_daily_consumed)}
                 _checkpoint(run_dir, run_hash, unit, result)
                 completed[unit] = result
             fixture_rows[f"{target}|{code}"] = result["fixture_row"]
@@ -846,12 +975,14 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
         for target, code in sorted(expected_touches):
             assertions[f"{target}|{code}"] = {"passed": (target, code) in observed_touches, "checks": {"tail_limit_touch": (target, code) in observed_touches}}
         label = "tnm_v2_r1_diagnostic_ready" if all(value["passed"] for value in assertions.values()) else "diagnostic_changes_required"
-        consumed_minutes = {day: record.get("consumed_member_sha256", {}) for day, record in sorted(source_records.items())}
-        consumed = {"minute_members": consumed_minutes, "daily_workbooks": daily_consumed}
-        run_manifest["consumed_input_identity"] = _content_identity({"minute_members": {"sha256": hashlib.sha256(_json_bytes(consumed_minutes)).hexdigest()}, "daily_workbooks": {"sha256": hashlib.sha256(_json_bytes(daily_consumed)).hexdigest()}})
-        run_manifest["consumed_input_manifest"] = consumed
+        verified_unit_identities = {
+            unit: _verify_checkpoint_consumed_input(unit, result, source_records)
+            for unit, result in sorted(completed.items())
+        }
+        run_manifest["consumed_input_identity"] = hashlib.sha256(_json_bytes(verified_unit_identities)).hexdigest()
+        run_manifest["verified_checkpoint_consumed_identities"] = verified_unit_identities
         _write_json(run_dir / "run_manifest.json", run_manifest)
-        summary = {"execution_label": label, "contract": "TNM-V2-R1 two-market-three-fixture diagnostic", "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS), "fixture_targets": [f"{day}|{code}" for day, code in FIXTURE_TARGETS], "read_years": ["2024"], "spec_hash": run_manifest["spec_hash"], "base_commit": run_manifest["base_commit"], "source_blob_identity": run_manifest["source_blob_identity"], "run_hash": run_hash, "input_manifest_hash": run_manifest["input_manifest_hash"], "consumed_input_identity": run_manifest["consumed_input_identity"], "capacity_filter_applied": False, "st_filter_applied": False, "st_status": "unavailable_not_filtered", "st_limit_filter_status": "unproven_standard_board_rule_applied", "corporate_action_filter": "unproven_not_applied", "source_records": {day: source_records[day] for day in sorted(source_records)}, "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in MARKET_TARGETS}, "excluded_limit_touch_count": len(excluded_limit_touch), "fixture_assertions": assertions, "performance": {"elapsed_seconds": round(time.monotonic() - started, 6), "container_open_total": sum(record["container_open_count"] for record in source_records.values())}, "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}, "read_2025_2026": False, "e_drive_written": False}
+        summary = {"execution_label": label, "contract": "TNM-V2-R1R two-market-three-fixture diagnostic", "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS), "fixture_targets": [f"{day}|{code}" for day, code in FIXTURE_TARGETS], "read_years": ["2024"], "spec_hash": run_manifest["spec_hash"], "base_commit": run_manifest["base_commit"], "source_blob_identity": run_manifest["source_blob_identity"], "run_hash": run_hash, "input_manifest_hash": run_manifest["input_manifest_hash"], "consumed_input_identity": run_manifest["consumed_input_identity"], "verified_checkpoint_consumed_identities": verified_unit_identities, "capacity_filter_applied": False, "st_filter_applied": False, "st_status": "unavailable_not_filtered", "st_limit_filter_status": "unproven_standard_board_rule_applied", "corporate_action_filter": "unproven_not_applied", "source_records": {day: source_records[day] for day in sorted(source_records)}, "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in MARKET_TARGETS}, "gate_counts": {day: completed[f"market:{day}"]["gate_counts"] for day in MARKET_TARGETS}, "excluded_limit_touch_count": len(excluded_limit_touch), "fixture_assertions": assertions, "performance": {"elapsed_seconds": round(time.monotonic() - started, 6), "container_open_total": sum(record["container_open_count"] for record in source_records.values())}, "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}, "read_2025_2026": False, "e_drive_written": False}
         _write_json(run_dir / "diagnostic_summary.json", summary)
         _write_csv_gz(run_dir / "diagnostic_eligible_pool.csv.gz", eligible_rows)
         _write_csv_gz(run_dir / "diagnostic_excluded_limit_touch.csv.gz", excluded_limit_touch)
