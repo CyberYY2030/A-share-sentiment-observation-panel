@@ -340,8 +340,8 @@ def load_day_v2_statistics(
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     """Open one daily container once; optionally parse only named A-share members."""
     key = str(trade_date).replace("-", "")
-    if key[:4] != "2024":
-        raise TailDataError(f"v2_canary_year_guard:{key}")
+    if key[:4] not in {"2023", "2024"}:
+        raise TailDataError(f"v2_supported_year_guard:{key}")
     source, source_kind = locate_day_source(minute_root, key)
     requested = None if codes is None else {canonical_code(code) for code in codes if is_a_share_code(code)}
     result: dict[str, dict[str, Any]] = {}

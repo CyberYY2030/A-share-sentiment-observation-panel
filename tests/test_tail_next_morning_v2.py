@@ -418,6 +418,36 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(0, main(["v22-development", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "development-id"]))
         self.assertEqual("development-id", runner.call_args.kwargs["resume_run_id"])
 
+    def test_v22_loader_year_guard_accepts_development_history_without_widening_canary(self) -> None:
+        """The shared loader supports the frozen development years; modes retain their own bounds."""
+        from mining import tail_next_morning_v2 as module
+        calendar = ["20230103", "20230104", "20230105", "20230106", "20230109", "20230110", "20230111", "20230112", "20230113", "20230116", "20230117", "20230118"]
+        positions = {trade_date: index for index, trade_date in enumerate(calendar)}
+        with tempfile.TemporaryDirectory() as temporary:
+            root, daily_root = Path(temporary) / "minute", Path(temporary) / "daily"
+            daily_root.mkdir()
+            for trade_date in calendar:
+                day_dir = root / trade_date[:4] / trade_date[4:6] / trade_date
+                day_dir.mkdir(parents=True)
+                raw_frame().to_csv(day_dir / "sz300001.csv", index=False)
+            extra_2024 = root / "2024" / "01" / "20240103"
+            extra_2024.mkdir(parents=True)
+            raw_frame().to_csv(extra_2024 / "sz300001.csv", index=False)
+            for accepted in ("20230103", "20240103"):
+                values, record = load_day_v2_statistics(root, accepted, {"300001"})
+                self.assertEqual("ready", values["300001"]["status"])
+                self.assertEqual(1, record["container_open_count"])
+            for rejected in ("20220103", "20250102", "20260102"):
+                with self.assertRaisesRegex(Exception, f"v2_supported_year_guard:{rejected}"):
+                    load_day_v2_statistics(root, rejected)
+            with self.assertRaisesRegex(Exception, "v22_canary_year_guard:20230103"):
+                module._v22_input_manifest(root, daily_root, ["20230103"])
+            manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+            with patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest):
+                summary, _ = run_v22_development(root, daily_root, Path(temporary) / "output")
+            self.assertEqual(["20230117"], summary["targets"])
+            self.assertEqual(1, summary["target_count"])
+
     def test_v22_development_daily_commit_ignores_orphan_outcome_and_resumes_once(self) -> None:
         """An outcome written before its marker is audit-only and cannot duplicate economics."""
         from mining import tail_next_morning_v2 as module

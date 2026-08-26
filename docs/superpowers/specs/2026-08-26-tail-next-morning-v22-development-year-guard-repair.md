@@ -20,4 +20,20 @@ Terra 只可写 `mining/tail_next_morning_v2.py`、`tests/test_tail_next_morning
 
 ## 4. 执行证据
 
-尚未执行。
+### TNM-V2.2 development 2023 年界最窄修复（Terra，2026-08-26）
+
+状态：`tnm_v22_development_year_guard_fix_verified`。共享 `load_day_v2_statistics` 仅把允许年份从
+硬编码 `2024` 扩展为 `{2023, 2024}`；2022、2025、2026 以
+`v2_supported_year_guard` fail-closed。`_v22_input_manifest` 的 canary 2024-only 守卫和
+`_v22_development_input_manifest` 的 development 2023/2024 守卫均未改变；经济函数、gate、score、
+rank、A6/B3、controls、退出、成本和账户均未修改。
+
+新增临时真实 loader 回归：2023/2024 容器均可解析，2022/2025/2026 均拒绝；canary input guard
+继续拒绝 2023；development 由 2023 的 D-10 历史日推进至首个 `20230117` target。Python 3.11
+本地验证：`tests.test_tail_next_morning_v2` 51 passed / 1 skipped；
+`tests.test_tail_next_morning` 25 passed；`py_compile` 与 `git diff --check` 通过。
+
+全程未读取 E 盘、未启动真实 runner、未读取 2025/2026、无任务进程。失败 identity
+`v22-development-8fffe4a3fba4-969e9d05cd0a` 及其 manifest/progress/completion/log 只读保留，
+未 resume、未改写；shared dirty 保持，未 push。等待 Sol 独立审核，approve 前禁止新 launch。
+Lessons：`create` 候选已在失败证据中登记，未超出本卡写入范围。
