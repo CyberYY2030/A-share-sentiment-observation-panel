@@ -102,4 +102,10 @@ git diff --check
 
 尚未执行。Terra 只能追加本节。
 
+### V22-1F（Terra，2026-08-26）
+
+状态：`v22_1f_code_verified`。仅完成本地实现和合成生产链验证，未读取 `E:\`、未创建真实 canary/development identity。修复将未来退出改为按日期汇合开放事件、同日容器只解析一次；`run_v22_canary` 现消费三对照、事件/年/月/coverage/固定槽位/bootstrap 汇总及真实九袖套 ledger/NAV，并在 checkpoint/恢复/成功快路径前复核实际成员和日K内容 identity。受控 `KeyboardInterrupt` 写原子 `CANCELLED`，异常写 `FAILED`。
+
+验证：`tests.test_tail_next_morning_v2` 41 项通过、1 项真实源测试显式禁用；`tests.test_tail_next_morning` 25 项通过；`py_compile` 与 `git diff --check` 通过。合成生产测试覆盖同未来日多股票单开、延期/当日分叉、多个 impulse、非并列 A6/B3、无效买入、30bps、三对照、九袖套同日卖后再买/busy skip/未决阻断、等长内容改写恢复拒绝、SUCCEEDED 快路径字节/mtime 不变及 `CANCELLED`。旧非终态 `v22-canary-3178f827ce5b-e4e9b6ccc022` 未读未改写；等待 Sol 复审后才可派发 V22-1C。
+
 Lessons：`skip`，这是既有项目执行合同的定点修复。

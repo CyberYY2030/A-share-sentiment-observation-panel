@@ -41,6 +41,9 @@ from mining.tail_next_morning import (
     validate_minute_window,
     vwap_for_window,
     window_bars,
+    _daily_k_input_identity,
+    _directory_input_identity,
+    _zip_input_identity,
 )
 
 
@@ -127,6 +130,10 @@ def _code_identity() -> dict[str, str]:
 def _content_identity(records: Mapping[str, Any]) -> str:
     """Stable identity of exactly the source members/workbooks actually read."""
     return hashlib.sha256(_json_bytes({key: dict(value) for key, value in sorted(records.items())})).hexdigest()
+
+
+def _json_identity(value: Any) -> str:
+    return hashlib.sha256(_json_bytes(value)).hexdigest()
 
 
 def _unit_consumed_input(minute_members: Mapping[str, Mapping[str, str]], daily_workbooks: Mapping[str, Mapping[str, str]]) -> dict[str, Any]:
@@ -1217,11 +1224,17 @@ def _v22_calendar(minute_root: str | Path) -> tuple[list[str], dict[str, int]]:
     return sessions, positions
 
 
-def _v22_final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _v22_final_row(
+    code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None],
+    daily_root: str | Path, listing_cache: dict[str, dict[str, Any]], daily_consumed: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
     provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
     row = build_v22_signal_row(code, day, prior, provisional)
     if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
         listing = development_listing_evidence(daily_root, code, target, minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS), cache=listing_cache)
+        workbook = Path(daily_root) / f"{canonical_code(code)}.xlsx"
+        if daily_consumed is not None and workbook.exists():
+            daily_consumed[canonical_code(code)] = {"path": str(workbook), "sha256": _sha256(workbook)}
         row = build_v22_signal_row(code, day, prior, listing)
     else:
         row.update({"listing_pass": False, "listing_age_source": "not_evaluated_shape_or_liquidity_failed", "listing_history_sessions": None, "listing_history_count_status": "not_evaluated", "eligible_pass": False})
@@ -1240,35 +1253,244 @@ def _v22_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str,
     return result
 
 
-def _v22_event(channel: str, code: str, signal_date: str, buy: Mapping[str, Any], calendar: list[str], start_index: int, load: Any) -> dict[str, Any]:
-    if buy.get("status") != "ready" or not _finite(buy.get("vwap")):
-        return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "unavailable_buy", "buy_price": None, "exit_price": None, "net_return": None, "holding_days": None, "decisions": []}
-    decisions = []
-    for index in range(start_index + 1, len(calendar)):
-        current_date, previous_date = calendar[index], calendar[index - 1]
-        decision = v22_exit_decision(channel, code, load(previous_date, {code}).get(code), load(current_date, {code}).get(code))
-        decisions.append({"trade_date": current_date, **decision})
-        if decision["status"] == "exit":
-            gross = float(decision["exit_price"]) / float(buy["vwap"]) - 1.0
-            return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "resolved", "buy_price": float(buy["vwap"]), "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - start_index, "exit_trade_date": current_date, "exit_window": decision["exit_window"], "decisions": decisions}
-    return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "unresolved_at_development_end", "buy_price": float(buy["vwap"]), "exit_price": None, "gross_return": None, "net_return": None, "holding_days": len(calendar) - start_index - 1, "decisions": decisions}
+def _v22_input_manifest(minute_root: str | Path, daily_root: str | Path, calendar: Iterable[str]) -> dict[str, Any]:
+    """Freeze allowed 2024 containers and the daily-K tree before a run exists."""
+    containers = []
+    for trade_date in sorted(set(calendar)):
+        if not str(trade_date).startswith("2024"):
+            raise TailDataError(f"v22_canary_year_guard:{trade_date}")
+        source, kind = locate_day_source(minute_root, trade_date)
+        identity = _zip_input_identity(source) if kind == "zip" else _directory_input_identity(source)
+        containers.append({"trade_date": trade_date, "source_kind": kind, **identity})
+    return {"minute_containers": containers, "daily_k_root": _daily_k_input_identity(daily_root)}
 
 
-def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path) -> tuple[dict[str, Any], Path]:
-    """The single V2.2 two-day canary; it never reads a 2025 session."""
-    started = time.monotonic()
-    calendar, positions = _v22_calendar(minute_root)
-    manifest = {"mode": "tnm-v22-1-canary", "targets": list(V22_MARKET_TARGETS), "calendar_end": calendar[-1], "base_commit": _current_commit(), "spec_hash": _spec_hash(), "source_blob_identity": _code_identity()}
-    run_hash = hashlib.sha256(_json_bytes(manifest)).hexdigest()
-    run_id = f"v22-canary-{manifest['spec_hash'][:12]}-{run_hash[:12]}"
+def _v22_prepare_run(output_dir: str | Path, manifest: Mapping[str, Any], *, resume_run_id: str | None) -> tuple[Path, dict[str, Any]]:
+    identity = {
+        "mode": "tnm-v22-1-canary", "spec_hash": _spec_hash(), "base_commit": _current_commit(),
+        "source_blob_identity": _code_identity(), "input_manifest_hash": _json_identity(manifest),
+    }
+    run_hash = _json_identity(identity)
+    run_id = f"v22-canary-{identity['spec_hash'][:12]}-{run_hash[:12]}"
+    if resume_run_id is not None and resume_run_id != run_id:
+        raise TailDataError("v22_resume_identity_mismatch")
     run_dir = Path(output_dir) / run_id
-    if (run_dir / "run_manifest.json").exists():
-        raise TailDataError("v22_canary_output_exists")
-    _write_json(run_dir / "run_manifest.json", {**manifest, "run_hash": run_hash, "run_id": run_id})
-    _write_json(run_dir / "progress.json", {"run_hash": run_hash, "stage": "initializing", "completed_units": []})
+    record = {**identity, "run_hash": run_hash, "run_id": run_id, "input_manifest": manifest}
+    path = run_dir / "run_manifest.json"
+    if path.exists():
+        if resume_run_id is None:
+            raise TailDataError("v22_output_exists_requires_explicit_resume")
+        if json.loads(path.read_text(encoding="utf-8")) != record:
+            raise TailDataError("v22_resume_hash_mismatch")
+    elif resume_run_id is not None:
+        raise TailDataError("v22_resume_run_manifest_missing")
+    else:
+        _write_json(path, record)
+    return run_dir, record
+
+
+def _v22_controls(pool: Iterable[Mapping[str, Any]], selected: Iterable[Mapping[str, Any]], channel: str) -> dict[str, list[dict[str, Any]]]:
+    size = len(list(selected))
+    rows = [dict(row) for row in pool]
+    key = lambda row: canonical_code(str(row["sec_code"]))
+    return {
+        "strategy": [dict(row) for row in selected],
+        "random_same_n": sorted(rows, key=lambda row: (hashlib.sha256(f"20260826|V22|{row['trade_date']}|{channel}|{key(row)}".encode()).hexdigest(), key(row)))[:size],
+        "ret1450_same_n": sorted(rows, key=lambda row: (-float(row["ret1450"]), key(row)))[:size],
+        "activity_same_n": sorted(rows, key=lambda row: (-float(row["activity"]), key(row)))[:size],
+    }
+
+
+def _v22_seed_event(row: Mapping[str, Any], *, group: str, rank: int, start_index: int, buy: Mapping[str, Any]) -> dict[str, Any]:
+    ready = buy.get("status") == "ready" and _finite(buy.get("vwap"))
+    return {
+        "trade_date": str(row["trade_date"]), "sec_code": canonical_code(str(row["sec_code"])), "channel": str(row["channel"]),
+        "strategy_or_control": group, "rank": rank, "start_index": start_index,
+        "selected": True, "bought": bool(ready), "outcome_status": "open" if ready else "unavailable_buy",
+        "buy_price": float(buy["vwap"]) if ready else None, "exit_price": None, "gross_return": None, "net_return": None,
+        "holding_days": None, "exit_trade_date": None, "exit_window": None, "decisions": [],
+    }
+
+
+def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any) -> None:
+    """Resolve every open event date-by-date so a future container is opened once."""
+    first = min((int(event["start_index"]) + 1 for event in events if event["outcome_status"] == "open"), default=len(calendar))
+    for index in range(first, len(calendar)):
+        open_events = [event for event in events if event["outcome_status"] == "open" and int(event["start_index"]) < index]
+        if not open_events:
+            continue
+        codes = {str(event["sec_code"]) for event in open_events}
+        current = load(calendar[index], codes)
+        previous = load(calendar[index - 1], codes)
+        for event in open_events:
+            decision = v22_exit_decision(event["channel"], event["sec_code"], previous.get(event["sec_code"]), current.get(event["sec_code"]))
+            event["decisions"].append({"trade_date": calendar[index], **decision})
+            current_stat = current.get(event["sec_code"], {})
+            if _history_ready(current_stat):
+                event["last_mark_price"] = float(current_stat["history"]["close"])
+            if decision["status"] == "exit":
+                gross = float(decision["exit_price"]) / float(event["buy_price"]) - 1.0
+                event.update({"outcome_status": "resolved", "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - int(event["start_index"]), "exit_trade_date": calendar[index], "exit_window": decision["exit_window"]})
+        on_frontier(calendar[index], len([event for event in events if event["outcome_status"] == "open"]))
+    for event in events:
+        if event["outcome_status"] == "open":
+            event.update({"outcome_status": "unresolved_at_development_end", "holding_days": len(calendar) - int(event["start_index"]) - 1})
+
+
+def _v22_group_metrics(values: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    rows = [dict(value) for value in values]
+    resolved = [float(value["net_return"]) for value in rows if value.get("outcome_status") == "resolved"]
+    dates = sorted({value["trade_date"] for value in rows})
+    unresolved = sum(value.get("outcome_status") == "unresolved_at_development_end" for value in rows)
+    return {
+        "selected": len(rows), "bought": sum(bool(value.get("bought")) for value in rows), "resolved": len(resolved), "unresolved": unresolved,
+        "coverage": len(resolved) / len(rows) if rows else None, "win_rate": sum(value > 0 for value in resolved) / len(resolved) if resolved else None,
+        "mean_net_return": sum(resolved) / len(resolved) if resolved else None, "median_net_return": float(pd.Series(resolved).median()) if resolved else None,
+        "p10_net_return": float(pd.Series(resolved).quantile(.10)) if resolved else None, "p90_net_return": float(pd.Series(resolved).quantile(.90)) if resolved else None,
+        "sum_event_net_return": sum(resolved) if resolved else 0.0, "distinct_signal_dates": len(dates),
+        "sample_status": "ready" if len(rows) >= 100 and len(dates) >= 60 else "insufficient_sample",
+        "economic_status": "blocked_unresolved" if unresolved else "ready",
+    }
+
+
+def _v22_daily_slots(values: Iterable[Mapping[str, Any]], channel: str) -> list[dict[str, Any]]:
+    slots = V22_A_LIMIT if channel == "A" else V22_B_LIMIT
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for value in values:
+        by_day[str(value["trade_date"])].append(dict(value))
+    result = []
+    for trade_date, rows in sorted(by_day.items()):
+        unresolved = any(row.get("outcome_status") == "unresolved_at_development_end" for row in rows)
+        net = sum(float(row["net_return"]) for row in rows if row.get("outcome_status") == "resolved") / slots
+        result.append({"trade_date": trade_date, "channel": channel, "daily_slot_net": None if unresolved else net, "nominal_slots": slots, "selected_slots": len(rows), "status": "blocked_unresolved" if unresolved else "ready"})
+    return result
+
+
+def _v22_month_block_bootstrap(daily_slots: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    ready = [dict(row) for row in daily_slots if row.get("daily_slot_net") is not None]
+    by_month: dict[str, list[float]] = defaultdict(list)
+    for row in ready:
+        by_month[str(row["trade_date"])[:6]].append(float(row["daily_slot_net"]))
+    months = sorted(by_month)
+    if len(months) < 2:
+        return {"status": "insufficient_sample", "replications": 0, "ci95": None}
+    samples = []
+    for replicate in range(256):
+        chosen = [months[int(hashlib.sha256(f"V22-bootstrap|{replicate}|{slot}".encode()).hexdigest(), 16) % len(months)] for slot in range(len(months))]
+        values = [value for month in chosen for value in by_month[month]]
+        samples.append(sum(values) / len(values))
+    series = pd.Series(samples)
+    return {"status": "diagnostic", "replications": 256, "ci95": [float(series.quantile(.025)), float(series.quantile(.975))]}
+
+
+def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Shared canary/development consumer with year/month, slots and deterministic bootstrap."""
+    rows = [dict(event) for event in events]
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in rows:
+        groups[f"{event['channel']}|{event['strategy_or_control']}"] .append(event)
+    overall = {name: _v22_group_metrics(values) for name, values in sorted(groups.items())}
+    yearly = {f"{name}|{year}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(year)) for name, values in sorted(groups.items()) for year in sorted({str(value["trade_date"])[:4] for value in values})}
+    monthly = {f"{name}|{month}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(month)) for name, values in sorted(groups.items()) for month in sorted({str(value["trade_date"])[:6] for value in values})}
+    slots = [slot for name, values in groups.items() for slot in _v22_daily_slots(values, name.split("|", 1)[0])]
+    return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "bootstrap": _v22_month_block_bootstrap(slots)}
+
+
+def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """Nine fixed sleeves driven by the same strategy events; exits are processed before buys."""
+    initial = 5_000_000.0 / 9.0
+    sleeves = {f"A{rank}": {"cash": initial, "event": None} for rank in range(1, 7)} | {f"B{rank}": {"cash": initial, "event": None} for rank in range(1, 4)}
+    strategy = [dict(event) for event in events if event["strategy_or_control"] == "strategy"]
+    by_signal: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    by_exit: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in strategy:
+        by_signal[event["trade_date"]].append(event)
+        if event.get("exit_trade_date"):
+            by_exit[str(event["exit_trade_date"])].append(event)
+    ledger, nav = [], []
+    busy_skip = 0
+    for trade_date in calendar:
+        for event in by_exit.get(str(trade_date), []):
+            sleeve = sleeves[f"{event['channel']}{event['rank']}"]
+            if sleeve["event"] is event:
+                sleeve["cash"] *= 1.0 + float(event["net_return"])
+                sleeve["event"] = None
+                ledger.append({"trade_date": trade_date, "sleeve": f"{event['channel']}{event['rank']}", "action": "sell", "sec_code": event["sec_code"], "net_return": event["net_return"]})
+        for event in sorted(by_signal.get(str(trade_date), []), key=lambda value: (value["channel"], value["rank"])):
+            name, sleeve = f"{event['channel']}{event['rank']}", sleeves[f"{event['channel']}{event['rank']}"]
+            if sleeve["event"] is not None:
+                busy_skip += 1
+                ledger.append({"trade_date": trade_date, "sleeve": name, "action": "busy_skip", "sec_code": event["sec_code"]})
+            elif not event["bought"]:
+                ledger.append({"trade_date": trade_date, "sleeve": name, "action": "unavailable_buy", "sec_code": event["sec_code"]})
+            else:
+                sleeve["event"] = event
+                ledger.append({"trade_date": trade_date, "sleeve": name, "action": "buy", "sec_code": event["sec_code"], "buy_price": event["buy_price"]})
+        value = 0.0
+        for sleeve in sleeves.values():
+            event = sleeve["event"]
+            value += float(sleeve["cash"]) if event is None else float(sleeve["cash"]) * float(event.get("last_mark_price") or event["buy_price"]) / float(event["buy_price"])
+        nav.append({"trade_date": trade_date, "nav": value, "utilization": sum(sleeve["event"] is not None for sleeve in sleeves.values()) / 9.0})
+    unresolved = any(sleeve["event"] is not None for sleeve in sleeves.values())
+    return ledger, nav, {"status": "blocked_unresolved_account" if unresolved else "ready", "busy_skip": busy_skip, "total_return": None if unresolved else nav[-1]["nav"] / 5_000_000.0 - 1.0, "diagnostic_mtm_nav": nav[-1]["nav"] if nav else 5_000_000.0}
+
+
+def _v22_checkpoint_identity(
+    records: Mapping[str, Mapping[str, Any]], daily: Mapping[str, Mapping[str, str]], target: str, index: int,
+    rows: Iterable[Mapping[str, Any]], events: Iterable[Mapping[str, Any]], calendar: list[str],
+) -> dict[str, Any]:
+    """Only members actually used by this target's selection and exit decisions."""
+    dependencies: dict[str, set[str] | None] = {target: None, calendar[index - 1]: None}
+    evaluated = {str(row["sec_code"]) for row in rows}
+    for trade_date in calendar[index - 10:index - 1]:
+        dependencies[trade_date] = set(evaluated)
+    for event in events:
+        code = str(event["sec_code"])
+        for decision in event.get("decisions", []):
+            trade_date = str(decision["trade_date"])
+            if dependencies.get(trade_date) is not None:
+                dependencies.setdefault(trade_date, set()).add(code)
+            previous_index = calendar.index(trade_date) - 1
+            previous_date = calendar[previous_index]
+            if dependencies.get(previous_date) is not None:
+                dependencies.setdefault(previous_date, set()).add(code)
+    daily_subset = {code: evidence for code, evidence in daily.items() if code in evaluated}
+    return _unit_consumed_input(_unit_minute_members(records, dependencies), daily_subset)
+
+
+def _v22_verify_saved_units(run_dir: Path, run_hash: str, minute_root: str | Path) -> dict[str, Any]:
+    saved: dict[str, Any] = {}
+    source_records: dict[str, dict[str, Any]] = {}
+    for path in sorted((run_dir / "checkpoints").glob("market_*.json")) if (run_dir / "checkpoints").exists() else []:
+        checkpoint = json.loads(path.read_text(encoding="utf-8"))
+        if checkpoint.get("run_hash") != run_hash:
+            raise TailDataError("v22_checkpoint_hash_mismatch")
+        result = checkpoint.get("result", {})
+        expected = result.get("unit_consumed_input", {})
+        for day, codes in expected.get("minute_members", {}).items():
+            if day not in source_records:
+                _, source_records[day] = load_day_v2_statistics(minute_root, day, set(codes))
+        _verify_checkpoint_consumed_input(str(checkpoint["unit"]), result, source_records)
+        saved[str(checkpoint["unit"])] = result
+    return saved
+
+
+def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
+    """V2.2's production chain: shared source batches, controls, events and sleeves."""
+    started, run_dir = time.monotonic(), None
+    calendar, positions = _v22_calendar(minute_root)
+    manifest_input = _v22_input_manifest(minute_root, daily_root, calendar)
+    run_dir, manifest = _v22_prepare_run(output_dir, manifest_input, resume_run_id=resume_run_id)
+    run_hash, progress_path, completion_path = manifest["run_hash"], run_dir / "progress.json", run_dir / "completion.json"
+    preserve_existing_terminal = completion_path.exists()
     cache: dict[str, dict[str, dict[str, Any]]] = {}
     records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
+    daily_consumed: dict[str, dict[str, str]] = {}
+    completed_sources: list[str] = []
+
+    def progress(stage: str, completed: Iterable[str], open_events: int = 0) -> None:
+        _write_json(progress_path, {"run_hash": run_hash, "stage": stage, "completed_units": sorted(completed), "total_units": len(V22_MARKET_TARGETS), "source_frontier": completed_sources[-1] if completed_sources else None, "completed_source_dates": list(completed_sources), "open_exit_events": open_events, "elapsed_seconds": round(time.monotonic() - started, 6)})
 
     def load(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
         requested = None if codes is None else {canonical_code(code) for code in codes}
@@ -1278,62 +1500,91 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
             return cache[trade_date]
         values, record = load_day_v2_statistics(minute_root, trade_date, requested)
         cache[trade_date], records[trade_date] = values, record
+        completed_sources.append(trade_date)
+        progress(f"source:{trade_date}", ())
         return values
 
     try:
-        pre: dict[str, dict[str, dict[str, Any]]] = {}
-        evaluation: dict[str, set[str]] = {}
+        if completion_path.exists():
+            completion = json.loads(completion_path.read_text(encoding="utf-8"))
+            if completion.get("status") == "SUCCEEDED":
+                if resume_run_id is None or completion.get("run_hash") != run_hash:
+                    raise TailDataError("v22_succeeded_requires_explicit_matching_resume")
+                _v22_verify_saved_units(run_dir, run_hash, minute_root)
+                _verify_succeeded_artifacts(run_dir, completion)
+                return json.loads((run_dir / "v22_summary.json").read_text(encoding="utf-8")), run_dir
+        saved = _v22_verify_saved_units(run_dir, run_hash, minute_root) if resume_run_id else {}
+        progress("input_frozen", saved)
+        all_rows: dict[str, list[dict[str, Any]]] = {}
+        ranked_by_target: dict[str, dict[str, Any]] = {}
         for target in V22_MARKET_TARGETS:
-            index = positions[target]
+            unit, index = f"market:{target}", positions[target]
+            if unit in saved:
+                continue
             day, d1 = load(target, None), load(calendar[index - 1], None)
-            pre[target] = {code: _v22_preselection(code, day.get(code), d1.get(code)) for code in day}
-            evaluation[target] = {code for code, proof in pre[target].items() if proof["survives"]}
-        needs: dict[str, set[str]] = defaultdict(set)
-        all_evaluation_codes = set().union(*evaluation.values())
-        for target, codes in evaluation.items():
-            index = positions[target]
+            pre = {code: _v22_preselection(code, day.get(code), d1.get(code)) for code in day}
+            evaluation = {code for code, proof in pre.items() if proof["survives"]}
             for dependency in calendar[index - 10:index - 1]:
-                needs[dependency].update(codes)
-            needs[calendar[index + 1]].update(all_evaluation_codes)
-        for dependency, codes in sorted(needs.items()):
-            load(dependency, codes)
-
-        all_daily, all_events, completed = [], [], []
-        for target in V22_MARKET_TARGETS:
-            index = positions[target]
-            day, d1 = cache[target], cache[calendar[index - 1]]
+                load(dependency, evaluation)
             rows = []
-            for code in sorted(evaluation[target]):
+            for code in sorted(evaluation):
                 prior = [cache[value].get(code) for value in calendar[index - 10:index - 1]] + [d1.get(code)]
-                rows.append(_v22_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache))
-            ranked = rank_v22_channels(rows)
-            selected = ranked["a_selected"] + ranked["b_selected"]
-            daily = {"trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]), "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]], "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"]}
-            for row in selected:
-                event = _v22_event(str(row["channel"]), row["sec_code"], target, day.get(row["sec_code"], {}).get("buy", {}), calendar, index, load)
-                row["event"] = event
-                all_events.append(event)
-            all_daily.extend(_public_row(row) for row in ranked["a_pool"] + ranked["b_pool"])
-            result = {"daily": daily, "eligible_rows": [_public_row(row) for row in ranked["a_pool"] + ranked["b_pool"]], "events": all_events[-len(selected):], "preselection": {"universe": len(day), "survivors": len(evaluation[target])}}
-            _checkpoint(run_dir, run_hash, f"market:{target}", result)
-            completed.append(f"market:{target}")
-            _write_json(run_dir / "progress.json", {"run_hash": run_hash, "stage": f"market:{target}", "completed_units": completed, "elapsed_seconds": round(time.monotonic() - started, 6)})
-        summary = {"execution_label": "tnm_v22_1_canary_verified", "targets": list(V22_MARKET_TARGETS), "run_hash": run_hash, "spec_hash": manifest["spec_hash"], "source_blob_identity": manifest["source_blob_identity"], "daily": {target: json.loads((run_dir / "checkpoints" / f"market_{target}.json").read_text(encoding="utf-8"))["result"]["daily"] for target in V22_MARKET_TARGETS}, "event_count": len(all_events), "resolved_events": sum(event["outcome_status"] == "resolved" for event in all_events), "unresolved_events": sum(event["outcome_status"] == "unresolved_at_development_end" for event in all_events), "read_2025_2026": False, "e_drive_written": False, "elapsed_seconds": round(time.monotonic() - started, 6), "source_records": records}
-        fixture_ok = all(code in {row["sec_code"] for row in summary["daily"][target]["A6"]} for target, code in (("20240923", "300085"), ("20240926", "300339")))
+                rows.append(_v22_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, daily_consumed))
+            all_rows[target], ranked_by_target[target] = rows, rank_v22_channels(rows)
+            progress(f"selection:{target}", saved)
+        events: list[dict[str, Any]] = []
+        daily_by_target: dict[str, Any] = {}
+        for target in V22_MARKET_TARGETS:
+            unit, index = f"market:{target}", positions[target]
+            if unit in saved:
+                daily_by_target[target] = saved[unit]["daily"]
+                events.extend(saved[unit]["events"])
+                continue
+            ranked = ranked_by_target[target]
+            daily_by_target[target] = {"trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]), "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]], "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"]}
+            day = cache[target]
+            for channel, pool, selected in (("A", ranked["a_pool"], ranked["a_selected"]), ("B", ranked["b_pool"], ranked["b_selected"])):
+                for group, members in _v22_controls(pool, selected, channel).items():
+                    for rank, row in enumerate(members, 1):
+                        events.append(_v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {})))
+        _v22_resolve_events(events, calendar, load, lambda frontier, open_events: progress(f"exit:{frontier}", saved, open_events))
+        all_daily: list[dict[str, Any]] = []
+        completed = dict(saved)
+        for target in V22_MARKET_TARGETS:
+            unit = f"market:{target}"
+            if unit in completed:
+                continue
+            target_events = [event for event in events if event["trade_date"] == target]
+            result = {"daily": daily_by_target[target], "eligible_rows": [_public_row(row) for row in ranked_by_target[target]["a_pool"] + ranked_by_target[target]["b_pool"]], "events": target_events, "unit_consumed_input": _v22_checkpoint_identity(records, daily_consumed, target, positions[target], all_rows[target], target_events, calendar)}
+            _checkpoint(run_dir, run_hash, unit, result)
+            completed[unit] = result
+            progress(f"market:{target}", completed, sum(event["outcome_status"] == "open" for event in events))
+        for target in V22_MARKET_TARGETS:
+            all_daily.extend(completed[f"market:{target}"]["eligible_rows"])
+        aggregates = _v22_event_aggregates(events)
+        ledger, nav, account = _v22_sleeve_account(events, calendar)
+        verified = {unit: _verify_checkpoint_consumed_input(unit, result, records) for unit, result in sorted(completed.items())}
+        summary = {"execution_label": "tnm_v22_1_canary_verified", "targets": list(V22_MARKET_TARGETS), "run_hash": run_hash, "spec_hash": manifest["spec_hash"], "base_commit": manifest["base_commit"], "source_blob_identity": manifest["source_blob_identity"], "input_manifest_hash": manifest["input_manifest_hash"], "daily": daily_by_target, "event_count": len(events), "resolved_events": sum(event["outcome_status"] == "resolved" for event in events), "unresolved_events": sum(event["outcome_status"] == "unresolved_at_development_end" for event in events), "aggregates": aggregates, "account": account, "verified_checkpoint_consumed_identities": verified, "consumed_input_identity": _json_identity(verified), "read_2025_2026": False, "e_drive_written": False, "elapsed_seconds": round(time.monotonic() - started, 6), "source_records": records}
+        fixture_ok = all(code in {row["sec_code"] for row in daily_by_target[target]["A6"]} for target, code in (("20240923", "300085"), ("20240926", "300339")))
         if not fixture_ok:
             summary["execution_label"] = "diagnostic_changes_required"
         _write_json(run_dir / "v22_summary.json", summary)
         _write_csv_gz(run_dir / "daily_results.csv.gz", all_daily)
-        _write_csv_gz(run_dir / "event_results.csv.gz", all_events)
-        sleeves = [{"sleeve": f"A{index}", "cash": 5_000_000 / 9, "holding": False, "skipped": 0} for index in range(1, 7)] + [{"sleeve": f"B{index}", "cash": 5_000_000 / 9, "holding": False, "skipped": 0} for index in range(1, 4)]
-        _write_csv_gz(run_dir / "account_ledger.csv.gz", sleeves)
-        _write_csv_gz(run_dir / "account_nav.csv.gz", [{"trade_date": target, "nav": 5_000_000, "status": "canary_interface_only"} for target in V22_MARKET_TARGETS])
+        _write_csv_gz(run_dir / "event_results.csv.gz", events)
+        _write_csv_gz(run_dir / "account_ledger.csv.gz", ledger)
+        _write_csv_gz(run_dir / "account_nav.csv.gz", nav)
+        progress("aggregated", completed)
         artifacts = {path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)} for path in sorted(run_dir.iterdir()) if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}}
         _write_json(run_dir / "artifact_manifest.json", artifacts)
-        _write_json(run_dir / "completion.json", {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": summary["execution_label"], "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
+        _write_json(completion_path, {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": summary["execution_label"], "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
         return summary, run_dir
+    except KeyboardInterrupt:
+        if run_dir is not None and not preserve_existing_terminal:
+            _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash, "reason": "KeyboardInterrupt"})
+        raise
     except Exception as exc:
-        _write_json(run_dir / "completion.json", {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        if run_dir is not None and not preserve_existing_terminal:
+            _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
         raise
 
 
