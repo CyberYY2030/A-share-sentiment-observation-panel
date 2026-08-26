@@ -1555,15 +1555,19 @@ def _v22_checkpoint_identity(
 def _v22_verify_saved_units(run_dir: Path, run_hash: str, minute_root: str | Path) -> dict[str, Any]:
     saved: dict[str, Any] = {}
     source_records: dict[str, dict[str, Any]] = {}
+    checkpoints = []
+    required_members: dict[str, set[str]] = defaultdict(set)
     for path in sorted((run_dir / "checkpoints").glob("market_*.json")) if (run_dir / "checkpoints").exists() else []:
         checkpoint = json.loads(path.read_text(encoding="utf-8"))
         if checkpoint.get("run_hash") != run_hash:
             raise TailDataError("v22_checkpoint_hash_mismatch")
         result = checkpoint.get("result", {})
-        expected = result.get("unit_consumed_input", {})
-        for day, codes in expected.get("minute_members", {}).items():
-            if day not in source_records:
-                _, source_records[day] = load_day_v2_statistics(minute_root, day, set(codes))
+        checkpoints.append((checkpoint, result))
+        for day, codes in result.get("unit_consumed_input", {}).get("minute_members", {}).items():
+            required_members[str(day)].update(str(code) for code in codes)
+    for day, codes in sorted(required_members.items()):
+        _, source_records[day] = load_day_v2_statistics(minute_root, day, codes)
+    for checkpoint, result in checkpoints:
         _verify_checkpoint_consumed_input(str(checkpoint["unit"]), result, source_records)
         saved[str(checkpoint["unit"])] = result
     return saved
@@ -1616,6 +1620,7 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
         progress("input_frozen", saved)
         all_rows: dict[str, list[dict[str, Any]]] = {}
         ranked_by_target: dict[str, dict[str, Any]] = {}
+        preselected: dict[str, tuple[int, dict[str, dict[str, Any]], set[str]]] = {}
         for target in V22_MARKET_TARGETS:
             unit, index = f"market:{target}", positions[target]
             if unit in saved:
@@ -1623,8 +1628,23 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
             day, d1 = load(target, None), load(calendar[index - 1], None)
             pre = {code: _v22_preselection(code, day.get(code), d1.get(code)) for code in day}
             evaluation = {code for code, proof in pre.items() if proof["survives"]}
-            for dependency in calendar[index - 10:index - 1]:
-                load(dependency, evaluation)
+            preselected[target] = (index, day, evaluation)
+
+        evaluation_union = set().union(*(evaluation for _, _, evaluation in preselected.values())) if preselected else set()
+        shared_history_dates = {
+            dependency
+            for target, (index, _, _) in preselected.items()
+            for dependency in calendar[index - 10:index - 1]
+        }
+        for dependency in sorted(shared_history_dates, key=calendar.index):
+            load(dependency, evaluation_union)
+
+        for target in V22_MARKET_TARGETS:
+            unit = f"market:{target}"
+            if unit in saved:
+                continue
+            index, day, evaluation = preselected[target]
+            d1 = cache[calendar[index - 1]]
             rows = []
             for code in sorted(evaluation):
                 prior = [cache[value].get(code) for value in calendar[index - 10:index - 1]] + [d1.get(code)]

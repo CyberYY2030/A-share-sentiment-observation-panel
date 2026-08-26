@@ -240,6 +240,66 @@ class TailNextMorningV2Tests(unittest.TestCase):
             final = {path.relative_to(run_dir).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns) for path in run_dir.rglob("*") if path.is_file()}
             self.assertEqual(after, final)
 
+    def test_v22_runner_unions_shared_history_but_isolates_checkpoint_members(self) -> None:
+        """Two targets may share a container without reusing each other's input proof."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [
+            "20240902", "20240903", "20240904", "20240905", "20240906", "20240909", "20240910", "20240911",
+            "20240912", "20240913", "20240923", "20240924", "20240925", "20240926", "20240927", "20240930",
+        ]
+        positions = {"20240923": 10, "20240926": 13}
+        first = {"300085", "300700", "300701", "300702", "300703", "300704"}
+        second = {"300339", "300710", "300711", "300712", "300713", "300714"}
+        universe = first | second
+        a_day, a_prior = a_inputs()
+        calls: dict[str, int] = {}
+        requested_by_day: dict[str, set[str]] = {}
+        content_token = {"value": "original"}
+
+        def future() -> dict:
+            value = copy.deepcopy(a_prior[-1])
+            value["a_exit"] = {"decision_status": "ready", "decision_close": 10.9, "sell": {"status": "ready", "vwap": 10.8}, "decision_window": "10:29-10:30", "sell_window": "10:30-10:35"}
+            return value
+
+        def fake_load(_root, trade_date, codes=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            requested = set(universe) if codes is None else set(codes)
+            requested_by_day.setdefault(trade_date, requested)
+            values = {}
+            for code in requested:
+                if trade_date in positions:
+                    value = copy.deepcopy(a_day)
+                    value["_survives"] = code in (first if trade_date == "20240923" else second)
+                elif trade_date in {"20240924", "20240927"}:
+                    value = future()
+                else:
+                    value = copy.deepcopy(a_prior[calendar.index(trade_date) % len(a_prior)])
+                values[code] = value
+            digests = {code: hashlib.sha256(f"{content_token['value']}|{trade_date}|{code}".encode()).hexdigest() for code in requested}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": digests}
+
+        def fake_preselection(_code, day, _d1):
+            return {"survives": bool(day and day.get("_survives"))}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "_v22_preselection", side_effect=fake_preselection), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            summary, run_dir = run_v22_canary("synthetic", "synthetic", temporary)
+            self.assertEqual("tnm_v22_1_canary_verified", summary["execution_label"])
+            self.assertEqual(6, len(summary["daily"]["20240923"]["A6"]))
+            self.assertEqual(6, len(summary["daily"]["20240926"]["A6"]))
+            self.assertEqual(1, calls["20240910"])
+            self.assertEqual(universe, requested_by_day["20240910"])
+            self.assertEqual(1, calls["20240924"])
+            self.assertEqual(universe, requested_by_day["20240924"])
+            left = json.loads((run_dir / "checkpoints" / "market_20240923.json").read_text(encoding="utf-8"))["result"]["unit_consumed_input"]["minute_members"]
+            right = json.loads((run_dir / "checkpoints" / "market_20240926.json").read_text(encoding="utf-8"))["result"]["unit_consumed_input"]["minute_members"]
+            self.assertEqual(first, set(left["20240905"]))
+            self.assertEqual(second, set(right["20240905"]))
+            self.assertEqual(second, set(right["20240924"]))
+            content_token["value"] = "rewritten"
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch"):
+                run_v22_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+
     def test_v22_runner_keyboard_interrupt_writes_cancelled_terminal(self) -> None:
         from mining import tail_next_morning_v2 as module
         calendar = [f"202409{day:02d}" for day in range(2, 16)]

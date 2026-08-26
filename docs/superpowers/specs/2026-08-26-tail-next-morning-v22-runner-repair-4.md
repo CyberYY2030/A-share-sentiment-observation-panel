@@ -32,4 +32,20 @@ Terra 白名单仅 V2 module/test及本卡第3节。禁止E盘/真实identity；
 
 ## 执行证据
 
-尚未执行。经济定义、统计、退出及其他已通过代码禁止改变。shared dirty保持，不push。Lessons：`skip`。
+### TNM-V2.2-1F4（Terra，2026-08-26）
+
+状态：`tnm_v22_1f4_runner_verified`。修复将 V22 market 选择拆为两个阶段：先对全部
+target 的 D/D-1 完成预筛，再按 `evaluation_union` 一次加载任一 target 的共享历史日期；
+退出仍沿用既有全局按日期扫描和严格 reopen guard。checkpoint 继续从共享 source record
+按各 unit 实际选择/退出成员裁剪；saved checkpoint 验证也先合并成员后每日期只读取一次。
+
+新增生产链合成回归使用两个 target 的不同 survivor 集，证明重叠历史日期及
+`target1` 退出/`target2` 历史重叠日期各只打开一次、请求完整 union、两个 target 均完成，
+且两个 checkpoint 的成员身份隔离；等成员内容改写后 resume 被
+`consumed_input_identity_mismatch` 拒绝。
+
+本地验证：Python 3.11 `tests.test_tail_next_morning_v2` 45 passed / 1 skipped；
+`tests.test_tail_next_morning` 25 passed；`py_compile` 通过；`git diff --check` 通过。
+未读取 E 盘、未创建真实 canary identity；旧 FAILED attempt
+`v22-canary-3178f827ce5b-fc4e02daa3a3` 未改动。经济定义、统计和退出规则未修改；
+shared dirty 保持，未 push。Lessons：`skip`。
