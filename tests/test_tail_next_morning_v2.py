@@ -48,8 +48,10 @@ from mining.tail_next_morning_v2 import (
     _v22_group_metrics,
     _v22_event_aggregates,
     _v22_slot_weights,
+    _v22_development_input_manifest,
     main,
     run_v22_canary,
+    run_v22_development,
 )
 
 
@@ -299,6 +301,104 @@ class TailNextMorningV2Tests(unittest.TestCase):
             content_token["value"] = "rewritten"
             with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch"):
                 run_v22_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+
+    def test_v22_development_streams_replays_and_matches_canary_targets(self) -> None:
+        """The development chain keeps one source open and preserves the approved two-day economics."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923", "20240924", "20240925", "20240926", "20240927", "20240930"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        a_day, a_prior = a_inputs()
+        calls: dict[str, int] = {}
+        content = {"value": "original"}
+        interrupt_once = {"enabled": False}
+
+        def fake_load(_root, trade_date, requested_codes=None):
+            if interrupt_once["enabled"] and trade_date == "20240925":
+                interrupt_once["enabled"] = False
+                raise KeyboardInterrupt
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            requested = set(codes) if requested_codes is None else set(requested_codes)
+            index = positions[trade_date]
+            values = {}
+            for code in requested:
+                value = copy.deepcopy(a_day if index >= 10 else a_prior[index])
+                if index > 10:
+                    value["a_exit"] = {"decision_status": "ready", "decision_close": 10.9, "sell": {"status": "ready", "vwap": 10.8}, "decision_window": "10:29-10:30", "sell_window": "10:30-10:35"}
+                values[code] = value
+            digests = {code: hashlib.sha256(f"{content['value']}|{trade_date}|{code}".encode()).hexdigest() for code in requested}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": digests}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_input_manifest", return_value=manifest), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            canary, canary_dir = run_v22_canary("synthetic", "synthetic", temporary)
+            calls.clear()
+            development, run_dir = run_v22_development("synthetic", "synthetic", temporary)
+            self.assertEqual("tnm_v22_development_completed", development["execution_label"])
+            self.assertTrue(all(count == 1 for count in calls.values()))
+            self.assertLessEqual(development["max_cached_market_days"], 11)
+            for target in ("20240923", "20240926"):
+                self.assertEqual(canary["daily"][target]["A_eligible_count"], development["daily"][target]["A_eligible_count"])
+                self.assertEqual(canary["daily"][target]["B_eligible_count"], development["daily"][target]["B_eligible_count"])
+                self.assertEqual(canary["daily"][target]["A6"], development["daily"][target]["A6"])
+                self.assertEqual(canary["daily"][target]["B3"], development["daily"][target]["B3"])
+            def economic_events(path):
+                frame = pd.read_csv(path, compression="gzip", dtype=str).fillna("")
+                columns = ["trade_date", "sec_code", "channel", "strategy_or_control", "rank", "bought", "outcome_status", "exit_price", "gross_return", "net_return", "holding_days", "exit_trade_date", "exit_window"]
+                return sorted(tuple(row[column] for column in columns) for _, row in frame[frame["trade_date"].isin(["20240923", "20240926"])].iterrows())
+            self.assertEqual(economic_events(canary_dir / "event_results.csv.gz"), economic_events(run_dir / "event_results.csv.gz"))
+            ledger = pd.read_csv(run_dir / "account_ledger.csv.gz", compression="gzip", dtype=str)
+            on_20240924 = ledger[ledger["trade_date"].astype(str) == "20240924"]["action"].tolist()
+            self.assertIn("sell", on_20240924)
+            self.assertIn("buy", ledger["action"].tolist())
+            self.assertTrue((run_dir / "outcomes" / "20240924.json").exists())
+            self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+            before = {path.relative_to(run_dir).as_posix(): path.read_bytes() for path in run_dir.rglob("*") if path.is_file()}
+            with patch.object(module, "rank_v22_channels", side_effect=AssertionError("fast path recalculated")):
+                replay, replay_dir = run_v22_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+            self.assertEqual(development, replay)
+            self.assertEqual(run_dir, replay_dir)
+            self.assertEqual(before, {path.relative_to(run_dir).as_posix(): path.read_bytes() for path in run_dir.rglob("*") if path.is_file()})
+            content["value"] = "equal_size_rewrite"
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch"):
+                run_v22_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+            content["value"] = "original"
+            interrupt_once["enabled"] = True
+            with tempfile.TemporaryDirectory() as interrupted_root:
+                with self.assertRaises(KeyboardInterrupt):
+                    run_v22_development("synthetic", "synthetic", interrupted_root)
+                interrupted_dir = next(Path(interrupted_root).glob("v22-development-*"))
+                self.assertEqual("CANCELLED", json.loads((interrupted_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+                resumed, _ = run_v22_development("synthetic", "synthetic", interrupted_root, resume_run_id=interrupted_dir.name)
+                self.assertEqual("tnm_v22_development_completed", resumed["execution_label"])
+                self.assertEqual("CANCELLED", json.loads((interrupted_dir / "completion.cancelled.json").read_text(encoding="utf-8"))["status"])
+                self.assertFalse((interrupted_dir / "run.lock").exists())
+
+    def test_v22_development_year_guard_and_cli_contract(self) -> None:
+        with self.assertRaisesRegex(Exception, "v22_development_year_guard:20250102"):
+            _v22_development_input_manifest("synthetic", "synthetic", ["20250102"])
+        with patch("mining.tail_next_morning_v2.run_v22_development", return_value=({"execution_label": "tnm_v22_development_completed"}, Path("synthetic"))) as runner:
+            self.assertEqual(0, main(["v22-development", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "development-id"]))
+        self.assertEqual("development-id", runner.call_args.kwargs["resume_run_id"])
+
+    def test_v22_development_marks_terminal_open_events_unresolved(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923", "20240924"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        a_day, a_prior = a_inputs()
+
+        def fake_load(_root, trade_date, requested_codes=None):
+            requested = set(codes) if requested_codes is None else set(requested_codes)
+            index = positions[trade_date]
+            return {code: copy.deepcopy(a_day if index >= 10 else a_prior[index]) for code in requested}, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"{trade_date}|{code}".encode()).hexdigest() for code in requested}}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            summary, run_dir = run_v22_development("synthetic", "synthetic", temporary)
+        self.assertEqual(24, summary["event_count"])
+        self.assertEqual(24, summary["unresolved_events"])
+        self.assertEqual("blocked_unresolved_account", summary["account"]["status"])
 
     def test_v22_runner_keyboard_interrupt_writes_cancelled_terminal(self) -> None:
         from mining import tail_next_morning_v2 as module

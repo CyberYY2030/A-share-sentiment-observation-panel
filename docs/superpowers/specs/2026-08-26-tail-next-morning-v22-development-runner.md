@@ -65,4 +65,22 @@ SUCCEEDED 后 Terra 只读验收终态、目标/checkpoint/outcome 数、经济�
 
 ## 7. 执行证据
 
-尚未执行。
+### TNM-V2.2 开发 runner 实现（Terra，2026-08-26）
+
+状态：`tnm_v22_development_runner_verified`。新增 `v22-development`，直接复用已批准的
+V22 gate、score、A6/B3、三个 same-N controls、买入/动态退出、30bps、九袖套和 aggregates。
+该 runner 仅发现/冻结 2023～2024 交易日，按日单向读取完整容器，最多缓存 11 个全市场日；
+每个 signal 日写不可变 checkpoint，退出更新写独立 outcome journal，resume 前复核选择与退出
+实际消费的分钟成员和日 K 内容身份。独立 development run hash 绑定经济规格、执行卡冻结部分、
+代码和输入 manifest；`run.lock` 为 JSON owner，`CANCELLED` 的原终态保留为
+`completion.cancelled.json` 后才允许显式恢复。
+
+合成生产链覆盖：2023/2024 与 D-10/D+1 边界、2025 年界拒绝、单容器单开/11 日缓存、
+上午退出先于当日下午信号、A/B 状态、阶段末 unresolved、checkpoint/outcome 回放、
+等长内容改写拒绝 resume、CANCELLED→显式恢复、canary 20240923/20240926 的 eligible count、
+A6/B3 及 event economics 完全一致，以及 controls/coverage/固定槽/九袖套/原子终态。
+
+本地验证：Python 3.11 `tests.test_tail_next_morning_v2` 48 passed / 1 skipped；
+`tests.test_tail_next_morning` 25 passed；`py_compile` 通过；`git diff --check` 通过。
+全程未读取 E 盘、未创建真实 development/preflight/canary identity、未读取 2025/2026、无任务进程。
+shared dirty 保持，未 push。后续真实批仍须按第 6 节另行批准。Lessons：`skip`。
