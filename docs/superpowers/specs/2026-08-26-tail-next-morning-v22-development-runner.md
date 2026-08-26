@@ -116,3 +116,21 @@ progress 的 source_frontier/completed_units/open_exit_events/updated_at、compl
 `run_id` 必须在获批 launch HEAD 下由完整 input manifest 计算；本 preflight 的 docs-only commit
 会改变 `base_commit`，所以不得把 preflight 前的 identity 当作可启动 identity。未启动 runner、
 未生成经济结果、未写 E 盘、无任务进程。等待规划会话批准 launch。Lessons：`skip`。
+
+### TNM-V2.2 development 唯一 detached launch（Terra，2026-08-26）
+
+状态：`tnm_v22_development_launch_blocked`。唯一启动命令使用 Python 3.11、隐藏窗口和
+`Start-Process -PassThru`，于 `2026-08-26T05:44:53.0509001Z` 启动 PID `65952`；stdout/stderr
+分别为 `output/tail-next-morning-v2/development/v22-development-launch-20260826T054453Z.stdout.log`
+及同名 `.stderr.log`。唯一 identity 为
+`v22-development-8fffe4a3fba4-969e9d05cd0a`，run hash 为
+`969e9d05cd0a55e75494cdbf33c5b9c2e9c61345127455f4e547da6e1d82faff`，base commit 为
+`4a803a05e5335e31cb2b7af0331dff1fc94955e5`，source blobs 与 preflight 一致，input manifest hash 为
+`45aaeaed69e27f44d53989085cee2893da64160d970e920b7416679cb7ff4a57`。
+
+启动后 `run_manifest.json` 已原子写入，progress 为 `input_frozen`、completed=0；随后首次读取
+`20230103` 即因 `load_day_v2_statistics` 抛出 `v2_canary_year_guard:20230103`。`completion.json`
+为原子 `FAILED/TailDataError`，stderr 1,458 bytes；无 checkpoint、无经济结果、无 `run.lock`，PID
+已退出。该失败表明 development runner 仍错误复用了 canary 的 2024 年界，属于 P1；旧失败 identity、
+manifest、progress、completion 和日志全部保留，禁止 resume、第二次启动或读取 2025/2026。需新修复卡、
+合成回归和独立审核后才可重新申请 launch。Lessons：`create` 候选（development loader 年界必须与 mode 一致）。
