@@ -19,13 +19,16 @@ from mining.tail_next_morning_v2 import (
     A_RET1450_MIN,
     MIN_D1_AMOUNT,
     _checkpoint,
+    _content_identity,
     _prepare_canary_run,
     _spec_hash,
+    _standard_limit_evidence,
     _v2_statistics_from_frame,
     build_signal_row,
     load_day_v2_statistics,
     necessary_preselection,
     outcome_from_frames,
+    outcome_from_statistics,
     rank_channels,
     run_canary,
 )
@@ -52,14 +55,16 @@ def stat(*, close=10.0, high=10.5, low=9.5, amount=100_000_000.0, full_amount=30
 
 
 def a_inputs(*, d1_amount=300_000_000.0) -> tuple[dict, list[dict]]:
-    prior = [stat(close=10.0, high=10.6, low=9.4, amount=100_000_000.0, full_amount=300_000_000.0) for _ in range(10)]
+    prior = [stat(close=10.0, high=10.1, low=9.9, amount=100_000_000.0, full_amount=300_000_000.0) for _ in range(10)]
     prior[-1]["history"]["full_amount"] = d1_amount
-    day = stat(close=10.5, high=10.6, low=10.0, amount=200_000_000.0, open_=10.0)
+    day = stat(close=10.5, high=10.9, low=10.0, amount=200_000_000.0, open_=10.0)
     return day, prior
 
 
 def b_inputs(*, d1_amount=300_000_000.0) -> tuple[dict, list[dict]]:
     prior = [stat(close=10.0, high=12.0, low=9.6, amount=100_000_000.0, full_amount=300_000_000.0) for _ in range(10)]
+    for value in prior:
+        value["signal"].update({"high": 10.2, "low": 9.8, "range1450": 10.2 / 9.8 - 1.0})
     prior[-1]["history"].update({"close": 10.8, "full_amount": d1_amount})
     day = stat(close=11.0, high=11.2, low=10.0, amount=50_000_000.0, open_=10.5)
     return day, prior
@@ -76,6 +81,78 @@ def raw_frame(*, close=10.0) -> pd.DataFrame:
 
 
 class TailNextMorningV2Tests(unittest.TestCase):
+    def test_standard_limit_fen_touch_and_post_1450_isolation(self) -> None:
+        self.assertEqual(11.0, _standard_limit_evidence("600001", 10.0, 10.995)["limit_up_price"])
+        self.assertTrue(_standard_limit_evidence("600001", 10.0, 10.995)["tail_limit_touch"])
+        self.assertEqual(12.0, _standard_limit_evidence("300001", 10.0, 11.995)["limit_up_price"])
+        self.assertFalse(_standard_limit_evidence("300001", 10.0, 11.994)["tail_limit_touch"])
+        before = _v2_statistics_from_frame(raw_frame(close=10.0))
+        future = raw_frame(close=10.0)
+        future.loc[230, "high"] = 20.0
+        after = _v2_statistics_from_frame(future)
+        self.assertEqual(before["signal"], after["signal"])
+
+    def test_tail_boundary_and_new_a_gates_and_score(self) -> None:
+        day, prior = a_inputs()
+        row = build_signal_row("300801", day, prior, LISTED)
+        self.assertTrue(row["a_shape_pass"])
+        exact = copy.deepcopy(day)
+        exact["signal"]["tail_return"] = -0.03
+        self.assertTrue(build_signal_row("300801", exact, prior, LISTED)["a_shape_pass"])
+        below = copy.deepcopy(exact)
+        below["signal"]["tail_return"] = math.nextafter(-.03, -math.inf)
+        self.assertIn("tail_return<-0.03", build_signal_row("300801", below, prior, LISTED)["a_failure_reasons"])
+        for key, value, reason in (("open", 10.5, "close1450<=open_D"), ("range1450", .01, "range_expansion<1.50")):
+            altered = copy.deepcopy(day)
+            altered["signal"][key] = value
+            self.assertIn(reason, build_signal_row("300801", altered, prior, LISTED)["a_failure_reasons"])
+        no_structure = copy.deepcopy(day)
+        no_structure["signal"]["close"] = 10.4
+        no_structure["signal"]["high"] = 10.9
+        no_structure_prior = copy.deepcopy(prior)
+        for value in no_structure_prior:
+            value["history"]["high"] = 10.5
+        self.assertIn("trend_structure_failed", build_signal_row("300801", no_structure, no_structure_prior, LISTED)["a_failure_reasons"])
+        rows = [build_signal_row(f"3008{index:02d}", *a_inputs(), LISTED) for index in range(3)]
+        rows[1]["position1450"], rows[1]["vwap_dist"] = .99, .99
+        ranked = rank_channels(rows)
+        self.assertEqual(ranked["a_pool"][0]["score_A"], ranked["a_pool"][1]["score_A"])
+
+    def test_b_new_gates_pool_top10_and_no_code_economic_tie(self) -> None:
+        day, prior = b_inputs()
+        self.assertTrue(build_signal_row("300901", day, prior, LISTED)["b_shape_pass"])
+        for key, value, reason in (("open", 10.95, "body1450<0.01"), ("range1450", .01, "range_expansion<1.00")):
+            altered = copy.deepcopy(day)
+            altered["signal"][key] = value
+            self.assertIn(reason, build_signal_row("300901", altered, prior, LISTED)["b_failure_reasons"])
+        rows = [build_signal_row(f"3009{index:02d}", *b_inputs(), LISTED) for index in range(12)]
+        ranked = rank_channels(rows, b_limit=10)
+        self.assertEqual(12, len(ranked["b_pool"]))
+        self.assertEqual(12, len(ranked["b_selected"]))
+        self.assertTrue(ranked["b_boundary_tie_expanded"])
+
+    def test_outcome_windows_degrade_independently(self) -> None:
+        day, _ = a_inputs()
+        next_stat = {
+            "morning_label": {"status": "invalid"},
+            "fixed_sell": {"status": "ready", "vwap": 11.0},
+        }
+        morning_bad = outcome_from_statistics(day, next_stat)
+        self.assertEqual("unavailable_morning_label", morning_bad["outcome_status"])
+        self.assertAlmostEqual(11.0 / day["buy"]["vwap"] - 1, morning_bad["gross_fixed_exit"])
+        next_stat = {
+            "morning_label": {"status": "ready", "next_open": 10.5, "high": 11.0, "low": 10.0},
+            "fixed_sell": {"status": "invalid_window"},
+        }
+        sell_bad = outcome_from_statistics(day, next_stat)
+        self.assertEqual("unavailable_fixed_exit", sell_bad["outcome_status"])
+        self.assertIsNotNone(sell_bad["intraday_mfe_0930_1000"])
+
+    def test_consumed_content_identity_changes_with_member_bytes(self) -> None:
+        before = _content_identity({"minute_members": {"sha256": hashlib.sha256(b"before").hexdigest()}})
+        after = _content_identity({"minute_members": {"sha256": hashlib.sha256(b"after").hexdigest()}})
+        self.assertNotEqual(before, after)
+
     def test_a_shape_and_strict_d1_liquidity(self) -> None:
         day, prior = a_inputs(d1_amount=MIN_D1_AMOUNT)
         row = build_signal_row("300001", day, prior, LISTED)
@@ -92,10 +169,9 @@ class TailNextMorningV2Tests(unittest.TestCase):
         altered["signal"].update({"tail_return": -0.25, "tail_location": 0.0})
         diagnostic_only = build_signal_row("300004", altered, prior, LISTED)
         self.assertTrue(baseline["a_shape_pass"])
-        self.assertEqual(
-            {key: baseline[key] for key in ("eligible_pass", "ret1450", "activity", "position1450")},
-            {key: diagnostic_only[key] for key in ("eligible_pass", "ret1450", "activity", "position1450")},
-        )
+        self.assertTrue(baseline["eligible_pass"])
+        self.assertFalse(diagnostic_only["eligible_pass"])
+        self.assertIn("tail_return<-0.03", diagnostic_only["a_failure_reasons"])
         day["signal"]["close"] = 10.39
         self.assertIn("ret1450<0.04", build_signal_row("300004", day, prior, LISTED)["a_failure_reasons"])
         day, prior = a_inputs()
@@ -150,7 +226,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
         for code in ("300099", "300001", "300050", "300002"):
             day, prior = a_inputs()
             rows.append(build_signal_row(code, day, prior, LISTED))
-        ranked = rank_channels(rows)
+        ranked = rank_channels(rows, a_limit=3)
         self.assertEqual(4, len(ranked["a_selected"]))
         self.assertTrue(ranked["a_boundary_tie_expanded"])
         self.assertEqual(["300001", "300002", "300050", "300099"], [row["sec_code"] for row in ranked["a_selected"]])
@@ -167,7 +243,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
             day, prior = b_inputs()
             day["signal"]["close"] = close
             rows.append(build_signal_row(code, day, prior, LISTED))
-        ranked = rank_channels(rows)
+        ranked = rank_channels(rows, b_limit=2)
         self.assertEqual(3, len(ranked["b_pool"]))
         self.assertTrue(all("pool_rank" in row for row in ranked["b_pool"]))
 
@@ -178,7 +254,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
             day["signal"]["close"] = close
             day["signal"]["high"] = 11.2
             rows.append(build_signal_row(f"30012{index}", day, prior, LISTED))
-        ranked = rank_channels(rows)
+        ranked = rank_channels(rows, b_limit=2)
         members = ranked["b_selected"]
         self.assertLessEqual(len(members), 2)
         self.assertTrue(all(row["b_shape_pass"] and row["eligible_pass"] and math.isfinite(row["score_B"]) for row in members))
@@ -249,7 +325,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
         text = card.read_text(encoding="utf-8")
         with tempfile.TemporaryDirectory() as temporary:
             copied = Path(temporary) / "card.md"
-            copied.write_text(text + "\nTNM-V2-1 test evidence\n", encoding="utf-8")
+            copied.write_text(text + "\nTNM-V2-R1 test evidence\n", encoding="utf-8")
             original_card = module.TASK_CARD
             module.TASK_CARD = copied
             try:

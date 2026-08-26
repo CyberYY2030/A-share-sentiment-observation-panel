@@ -13,6 +13,7 @@ import argparse
 from collections import defaultdict
 from datetime import date, timedelta, datetime, timezone
 import csv
+from decimal import Decimal, ROUND_HALF_UP
 import gzip
 import hashlib
 import io
@@ -43,20 +44,20 @@ from mining.tail_next_morning import (
 )
 
 
-TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-25-tail-next-morning-v2-task-cards.md"
+TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-revision-task-card.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
 MIN_D1_AMOUNT = 200_000_000.0
-A_LIMIT = 3
-B_LIMIT = 2
+A_LIMIT = 10
+B_LIMIT = 10
 A_RET1450_MIN = 0.04
 POSITION1450_MIN = 0.55
 A_VWAP_DIST_MIN = 0.01
 FIXTURES = {
     ("20240923", "300085"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
     ("20240926", "300339"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
-    ("20240826", "300972"): {"b_shape_pass": True, "liquidity_pass": False, "not_selected": True},
+    ("20240826", "300972"): {"b_shape_pass": False, "liquidity_pass": False, "not_selected": True},
     ("20240827", "300972"): {"b_shape_pass": False, "reason_contains": "position1450<0.55", "liquidity_pass": False},
     ("20240813", "300328"): {"b_shape_pass": True, "liquidity_pass": True},
 }
@@ -92,7 +93,7 @@ def _sha256(path: Path) -> str:
 
 def _spec_hash() -> str:
     text = TASK_CARD.read_text(encoding="utf-8").replace("\r\n", "\n")
-    definition, marker, _ = text.partition("## 11. 执行结果")
+    definition, marker, _ = text.partition("## 11. 执行证据")
     if not marker:
         raise TailDataError("v2_task_card_execution_marker_missing")
     return hashlib.sha256(definition.encode("utf-8")).hexdigest()
@@ -113,6 +114,33 @@ def _code_identity() -> dict[str, str]:
     module = Path(__file__).resolve()
     test = module.parents[1] / "tests" / "test_tail_next_morning_v2.py"
     return {"module_blob": _git_blob(module), "test_blob": _git_blob(test)}
+
+
+def _content_identity(records: Mapping[str, Mapping[str, str]]) -> str:
+    """Stable identity of exactly the source members/workbooks actually read."""
+    return hashlib.sha256(_json_bytes({key: dict(value) for key, value in sorted(records.items())})).hexdigest()
+
+
+def _standard_limit_rate(code: str) -> float:
+    return 0.20 if canonical_code(code).startswith(("300", "301", "688", "689")) else 0.10
+
+
+def _fen(value: float) -> int:
+    return int((Decimal(str(value)) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def _standard_limit_evidence(code: str, d1_close: float, tail_high: float) -> dict[str, Any]:
+    """Compare prices in integer fen: no float boundary ambiguity at a limit."""
+    rate = _standard_limit_rate(code)
+    limit_fen = _fen(float(d1_close) * (1.0 + rate))
+    high_fen = _fen(float(tail_high))
+    return {
+        "limit_rate": rate,
+        "limit_up_price": limit_fen / 100.0,
+        "tail_high": float(tail_high),
+        "tail_limit_touch": high_fen >= limit_fen,
+        "st_limit_filter_status": "unproven_standard_board_rule_applied",
+    }
 
 
 def _code_hash(identity: Mapping[str, str]) -> str:
@@ -184,6 +212,7 @@ def _v2_statistics_from_frame(raw: pd.DataFrame) -> dict[str, Any]:
             "volume": volume,
             "range1450": float(high / low - 1.0),
             "tail_return": float(tail.iloc[-1]["close"] / tail.iloc[0]["open"] - 1.0),
+            "tail_high": float(tail["high"].max()),
             "tail_location": float((tail.iloc[-1]["close"] - tail["low"].min()) / (tail["high"].max() - tail["low"].min()))
             if float(tail["high"].max() - tail["low"].min()) > 0
             else None,
@@ -229,6 +258,7 @@ def load_day_v2_statistics(
     source, source_kind = locate_day_source(minute_root, key)
     requested = None if codes is None else {canonical_code(code) for code in codes if is_a_share_code(code)}
     result: dict[str, dict[str, Any]] = {}
+    member_digests: dict[str, str] = {}
     duplicates: set[str] = set()
     if source_kind == "zip":
         with zipfile.ZipFile(source) as archive:
@@ -244,7 +274,12 @@ def load_day_v2_statistics(
                 else:
                     members[code] = name
             for code, name in members.items():
-                result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"} if code in duplicates else _stats_from_payload(archive.read(name))
+                if code in duplicates:
+                    result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"}
+                else:
+                    payload = archive.read(name)
+                    member_digests[code] = hashlib.sha256(payload).hexdigest()
+                    result[code] = _stats_from_payload(payload)
     else:
         members: dict[str, Path] = {}
         for item in sorted(source.rglob("*.csv")):
@@ -256,7 +291,12 @@ def load_day_v2_statistics(
             else:
                 members[code] = item
         for code, item in members.items():
-            result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"} if code in duplicates else _stats_from_payload(item.read_bytes())
+            if code in duplicates:
+                result[code] = {"status": "invalid", "reason": "ambiguous_minute_code_file"}
+            else:
+                payload = item.read_bytes()
+                member_digests[code] = hashlib.sha256(payload).hexdigest()
+                result[code] = _stats_from_payload(payload)
     if requested is not None:
         for code in requested - set(result):
             result[code] = {"status": "invalid", "reason": "minute_code_missing"}
@@ -270,6 +310,8 @@ def load_day_v2_statistics(
         "universe_count": len(result),
         "parsed_code_count": len(result),
         "invalid_file_count": sum(value.get("status") != "ready" for value in result.values()),
+        "consumed_member_sha256": member_digests,
+        "consumed_member_identity": hashlib.sha256(_json_bytes(member_digests)).hexdigest(),
     }
 
 
@@ -296,6 +338,7 @@ def _base_row(code: str, day: Mapping[str, Any] | None, prior: list[Mapping[str,
         "failure_reasons": [],
         "st_filter_applied": False,
         "st_status": "unavailable_not_filtered",
+        "st_limit_filter_status": "unproven_standard_board_rule_applied",
         "corporate_action_filter": "unproven_not_applied",
     }
     if not is_a_share_code(code):
@@ -321,6 +364,7 @@ def _base_row(code: str, day: Mapping[str, Any] | None, prior: list[Mapping[str,
         row["failure_reasons"].append("non_positive_common_denominator")
         return row
     prev_ma10 = float(pd.Series([value["history"]["close"] for value in previous]).mean())
+    prev_ma5 = float(pd.Series([value["history"]["close"] for value in previous[-5:]]).mean())
     range_median = float(pd.Series([value["signal"]["range1450"] for value in previous]).median())
     activity_denominator = float(pd.Series([value["signal"]["amount"] for value in previous[-3:]]).median())
     pullback_denominator = float(max(value["signal"]["amount"] for value in previous[-5:]))
@@ -335,6 +379,7 @@ def _base_row(code: str, day: Mapping[str, Any] | None, prior: list[Mapping[str,
         "amount1450": amount1450,
         "prev_close": prev_close,
         "prev_ma10": prev_ma10,
+        "prev_ma5": prev_ma5,
         "range_expansion": float(signal["range1450"]) / range_median,
         "activity": amount1450 / activity_denominator,
         "tail_return": signal.get("tail_return"),
@@ -349,6 +394,7 @@ def _base_row(code: str, day: Mapping[str, Any] | None, prior: list[Mapping[str,
         "close1450": close1450,
     }
     metrics["vwap_dist"] = close1450 / metrics["vwap1450"] - 1.0
+    metrics.update(_standard_limit_evidence(code, prev_close, float(signal.get("tail_high", signal["high"]))))
     row.update(metrics)
     row["common_quality_pass"] = True
     row["liquidity_pass"] = metrics["d1_amount"] > MIN_D1_AMOUNT
@@ -363,10 +409,15 @@ def _a_shape(row: dict[str, Any]) -> None:
         return
     gates = (
         (row["ret1450"] >= A_RET1450_MIN, "ret1450<0.04"),
+        (row["close1450"] > row["open_D"], "close1450<=open_D"),
         (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
         (row["vwap_dist"] >= A_VWAP_DIST_MIN, "vwap_dist<0.01"),
         (row["activity"] >= 1.50, "activity<1.50"),
+        (row["range_expansion"] >= 1.50, "range_expansion<1.50"),
         (row["close1450"] > row["prev_ma10"], "close1450<=prev_ma10"),
+        (float(row["tail_return"]) >= -0.03, "tail_return<-0.03"),
+        (not bool(row["tail_limit_touch"]), "tail_limit_touch"),
+        (row["close1450"] >= row["prior10_high"] or (row["prev_ma5"] > row["prev_ma10"] and row["close1450"] > row["prev_ma5"]), "trend_structure_failed"),
     )
     row["a_failure_reasons"] = [reason for passed, reason in gates if not passed]
     row["a_shape_pass"] = not row["a_failure_reasons"]
@@ -383,6 +434,10 @@ def _b_shape(row: dict[str, Any]) -> None:
         (row["pullback_volume_ratio"] <= 0.80, "pullback_volume_ratio>0.80"),
         (row["close1450"] > max(row["prev_close"], row["open_D"]), "close1450<=max(open_D,prev_close)"),
         (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
+        (row["body1450"] >= 0.01, "body1450<0.01"),
+        (row["range_expansion"] >= 1.00, "range_expansion<1.00"),
+        (float(row["tail_return"]) >= -0.03, "tail_return<-0.03"),
+        (not bool(row["tail_limit_touch"]), "tail_limit_touch"),
     )
     row["b_failure_reasons"] = [reason for passed, reason in gates if not passed]
     row["b_shape_pass"] = not row["b_failure_reasons"]
@@ -438,11 +493,11 @@ def _percentiles(rows: list[dict[str, Any]], key: str, *, higher_is_better: bool
 
 
 def _sort_a(row: Mapping[str, Any]) -> tuple[float, ...]:
-    return (-float(row["score_A"]), -float(row["ret1450"]), -float(row["activity"]), -float(row["range_expansion"]), -float(row["position1450"]), -float(row["amount1450"]))
+    return (-float(row["score_A"]), -float(row["ret1450"]), -float(row["volume_score"]), -float(row["range_expansion"]), -float(row["amount1450"]))
 
 
 def _sort_b(row: Mapping[str, Any]) -> tuple[float, ...]:
-    return (-float(row["score_B"]), -float(row["prior10_runup"]), float(row["pullback_volume_ratio"]), -float(row["body1450"]), -float(row["position1450"]), -float(row["amount1450"]))
+    return (-float(row["score_B"]), -float(row["prior10_runup"]), float(row["pullback_volume_ratio"]), -float(row["body1450"]), -float(row["range_expansion"]), -float(row["amount1450"]))
 
 
 def _select_with_boundary_ties(rows: list[dict[str, Any]], limit: int, sort_key: Any) -> tuple[list[dict[str, Any]], bool]:
@@ -461,27 +516,31 @@ def _select_with_boundary_ties(rows: list[dict[str, Any]], limit: int, sort_key:
     return display, len(display) > limit
 
 
-def rank_channels(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+def rank_channels(rows: Iterable[dict[str, Any]], *, a_limit: int = A_LIMIT, b_limit: int = B_LIMIT) -> dict[str, Any]:
     """Apply same-pool percentile ranks only after all absolute gates pass."""
     all_rows = list(rows)
     a_pool = [row for row in all_rows if row["a_shape_pass"] and row["liquidity_pass"] and row["listing_pass"] and row["common_quality_pass"]]
-    for key in ("ret1450", "activity", "range_expansion", "position1450"):
+    for key in ("ret1450", "activity", "amount1450", "range_expansion"):
         _percentiles(a_pool, key)
     for row in a_pool:
         row["channel"] = "A"
-        row["score_A"] = float(sum(row[f"rank_{key}"] for key in ("ret1450", "activity", "range_expansion", "position1450")) / 4.0)
-    a_selected, a_ties = _select_with_boundary_ties(a_pool, A_LIMIT, _sort_a)
+        row["rank_price"] = row["rank_ret1450"]
+        row["rank_volatility"] = row["rank_range_expansion"]
+        row["volume_score"] = float((row["rank_activity"] + row["rank_amount1450"]) / 2.0)
+        row["score_A"] = float((row["rank_price"] + row["volume_score"] + row["rank_volatility"]) / 3.0)
+    a_selected, a_ties = _select_with_boundary_ties(a_pool, a_limit, _sort_a)
     a_codes = {row["sec_code"] for row in a_pool}
     b_pool = [row for row in all_rows if row["sec_code"] not in a_codes and row["b_shape_pass"] and row["liquidity_pass"] and row["listing_pass"] and row["common_quality_pass"]]
-    for key, higher in (("prior10_runup", True), ("pullback_volume_ratio", False), ("body1450", True), ("position1450", True)):
+    for key, higher in (("prior10_runup", True), ("pullback_volume_ratio", False), ("body1450", True), ("range_expansion", True)):
         _percentiles(b_pool, key, higher_is_better=higher)
     for row in b_pool:
         row["channel"] = "B"
-        row["score_B"] = float(sum(row[f"rank_{key}"] for key in ("prior10_runup", "pullback_volume_ratio", "body1450", "position1450")) / 4.0)
-    b_selected, b_ties = _select_with_boundary_ties(b_pool, B_LIMIT, _sort_b)
+        row["score_B"] = float(sum(row[f"rank_{key}"] for key in ("prior10_runup", "pullback_volume_ratio", "body1450", "range_expansion")) / 4.0)
+    b_selected, b_ties = _select_with_boundary_ties(b_pool, b_limit, _sort_b)
     selected_codes = {row["sec_code"] for row in a_selected + b_selected}
     for row in all_rows:
         row["selected"] = row["sec_code"] in selected_codes
+        row["selected_top10"] = row["selected"]
         if not row.get("channel"):
             row["channel"] = None
     return {
@@ -504,29 +563,22 @@ def outcome_from_frames(day_stat: Mapping[str, Any] | None, next_bars: pd.DataFr
     if next_bars is None:
         result["outcome_status"] = "unavailable_next_day"
         return result
+    morning_ok, sell_ok = False, False
     try:
         opening = validate_minute_window(next_bars, "09:30", "09:31")
         morning = validate_minute_window(next_bars, "09:30", "10:00")
-        sell_window = validate_minute_window(next_bars, "10:00", "10:05")
-    except TailDataError as exc:
-        result["outcome_status"] = _reason("unavailable_window", exc.reason)
-        return result
-    next_open = float(opening.iloc[0]["open"])
-    high = float(morning["high"].max())
-    low = float(morning["low"].min())
-    result.update({
-        "next_open": next_open,
-        "intraday_mfe_0930_1000": high / next_open - 1.0,
-        "gap_return": next_open / buy_vwap - 1.0,
-        "mfe_from_buy": high / buy_vwap - 1.0,
-        "mae_from_buy": low / buy_vwap - 1.0,
-    })
+        next_open = float(opening.iloc[0]["open"])
+        high, low = float(morning["high"].max()), float(morning["low"].min())
+        result.update({"next_open": next_open, "intraday_mfe_0930_1000": high / next_open - 1.0, "gap_return": next_open / buy_vwap - 1.0, "mfe_from_buy": high / buy_vwap - 1.0, "mae_from_buy": low / buy_vwap - 1.0})
+        morning_ok = True
+    except TailDataError:
+        pass
     sell = vwap_for_window(next_bars, "10:00", "10:05")
-    if sell.get("status") != "ready":
-        result["outcome_status"] = "unavailable_fixed_exit"
-        return result
-    gross = float(sell["vwap"]) / buy_vwap - 1.0
-    result.update({"sell_vwap": float(sell["vwap"]), "gross_fixed_exit": gross, "net30": gross - 0.003})
+    if sell.get("status") == "ready":
+        gross = float(sell["vwap"]) / buy_vwap - 1.0
+        result.update({"sell_vwap": float(sell["vwap"]), "gross_fixed_exit": gross, "net30": gross - 0.003})
+        sell_ok = True
+    result["outcome_status"] = "ready" if morning_ok and sell_ok else "unavailable_morning_label" if sell_ok else "unavailable_fixed_exit" if morning_ok else "unavailable_morning_and_fixed_exit"
     return result
 
 
@@ -541,17 +593,15 @@ def outcome_from_statistics(day_stat: Mapping[str, Any] | None, next_stat: Mappi
         result["outcome_status"] = "unavailable_next_day"
         return result
     morning, sell = next_stat.get("morning_label", {}), next_stat.get("fixed_sell", {})
-    if morning.get("status") != "ready":
-        result["outcome_status"] = "unavailable_morning_label"
-        return result
-    next_open, high, low = float(morning["next_open"]), float(morning["high"]), float(morning["low"])
+    morning_ok, sell_ok = morning.get("status") == "ready", sell.get("status") == "ready"
     buy_vwap = float(buy["vwap"])
-    result.update({"next_open": next_open, "intraday_mfe_0930_1000": high / next_open - 1.0, "gap_return": next_open / buy_vwap - 1.0, "mfe_from_buy": high / buy_vwap - 1.0, "mae_from_buy": low / buy_vwap - 1.0})
-    if sell.get("status") != "ready":
-        result["outcome_status"] = "unavailable_fixed_exit"
-        return result
-    gross = float(sell["vwap"]) / buy_vwap - 1.0
-    result.update({"sell_vwap": float(sell["vwap"]), "gross_fixed_exit": gross, "net30": gross - 0.003})
+    if morning_ok:
+        next_open, high, low = float(morning["next_open"]), float(morning["high"]), float(morning["low"])
+        result.update({"next_open": next_open, "intraday_mfe_0930_1000": high / next_open - 1.0, "gap_return": next_open / buy_vwap - 1.0, "mfe_from_buy": high / buy_vwap - 1.0, "mae_from_buy": low / buy_vwap - 1.0})
+    if sell_ok:
+        gross = float(sell["vwap"]) / buy_vwap - 1.0
+        result.update({"sell_vwap": float(sell["vwap"]), "gross_fixed_exit": gross, "net30": gross - 0.003})
+    result["outcome_status"] = "ready" if morning_ok and sell_ok else "unavailable_morning_label" if sell_ok else "unavailable_fixed_exit" if morning_ok else "unavailable_morning_and_fixed_exit"
     return result
 
 
@@ -567,8 +617,7 @@ def _load_next_frame(minute_root: str | Path, next_date: str, code: str, cache: 
 
 
 def _public_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    excluded = {"a_failure_reasons", "b_failure_reasons", "failure_reasons"}
-    return {key: value for key, value in row.items() if key not in excluded}
+    return dict(row)
 
 
 def _write_csv_gz(path: Path, rows: list[Mapping[str, Any]]) -> None:
@@ -620,9 +669,9 @@ def _canary_input_manifest(minute_root: str | Path, daily_root: str | Path, cale
 
 
 def _prepare_canary_run(output_dir: str | Path, manifest: Mapping[str, Any], *, resume_run_id: str | None) -> tuple[Path, dict[str, Any]]:
-    identity = {"mode": "tnm-v2-1f-canary", "spec_hash": _spec_hash(), "code_commit": _current_commit(), "code_identity": _code_identity(), "input_manifest_hash": hashlib.sha256(_json_bytes(manifest)).hexdigest()}
+    identity = {"mode": "tnm-v2-r1-diagnostic", "spec_hash": _spec_hash(), "base_commit": _current_commit(), "source_blob_identity": _code_identity(), "input_manifest_hash": hashlib.sha256(_json_bytes(manifest)).hexdigest()}
     run_hash = hashlib.sha256(_json_bytes(identity)).hexdigest()
-    calculated = f"canary-{identity['spec_hash'][:12]}-{run_hash[:12]}"
+    calculated = f"diagnostic-{identity['spec_hash'][:12]}-{run_hash[:12]}"
     if resume_run_id is not None and resume_run_id != calculated:
         raise TailDataError("resume_identity_mismatch")
     run_dir = Path(output_dir) / calculated
@@ -644,11 +693,14 @@ def _checkpoint(run_dir: Path, run_hash: str, unit: str, result: Mapping[str, An
     _write_json(run_dir / "checkpoints" / f"{unit.replace('|', '_').replace(':', '_')}.json", {"run_hash": run_hash, "unit": unit, "result": result})
 
 
-def _final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]], daily_consumed: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
     provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
     row = build_signal_row(code, day, prior, provisional)
     if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
         listing = development_listing_evidence(daily_root, code, target, minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS), cache=listing_cache)
+        workbook = Path(daily_root) / f"{canonical_code(code)}.xlsx"
+        if daily_consumed is not None and workbook.exists():
+            daily_consumed[canonical_code(code)] = {"path": str(workbook), "sha256": _sha256(workbook)}
         row = build_signal_row(code, day, prior, listing)
     else:
         row.update({"listing_pass": False, "listing_age_source": "not_evaluated_shape_or_liquidity_failed", "listing_history_sessions": None, "listing_history_count_status": "not_evaluated", "eligible_pass": False})
@@ -656,8 +708,8 @@ def _final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None
     return row
 
 
-def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
-    """Two full-market scans plus three frozen single-code fixtures; no other target D."""
+def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
+    """R1's two full-market scans plus three frozen single-code fixtures."""
     started = time.monotonic()
     calendar, positions = _calendar_for_targets(minute_root, TARGET_DATES)
     input_manifest = _canary_input_manifest(minute_root, daily_root, calendar, positions)
@@ -668,6 +720,7 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
     stats_cache: dict[str, dict[str, dict[str, Any]]] = {}
     source_records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
+    daily_consumed: dict[str, dict[str, str]] = {}
 
     def load_once(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
         requested = None if codes is None else {canonical_code(code) for code in codes}
@@ -716,7 +769,8 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
             completed[saved["unit"]] = saved["result"]
         daily_top: dict[str, Any] = {}
         fixture_rows: dict[str, Any] = {}
-        candidate_rows: list[dict[str, Any]] = []
+        eligible_rows: list[dict[str, Any]] = []
+        excluded_limit_touch: list[dict[str, Any]] = []
         unit_survivors: dict[str, Any] = {}
 
         def progress(stage: str) -> None:
@@ -732,12 +786,13 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
                 rows = []
                 for code in sorted(evaluation_codes[target]):
                     prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
-                    rows.append(_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache))
+                    rows.append(_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, daily_consumed))
                 ranked = rank_channels(rows)
                 selected = ranked["a_selected"] + ranked["b_selected"]
-                outcome_codes = {row["sec_code"] for row in selected} | {code for (date_key, code) in FIXTURES if date_key == target}
+                pool = ranked["a_pool"] + ranked["b_pool"]
+                outcome_codes = {row["sec_code"] for row in pool} | {code for (date_key, code) in FIXTURES if date_key == target}
                 next_stats = load_once(calendar[index + 1], outcome_codes)
-                for row in selected:
+                for row in pool:
                     row["outcome"] = outcome_from_statistics(day.get(row["sec_code"]), next_stats.get(row["sec_code"]))
                 fixture_subset = {}
                 for code in sorted({code for (date_key, code) in FIXTURES if date_key == target}):
@@ -745,11 +800,18 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
                     row["outcome"] = outcome_from_statistics(day.get(code), next_stats.get(code))
                     fixture_subset[f"{target}|{code}"] = row
                 top = {"A": [_public_row(row) for row in ranked["a_selected"]], "B": [_public_row(row) for row in ranked["b_selected"]], "a_candidate_count": len(ranked["a_pool"]), "b_candidate_count": len(ranked["b_pool"]), "a_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "b_boundary_tie_expanded": ranked["b_boundary_tie_expanded"], "selected_count": len(selected)}
-                result = {"daily_top": top, "candidate_rows": [_public_row(row) for row in selected], "fixture_rows": fixture_subset, "preselection": {"universe": len(day), "survivors": sum(proof["survives"] for proof in market_pre[target].values()), "evaluated": len(rows)}}
+                touch_rows = []
+                for code, value in day.items():
+                    if _signal_ready(value) and _history_ready(d1.get(code)):
+                        evidence = _standard_limit_evidence(code, float(d1[code]["history"]["close"]), float(value["signal"].get("tail_high", value["signal"]["high"])))
+                        if evidence["tail_limit_touch"]:
+                            touch_rows.append({"trade_date": target, "sec_code": code, "failure_reason": "tail_limit_touch", **evidence})
+                result = {"daily_top": top, "eligible_rows": [_public_row(row) for row in pool], "fixture_rows": fixture_subset, "excluded_limit_touch": touch_rows, "preselection": {"universe": len(day), "survivors": sum(proof["survives"] for proof in market_pre[target].values()), "evaluated": len(rows)}}
                 _checkpoint(run_dir, run_hash, unit, result)
                 completed[unit] = result
             daily_top[target] = result["daily_top"]
-            candidate_rows.extend(result["candidate_rows"])
+            eligible_rows.extend(result["eligible_rows"])
+            excluded_limit_touch.extend(result.get("excluded_limit_touch", []))
             fixture_rows.update(result["fixture_rows"])
             unit_survivors[unit] = result["preselection"]
             progress(unit)
@@ -762,7 +824,7 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
                 index = positions[target]
                 day, d1 = stats_cache[target], stats_cache[calendar[index - 1]]
                 prior = [stats_cache[history_date].get(code) for history_date in calendar[index - 10:index - 1]] + [d1.get(code)]
-                row = _final_row(code, target, index, day.get(code), prior, daily_root, listing_cache)
+                row = _final_row(code, target, index, day.get(code), prior, daily_root, listing_cache, daily_consumed)
                 next_stats = load_once(calendar[index + 1], {code})
                 row["outcome"] = outcome_from_statistics(day.get(code), next_stats.get(code))
                 row["selected"] = False
@@ -775,12 +837,26 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
             progress(unit)
 
         assertions = _fixture_assertions({tuple(key.split("|")): value for key, value in fixture_rows.items()}, daily_top)
-        label = "tnm_v2_1_canary_verified" if all(value["passed"] for value in assertions.values()) else "changes_required_by_frozen_canary"
-        summary = {"execution_label": label, "contract": "TNM-V2-1F two-market-three-fixture canary", "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS), "fixture_targets": [f"{day}|{code}" for day, code in FIXTURE_TARGETS], "read_years": ["2024"], "spec_hash": run_manifest["spec_hash"], "code_identity": run_manifest["code_identity"], "run_hash": run_hash, "input_manifest_hash": run_manifest["input_manifest_hash"], "capacity_filter_applied": False, "st_filter_applied": False, "st_status": "unavailable_not_filtered", "corporate_action_filter": "unproven_not_applied", "source_records": {day: source_records[day] for day in sorted(source_records)}, "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in MARKET_TARGETS}, "fixture_assertions": assertions, "performance": {"elapsed_seconds": round(time.monotonic() - started, 6), "container_open_total": sum(record["container_open_count"] for record in source_records.values())}, "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}}
-        _write_json(run_dir / "canary_summary.json", summary)
-        _write_csv_gz(run_dir / "canary_candidates.csv.gz", candidate_rows)
-        _write_json(run_dir / "canary_fixture_rows.json", fixture_rows)
-        _write_json(run_dir / "canary_daily_top.json", daily_top)
+        expected_touches = {
+            ("20240923", code) for code in ("600619", "002405", "600203")
+        } | {
+            ("20240926", code) for code in ("002583", "300100", "600208")
+        }
+        observed_touches = {(str(row["trade_date"]), str(row["sec_code"])) for row in excluded_limit_touch}
+        for target, code in sorted(expected_touches):
+            assertions[f"{target}|{code}"] = {"passed": (target, code) in observed_touches, "checks": {"tail_limit_touch": (target, code) in observed_touches}}
+        label = "tnm_v2_r1_diagnostic_ready" if all(value["passed"] for value in assertions.values()) else "diagnostic_changes_required"
+        consumed_minutes = {day: record.get("consumed_member_sha256", {}) for day, record in sorted(source_records.items())}
+        consumed = {"minute_members": consumed_minutes, "daily_workbooks": daily_consumed}
+        run_manifest["consumed_input_identity"] = _content_identity({"minute_members": {"sha256": hashlib.sha256(_json_bytes(consumed_minutes)).hexdigest()}, "daily_workbooks": {"sha256": hashlib.sha256(_json_bytes(daily_consumed)).hexdigest()}})
+        run_manifest["consumed_input_manifest"] = consumed
+        _write_json(run_dir / "run_manifest.json", run_manifest)
+        summary = {"execution_label": label, "contract": "TNM-V2-R1 two-market-three-fixture diagnostic", "targets": list(TARGET_DATES), "market_targets": list(MARKET_TARGETS), "fixture_targets": [f"{day}|{code}" for day, code in FIXTURE_TARGETS], "read_years": ["2024"], "spec_hash": run_manifest["spec_hash"], "base_commit": run_manifest["base_commit"], "source_blob_identity": run_manifest["source_blob_identity"], "run_hash": run_hash, "input_manifest_hash": run_manifest["input_manifest_hash"], "consumed_input_identity": run_manifest["consumed_input_identity"], "capacity_filter_applied": False, "st_filter_applied": False, "st_status": "unavailable_not_filtered", "st_limit_filter_status": "unproven_standard_board_rule_applied", "corporate_action_filter": "unproven_not_applied", "source_records": {day: source_records[day] for day in sorted(source_records)}, "daily_counts": {day: {"a": daily_top[day]["a_candidate_count"], "b": daily_top[day]["b_candidate_count"], "selected": daily_top[day]["selected_count"]} for day in MARKET_TARGETS}, "excluded_limit_touch_count": len(excluded_limit_touch), "fixture_assertions": assertions, "performance": {"elapsed_seconds": round(time.monotonic() - started, 6), "container_open_total": sum(record["container_open_count"] for record in source_records.values())}, "exception_counts": {"invalid_source_files": sum(record["invalid_file_count"] for record in source_records.values())}, "read_2025_2026": False, "e_drive_written": False}
+        _write_json(run_dir / "diagnostic_summary.json", summary)
+        _write_csv_gz(run_dir / "diagnostic_eligible_pool.csv.gz", eligible_rows)
+        _write_csv_gz(run_dir / "diagnostic_excluded_limit_touch.csv.gz", excluded_limit_touch)
+        _write_json(run_dir / "diagnostic_fixture_rows.json", fixture_rows)
+        _write_json(run_dir / "diagnostic_daily_top10.json", daily_top)
         artifact_manifest = {path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)} for path in sorted(run_dir.iterdir()) if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}}
         _write_json(run_dir / "artifact_manifest.json", artifact_manifest)
         _write_json(completion_path, {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": label, "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
@@ -788,25 +864,32 @@ def run_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str 
     except KeyboardInterrupt:
         _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash})
         raise
+
+
     except Exception as exc:
         _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
         raise
 
 
+# Compatibility for the V2-1F synthetic harness.  The production CLI exposes
+# only the R1 diagnostic command below.
+run_canary = run_diagnostic
+
+
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="TNM V2 fixed canary only")
+    parser = argparse.ArgumentParser(description="TNM V2 R1 diagnostic only")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    canary = subparsers.add_parser("canary")
-    canary.add_argument("--minute-root", required=True)
-    canary.add_argument("--daily-root", required=True)
-    canary.add_argument("--output-dir", required=True)
-    canary.add_argument("--resume-run-id")
+    diagnostic = subparsers.add_parser("diagnostic")
+    diagnostic.add_argument("--minute-root", required=True)
+    diagnostic.add_argument("--daily-root", required=True)
+    diagnostic.add_argument("--output-dir", required=True)
+    diagnostic.add_argument("--resume-run-id")
     args = parser.parse_args(argv)
-    if args.command != "canary":
+    if args.command != "diagnostic":
         raise TailDataError("unsupported_v2_command")
-    summary, run_dir = run_canary(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
+    summary, run_dir = run_diagnostic(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     print(f"status={summary['execution_label']} run_dir={run_dir}")
-    return 0 if summary["execution_label"] == "tnm_v2_1_canary_verified" else 2
+    return 0 if summary["execution_label"] == "tnm_v2_r1_diagnostic_ready" else 2
 
 
 if __name__ == "__main__":
