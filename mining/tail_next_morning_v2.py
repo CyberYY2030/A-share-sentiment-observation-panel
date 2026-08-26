@@ -44,7 +44,7 @@ from mining.tail_next_morning import (
 )
 
 
-TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-final-evidence-repair.md"
+TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v22-task-cards.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
@@ -54,6 +54,9 @@ B_LIMIT = 10
 A_RET1450_MIN = 0.04
 POSITION1450_MIN = 0.55
 A_VWAP_DIST_MIN = 0.01
+V22_A_LIMIT = 6
+V22_B_LIMIT = 3
+V22_MARKET_TARGETS = ("20240923", "20240926")
 FIXTURES = {
     ("20240923", "300085"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
     ("20240926", "300339"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
@@ -94,7 +97,7 @@ def _sha256(path: Path) -> str:
 def _spec_hash() -> str:
     text = TASK_CARD.read_text(encoding="utf-8").replace("\r\n", "\n")
     definition = None
-    for marker in ("## 4. 执行证据", "## 6. 执行证据", "## 11. 执行证据"):
+    for marker in ("## 4. 执行证据", "## 6. 执行证据", "## 11. 执行证据", "## 12. 执行证据"):
         before, found, _ = text.partition(marker)
         if found:
             definition = before
@@ -286,6 +289,27 @@ def _v2_statistics_from_frame(raw: pd.DataFrame) -> dict[str, Any]:
         result["fixed_sell"] = vwap_for_window(bars, "10:00", "10:05")
     except TailDataError as exc:
         result["fixed_sell"] = {"status": "invalid_window", "reason": exc.reason, "vwap": None, "amount": None, "volume": None}
+    for label, decision_start, sell_start, sell_end in (
+        ("a_exit", "10:29", "10:30", "10:35"),
+        ("b_exit", "10:59", "11:00", "11:05"),
+    ):
+        try:
+            decision = validate_minute_window(bars, decision_start, sell_start)
+            result[label] = {
+                "decision_status": "ready",
+                "decision_close": float(decision.iloc[-1]["close"]),
+                "sell": vwap_for_window(bars, sell_start, sell_end),
+                "decision_window": f"{decision_start}-{sell_start}",
+                "sell_window": f"{sell_start}-{sell_end}",
+            }
+        except TailDataError as exc:
+            result[label] = {
+                "decision_status": "invalid",
+                "decision_close": None,
+                "sell": {"status": "invalid_window", "reason": exc.reason, "vwap": None, "amount": None, "volume": None},
+                "decision_window": f"{decision_start}-{sell_start}",
+                "sell_window": f"{sell_start}-{sell_end}",
+            }
     return result
 
 
@@ -1027,6 +1051,292 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
 run_canary = run_diagnostic
 
 
+def v22_impulse(prior: Iterable[Mapping[str, Any] | None]) -> dict[str, Any]:
+    """Choose one D-5..D-1 impulse; all ranking fields share that day."""
+    values = list(prior)
+    candidates: list[dict[str, Any]] = []
+    if len(values) != 10 or not all(_history_ready(value) for value in values):
+        return {"impulse_pass": False, "impulse_day": None, "impulse_return": None, "impulse_amount_ratio": None}
+    for index in range(5, 10):
+        history = values[index]["history"]
+        prior_close = float(values[index - 1]["history"]["close"])
+        denominator = float(pd.Series([values[item]["history"]["full_amount"] for item in range(index - 3, index)]).median())
+        if prior_close <= 0 or denominator <= 0:
+            continue
+        impulse_return = float(history["close"]) / prior_close - 1.0
+        impulse_amount_ratio = float(history["full_amount"]) / denominator
+        if impulse_return >= .05 and impulse_amount_ratio >= 1.50:
+            candidates.append({"impulse_day": f"D-{10 - index}", "impulse_return": impulse_return, "impulse_amount_ratio": impulse_amount_ratio, "_index": index})
+    if not candidates:
+        return {"impulse_pass": False, "impulse_day": None, "impulse_return": None, "impulse_amount_ratio": None}
+    chosen = sorted(candidates, key=lambda value: (-value["impulse_return"], -value["impulse_amount_ratio"], -value["_index"]))[0]
+    return {key: value for key, value in chosen.items() if key != "_index"} | {"impulse_pass": True}
+
+
+def _v22_a_shape(row: dict[str, Any]) -> None:
+    if not row["common_quality_pass"]:
+        row["a_failure_reasons"] = ["common_quality_failed"]
+        return
+    gates = (
+        (row["ret1450"] >= A_RET1450_MIN, "ret1450<0.04"),
+        (row["close1450"] > row["open_D"], "close1450<=open_D"),
+        (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
+        (row["vwap_dist"] >= A_VWAP_DIST_MIN, "vwap_dist<0.01"),
+        (row["range_expansion"] >= 1.50, "range_expansion<1.50"),
+        (row["close1450"] > row["prev_ma10"], "close1450<=prev_ma10"),
+        (float(row["tail_return"]) >= -.03, "tail_return<-0.03"),
+        (not bool(row["tail_limit_touch"]), "tail_limit_touch"),
+        (row["close1450"] >= row["prior10_high"] or (row["prev_ma5"] > row["prev_ma10"] and row["close1450"] > row["prev_ma5"]), "trend_structure_failed"),
+    )
+    row["a_failure_reasons"] = [reason for passed, reason in gates if not passed]
+    row["a_shape_pass"] = not row["a_failure_reasons"]
+
+
+def _v22_b_shape(row: dict[str, Any]) -> None:
+    if not row["common_quality_pass"]:
+        row["b_failure_reasons"] = ["common_quality_failed"]
+        return
+    gates = (
+        (bool(row["impulse_pass"]), "impulse_missing"),
+        (row["prior10_runup"] >= .15, "prior10_runup<0.15"),
+        (-.15 <= row["drawdown"] <= -.03, "drawdown_outside_-0.15_to_-0.03"),
+        (row["close1450"] > row["prev_ma10"], "close1450<=prev_ma10"),
+        (row["pullback_volume_ratio"] <= .80, "pullback_volume_ratio>0.80"),
+        (row["position1450"] >= POSITION1450_MIN, "position1450<0.55"),
+        (row["body1450"] >= -.03, "body1450<-0.03"),
+        (float(row["tail_return"]) >= -.03, "tail_return<-0.03"),
+        (not bool(row["tail_limit_touch"]), "tail_limit_touch"),
+    )
+    row["b_failure_reasons"] = [reason for passed, reason in gates if not passed]
+    row["b_shape_pass"] = not row["b_failure_reasons"]
+
+
+def build_v22_signal_row(code: str, day: Mapping[str, Any] | None, prior: Iterable[Mapping[str, Any] | None], listing: Mapping[str, Any]) -> dict[str, Any]:
+    row = _base_row(code, day, list(prior))
+    row.update(v22_impulse(prior))
+    _v22_a_shape(row)
+    _v22_b_shape(row)
+    row["shape_pass"] = bool(row["a_shape_pass"] or row["b_shape_pass"])
+    row["listing_pass"] = listing.get("listing_history_count_status") == "at_least_threshold" or int(listing.get("listing_history_sessions") or 0) >= MIN_HISTORY_SESSIONS
+    row["listing_age_source"] = listing.get("listing_age_source")
+    row["listing_history_sessions"] = listing.get("listing_history_sessions")
+    row["listing_history_count_status"] = listing.get("listing_history_count_status")
+    row["eligible_pass"] = bool(row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"] and row["listing_pass"])
+    return row
+
+
+def _v22_sort_a(row: Mapping[str, Any]) -> tuple[float, ...]:
+    return (-float(row["score_A"]), -float(row["ret1450"]), -float(row["volume_score"]), -float(row["range_expansion"]), -float(row["amount1450"]), -float(row["vwap_dist"]), -float(row["position1450"]), -float(row["tail_return"]))
+
+
+def _v22_sort_b(row: Mapping[str, Any]) -> tuple[float, ...]:
+    return (-float(row["score_B"]), -float(row["impulse_return"]), -float(row["impulse_amount_ratio"]), float(row["pullback_volume_ratio"]), -float(row["position1450"]), -float(row["body1450"]), -float(row["tail_return"]), -float(row["amount1450"]))
+
+
+def rank_v22_channels(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    all_rows = list(rows)
+    a_pool = [row for row in all_rows if row["a_shape_pass"] and row["liquidity_pass"] and row["listing_pass"] and row["common_quality_pass"]]
+    for key in ("ret1450", "activity", "amount1450", "range_expansion"):
+        _percentiles(a_pool, key)
+    for row in a_pool:
+        row["channel"] = "A"
+        row["rank_price"] = row["rank_ret1450"]
+        row["rank_volatility"] = row["rank_range_expansion"]
+        row["volume_score"] = (row["rank_activity"] + row["rank_amount1450"]) / 2.0
+        row["score_A"] = (row["rank_price"] + row["volume_score"] + row["rank_volatility"]) / 3.0
+    a_selected, a_ties = _select_with_boundary_ties(a_pool, V22_A_LIMIT, _v22_sort_a)
+    a_codes = {row["sec_code"] for row in a_pool}
+    b_pool = [row for row in all_rows if row["sec_code"] not in a_codes and row["b_shape_pass"] and row["liquidity_pass"] and row["listing_pass"] and row["common_quality_pass"]]
+    for key, higher in (("impulse_return", True), ("impulse_amount_ratio", True), ("pullback_volume_ratio", False), ("position1450", True)):
+        _percentiles(b_pool, key, higher_is_better=higher)
+    for row in b_pool:
+        row["channel"] = "B"
+        row["score_B"] = sum(row[f"rank_{key}"] for key in ("impulse_return", "impulse_amount_ratio", "pullback_volume_ratio", "position1450")) / 4.0
+    b_selected, b_ties = _select_with_boundary_ties(b_pool, V22_B_LIMIT, _v22_sort_b)
+    selected_codes = {row["sec_code"] for row in a_selected + b_selected}
+    for row in all_rows:
+        row["selected"] = row["sec_code"] in selected_codes
+        row["selected_top"] = row["selected"]
+        row.setdefault("channel", None)
+    return {"a_pool": a_pool, "b_pool": b_pool, "a_selected": a_selected, "b_selected": b_selected, "a_boundary_tie_expanded": a_ties, "b_boundary_tie_expanded": b_ties}
+
+
+def v22_exit_decision(channel: str, code: str, previous: Mapping[str, Any] | None, current: Mapping[str, Any] | None) -> dict[str, Any]:
+    """One post-D trading day; unavailable fields deliberately continue holding."""
+    if not _history_ready(previous) or not current or current.get("status") != "ready":
+        return {"status": "continue_invalid_previous_or_day"}
+    key = "a_exit" if channel == "A" else "b_exit"
+    detail = current.get(key, {})
+    if detail.get("decision_status") != "ready" or not _finite(detail.get("decision_close")):
+        return {"status": "continue_invalid_decision", "exit_window": detail.get("sell_window")}
+    sell = detail.get("sell", {})
+    if sell.get("status") != "ready" or not _finite(sell.get("vwap")):
+        return {"status": "continue_unavailable_sell", "exit_window": detail.get("sell_window")}
+    decision_close = float(detail["decision_close"])
+    previous_close = float(previous["history"]["close"])
+    if channel == "A":
+        limit = _standard_limit_evidence(code, previous_close, decision_close)
+        if limit["tail_limit_touch"]:
+            return {"status": "continue_limit_up", "decision_close": decision_close, **limit}
+    else:
+        day_return = decision_close / previous_close - 1.0
+        if day_return >= .03:
+            return {"status": "continue_return_ge_3pct", "decision_close": decision_close, "day_return_1100": day_return}
+    return {"status": "exit", "exit_price": float(sell["vwap"]), "exit_window": detail["sell_window"], "decision_close": decision_close, "decision_window": detail["decision_window"]}
+
+
+def v22_sleeve_step(sleeve: Mapping[str, Any], event: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Pure fixed-rank sleeve transition: cash is never borrowed or reallocated."""
+    state = dict(sleeve)
+    if state.get("holding") and event and event.get("exit_price"):
+        state.update({"cash": float(state["cash"]) * (1.0 + float(event["net_return"])), "holding": False, "skipped": int(state.get("skipped", 0))})
+    elif not state.get("holding") and event and event.get("buy_price"):
+        state["holding"] = True
+    elif state.get("holding") and event and event.get("buy_price"):
+        state["skipped"] = int(state.get("skipped", 0)) + 1
+    return state
+
+
+def _v22_calendar(minute_root: str | Path) -> tuple[list[str], dict[str, int]]:
+    first, last = date(2024, 8, 1), date(2024, 12, 31)
+    sessions: list[str] = []
+    cursor = first
+    while cursor <= last:
+        if cursor.weekday() < 5:
+            key = _day_key(cursor)
+            try:
+                locate_day_source(minute_root, key)
+                sessions.append(key)
+            except TailDataError as exc:
+                if exc.reason != f"minute_day_missing:{key}":
+                    raise
+        cursor += timedelta(days=1)
+    positions = {value: index for index, value in enumerate(sessions)}
+    if any(target not in positions or positions[target] < 10 for target in V22_MARKET_TARGETS):
+        raise TailDataError("v22_canary_calendar_missing_dependency")
+    return sessions, positions
+
+
+def _v22_final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
+    row = build_v22_signal_row(code, day, prior, provisional)
+    if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
+        listing = development_listing_evidence(daily_root, code, target, minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS), cache=listing_cache)
+        row = build_v22_signal_row(code, day, prior, listing)
+    else:
+        row.update({"listing_pass": False, "listing_age_source": "not_evaluated_shape_or_liquidity_failed", "listing_history_sessions": None, "listing_history_count_status": "not_evaluated", "eligible_pass": False})
+    row["trade_date"] = target
+    return row
+
+
+def _v22_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Only necessary local conditions; B deliberately has no activity/close gate."""
+    result = necessary_preselection(code, day, d1)
+    if not result["quality_pass"]:
+        return result
+    result["b_local_necessary"] = bool(result["position1450"] >= POSITION1450_MIN)
+    result["survives"] = bool(result["liquidity_pass"] and (result["a_local_necessary"] or result["b_local_necessary"]))
+    result["reason"] = None if result["survives"] else "local_necessary_condition_failed"
+    return result
+
+
+def _v22_event(channel: str, code: str, signal_date: str, buy: Mapping[str, Any], calendar: list[str], start_index: int, load: Any) -> dict[str, Any]:
+    if buy.get("status") != "ready" or not _finite(buy.get("vwap")):
+        return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "unavailable_buy", "buy_price": None, "exit_price": None, "net_return": None, "holding_days": None, "decisions": []}
+    decisions = []
+    for index in range(start_index + 1, len(calendar)):
+        current_date, previous_date = calendar[index], calendar[index - 1]
+        decision = v22_exit_decision(channel, code, load(previous_date, {code}).get(code), load(current_date, {code}).get(code))
+        decisions.append({"trade_date": current_date, **decision})
+        if decision["status"] == "exit":
+            gross = float(decision["exit_price"]) / float(buy["vwap"]) - 1.0
+            return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "resolved", "buy_price": float(buy["vwap"]), "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - start_index, "exit_trade_date": current_date, "exit_window": decision["exit_window"], "decisions": decisions}
+    return {"trade_date": signal_date, "sec_code": code, "channel": channel, "outcome_status": "unresolved_at_development_end", "buy_price": float(buy["vwap"]), "exit_price": None, "gross_return": None, "net_return": None, "holding_days": len(calendar) - start_index - 1, "decisions": decisions}
+
+
+def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path) -> tuple[dict[str, Any], Path]:
+    """The single V2.2 two-day canary; it never reads a 2025 session."""
+    started = time.monotonic()
+    calendar, positions = _v22_calendar(minute_root)
+    manifest = {"mode": "tnm-v22-1-canary", "targets": list(V22_MARKET_TARGETS), "calendar_end": calendar[-1], "base_commit": _current_commit(), "spec_hash": _spec_hash(), "source_blob_identity": _code_identity()}
+    run_hash = hashlib.sha256(_json_bytes(manifest)).hexdigest()
+    run_id = f"v22-canary-{manifest['spec_hash'][:12]}-{run_hash[:12]}"
+    run_dir = Path(output_dir) / run_id
+    if (run_dir / "run_manifest.json").exists():
+        raise TailDataError("v22_canary_output_exists")
+    _write_json(run_dir / "run_manifest.json", {**manifest, "run_hash": run_hash, "run_id": run_id})
+    _write_json(run_dir / "progress.json", {"run_hash": run_hash, "stage": "initializing", "completed_units": []})
+    cache: dict[str, dict[str, dict[str, Any]]] = {}
+    records: dict[str, dict[str, Any]] = {}
+    listing_cache: dict[str, dict[str, Any]] = {}
+
+    def load(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
+        requested = None if codes is None else {canonical_code(code) for code in codes}
+        if trade_date in cache:
+            if requested is not None and not requested.issubset(cache[trade_date]):
+                raise TailDataError(f"v22_container_reopen_forbidden:{trade_date}")
+            return cache[trade_date]
+        values, record = load_day_v2_statistics(minute_root, trade_date, requested)
+        cache[trade_date], records[trade_date] = values, record
+        return values
+
+    try:
+        pre: dict[str, dict[str, dict[str, Any]]] = {}
+        evaluation: dict[str, set[str]] = {}
+        for target in V22_MARKET_TARGETS:
+            index = positions[target]
+            day, d1 = load(target, None), load(calendar[index - 1], None)
+            pre[target] = {code: _v22_preselection(code, day.get(code), d1.get(code)) for code in day}
+            evaluation[target] = {code for code, proof in pre[target].items() if proof["survives"]}
+        needs: dict[str, set[str]] = defaultdict(set)
+        all_evaluation_codes = set().union(*evaluation.values())
+        for target, codes in evaluation.items():
+            index = positions[target]
+            for dependency in calendar[index - 10:index - 1]:
+                needs[dependency].update(codes)
+            needs[calendar[index + 1]].update(all_evaluation_codes)
+        for dependency, codes in sorted(needs.items()):
+            load(dependency, codes)
+
+        all_daily, all_events, completed = [], [], []
+        for target in V22_MARKET_TARGETS:
+            index = positions[target]
+            day, d1 = cache[target], cache[calendar[index - 1]]
+            rows = []
+            for code in sorted(evaluation[target]):
+                prior = [cache[value].get(code) for value in calendar[index - 10:index - 1]] + [d1.get(code)]
+                rows.append(_v22_final_row(code, target, index, day.get(code), prior, daily_root, listing_cache))
+            ranked = rank_v22_channels(rows)
+            selected = ranked["a_selected"] + ranked["b_selected"]
+            daily = {"trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]), "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]], "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"]}
+            for row in selected:
+                event = _v22_event(str(row["channel"]), row["sec_code"], target, day.get(row["sec_code"], {}).get("buy", {}), calendar, index, load)
+                row["event"] = event
+                all_events.append(event)
+            all_daily.extend(_public_row(row) for row in ranked["a_pool"] + ranked["b_pool"])
+            result = {"daily": daily, "eligible_rows": [_public_row(row) for row in ranked["a_pool"] + ranked["b_pool"]], "events": all_events[-len(selected):], "preselection": {"universe": len(day), "survivors": len(evaluation[target])}}
+            _checkpoint(run_dir, run_hash, f"market:{target}", result)
+            completed.append(f"market:{target}")
+            _write_json(run_dir / "progress.json", {"run_hash": run_hash, "stage": f"market:{target}", "completed_units": completed, "elapsed_seconds": round(time.monotonic() - started, 6)})
+        summary = {"execution_label": "tnm_v22_1_canary_verified", "targets": list(V22_MARKET_TARGETS), "run_hash": run_hash, "spec_hash": manifest["spec_hash"], "source_blob_identity": manifest["source_blob_identity"], "daily": {target: json.loads((run_dir / "checkpoints" / f"market_{target}.json").read_text(encoding="utf-8"))["result"]["daily"] for target in V22_MARKET_TARGETS}, "event_count": len(all_events), "resolved_events": sum(event["outcome_status"] == "resolved" for event in all_events), "unresolved_events": sum(event["outcome_status"] == "unresolved_at_development_end" for event in all_events), "read_2025_2026": False, "e_drive_written": False, "elapsed_seconds": round(time.monotonic() - started, 6), "source_records": records}
+        fixture_ok = all(code in {row["sec_code"] for row in summary["daily"][target]["A6"]} for target, code in (("20240923", "300085"), ("20240926", "300339")))
+        if not fixture_ok:
+            summary["execution_label"] = "diagnostic_changes_required"
+        _write_json(run_dir / "v22_summary.json", summary)
+        _write_csv_gz(run_dir / "daily_results.csv.gz", all_daily)
+        _write_csv_gz(run_dir / "event_results.csv.gz", all_events)
+        sleeves = [{"sleeve": f"A{index}", "cash": 5_000_000 / 9, "holding": False, "skipped": 0} for index in range(1, 7)] + [{"sleeve": f"B{index}", "cash": 5_000_000 / 9, "holding": False, "skipped": 0} for index in range(1, 4)]
+        _write_csv_gz(run_dir / "account_ledger.csv.gz", sleeves)
+        _write_csv_gz(run_dir / "account_nav.csv.gz", [{"trade_date": target, "nav": 5_000_000, "status": "canary_interface_only"} for target in V22_MARKET_TARGETS])
+        artifacts = {path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)} for path in sorted(run_dir.iterdir()) if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}}
+        _write_json(run_dir / "artifact_manifest.json", artifacts)
+        _write_json(run_dir / "completion.json", {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": summary["execution_label"], "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
+        return summary, run_dir
+    except Exception as exc:
+        _write_json(run_dir / "completion.json", {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        raise
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="TNM V2 R1 diagnostic only")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1035,12 +1345,19 @@ def main(argv: list[str] | None = None) -> int:
     diagnostic.add_argument("--daily-root", required=True)
     diagnostic.add_argument("--output-dir", required=True)
     diagnostic.add_argument("--resume-run-id")
+    v22 = subparsers.add_parser("v22-canary")
+    v22.add_argument("--minute-root", required=True)
+    v22.add_argument("--daily-root", required=True)
+    v22.add_argument("--output-dir", required=True)
     args = parser.parse_args(argv)
-    if args.command != "diagnostic":
+    if args.command == "diagnostic":
+        summary, run_dir = run_diagnostic(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
+    elif args.command == "v22-canary":
+        summary, run_dir = run_v22_canary(args.minute_root, args.daily_root, args.output_dir)
+    else:
         raise TailDataError("unsupported_v2_command")
-    summary, run_dir = run_diagnostic(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     print(f"status={summary['execution_label']} run_dir={run_dir}")
-    return 0 if summary["execution_label"] == "tnm_v2_r1_diagnostic_ready" else 2
+    return 0 if summary["execution_label"] in {"tnm_v2_r1_diagnostic_ready", "tnm_v22_1_canary_verified"} else 2
 
 
 if __name__ == "__main__":

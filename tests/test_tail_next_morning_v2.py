@@ -39,6 +39,11 @@ from mining.tail_next_morning_v2 import (
     outcome_from_statistics,
     rank_channels,
     run_canary,
+    build_v22_signal_row,
+    rank_v22_channels,
+    v22_exit_decision,
+    v22_impulse,
+    v22_sleeve_step,
 )
 
 
@@ -89,6 +94,45 @@ def raw_frame(*, close=10.0) -> pd.DataFrame:
 
 
 class TailNextMorningV2Tests(unittest.TestCase):
+    def test_v22_a_removes_activity_gate_and_uses_six_slots(self) -> None:
+        day, prior = a_inputs()
+        day["signal"]["amount"] = 10.0
+        day["signal"]["volume"] = 1.0
+        row = build_v22_signal_row("300801", day, prior, LISTED)
+        self.assertTrue(row["a_shape_pass"])
+        rows = [build_v22_signal_row(f"3008{index:02d}", *a_inputs(), LISTED) for index in range(7)]
+        ranked = rank_v22_channels(rows)
+        self.assertEqual(7, len(ranked["a_selected"]))
+        self.assertTrue(ranked["a_boundary_tie_expanded"])
+
+    def test_v22_impulse_binding_b_gates_and_score(self) -> None:
+        day, prior = b_inputs()
+        prior[7]["history"].update({"close": 10.6, "full_amount": 500_000_000.0})
+        prior[6]["history"]["close"] = 10.0
+        impulse = v22_impulse(prior)
+        self.assertTrue(impulse["impulse_pass"])
+        row = build_v22_signal_row("300802", day, prior, LISTED)
+        self.assertTrue(row["b_shape_pass"])
+        ranked = rank_v22_channels([row])
+        self.assertIn("score_B", ranked["b_pool"][0])
+
+    def test_v22_exit_state_machine_and_sleeves(self) -> None:
+        previous = stat(close=10.0)
+        current = stat(close=10.0)
+        current["a_exit"] = {"decision_status": "ready", "decision_close": 11.0, "sell": {"status": "ready", "vwap": 10.8}, "decision_window": "10:29-10:30", "sell_window": "10:30-10:35"}
+        self.assertEqual("continue_limit_up", v22_exit_decision("A", "600001", previous, current)["status"])
+        current["a_exit"]["decision_close"] = 10.9
+        self.assertEqual("exit", v22_exit_decision("A", "600001", previous, current)["status"])
+        current["b_exit"] = {"decision_status": "ready", "decision_close": 10.3, "sell": {"status": "ready", "vwap": 10.2}, "decision_window": "10:59-11:00", "sell_window": "11:00-11:05"}
+        self.assertEqual("continue_return_ge_3pct", v22_exit_decision("B", "300001", previous, current)["status"])
+        current["b_exit"]["decision_close"] = 10.299
+        self.assertEqual("exit", v22_exit_decision("B", "300001", previous, current)["status"])
+        held = v22_sleeve_step({"cash": 100.0, "holding": True, "skipped": 0}, {"buy_price": 10.0})
+        self.assertEqual(1, held["skipped"])
+        closed = v22_sleeve_step(held, {"exit_price": 11.0, "net_return": .10})
+        self.assertFalse(closed["holding"])
+        self.assertAlmostEqual(110.0, closed["cash"])
+
     def test_standard_limit_fen_touch_and_post_1450_isolation(self) -> None:
         self.assertEqual(11.0, _standard_limit_evidence("600001", 10.0, 10.995)["limit_up_price"])
         self.assertTrue(_standard_limit_evidence("600001", 10.0, 10.995)["tail_limit_touch"])

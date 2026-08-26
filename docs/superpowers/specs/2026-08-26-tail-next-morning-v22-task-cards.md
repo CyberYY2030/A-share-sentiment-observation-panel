@@ -238,4 +238,8 @@ tracked 白名单仅：
 
 尚未执行。Terra 只能在本节追加紧凑证据，不得改写第1～11节。
 
+### TNM-V22-1（Terra，2026-08-26）
+
+状态：`tnm_v22_1_blocked_performance`。实现与最小验证已完成：V2 37 tests、V1 25 tests、`py_compile`、`git diff --check` 均通过。唯一真实 identity `v22-canary-3178f827ce5b-e4e9b6ccc022`（run hash `e4e9b6ccc0222d5dfb153566c3d6efaeaf0c5ee48ad136b09a91120ea3c234ba`，spec hash `3178f827ce5b347fa5eea62605fff9d903cbc24a5eb2848098c3754876e30342`）在 2026-08-26 11:00:58 +08:00 启动，3分38秒后仍为 `initializing`、0 checkpoint；按项目三分钟无新信号规则仅终止任务自有 PID 49028，未创建第二 identity、未执行 2025/2026、未写 E:。保留 `output/tail-next-morning-v2/v22-canary/v22-canary-3178f827ce5b-e4e9b6ccc022/` 的 `run_manifest.json` 与 `progress.json` 原样供 Sol 归因；未产生可核验的 A6/B3、fixture 或经济结果，不得进入开发批。
+
 Lessons：`skip`。本卡是项目专属经济假设，尚无跨项目复用证据。
