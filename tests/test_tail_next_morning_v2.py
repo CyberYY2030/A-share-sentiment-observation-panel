@@ -160,6 +160,41 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertIn("A|strategy|2023", aggregates["bootstrap"])
         self.assertIn("A|strategy|combined", aggregates["bootstrap"])
 
+    def test_v22_ab_combined_channel_uses_slot_weights_not_event_counts(self) -> None:
+        def event(day, channel, group, value, code):
+            return {"trade_date": day, "sec_code": code, "channel": channel, "strategy_or_control": group, "rank": 1, "slot_weight": 1.0, "outcome_status": "resolved", "bought": True, "gross_return": value + .003, "net_return": value, "holding_days": 1}
+
+        rows = [
+            event("20231229", "A", "strategy", .09, "300001"),
+            event("20231229", "B", "strategy", -.03, "300002"),
+            event("20240102", "A", "strategy", .01, "300003"),  # B deliberately has no event this day.
+        ]
+        for group, value in (("random_same_n", -.02), ("ret1450_same_n", -.01), ("activity_same_n", .00)):
+            rows.extend([
+                event("20231229", "A", group, value, f"30{len(rows):04d}"),
+                event("20231229", "B", group, value / 2, f"30{len(rows):04d}"),
+                event("20240102", "A", group, value / 4, f"30{len(rows):04d}"),
+            ])
+        combined = _v22_event_aggregates(rows)["combined_channel"]
+        strategy_slots = {row["trade_date"]: row for row in combined["daily_slot_net"] if row["strategy_or_control"] == "strategy"}
+        self.assertAlmostEqual(.03, strategy_slots["20231229"]["daily_slot_net"])
+        self.assertAlmostEqual(.01, strategy_slots["20240102"]["daily_slot_net"])
+        self.assertEqual(2.0, strategy_slots["20231229"]["selected_slot_weight"])
+        self.assertEqual(1.0, strategy_slots["20240102"]["selected_slot_weight"])
+        self.assertAlmostEqual(.04, combined["daily_slot_statistics"]["strategy|combined"]["arithmetic_sum"])
+        for group in ("strategy", "random_same_n", "ret1450_same_n", "activity_same_n"):
+            self.assertIn(group, combined["overall"])
+            self.assertIn(f"{group}|2023", combined["yearly"])
+            self.assertIn(f"{group}|2024", combined["yearly"])
+            self.assertIn(f"{group}|202312", combined["monthly"])
+            self.assertIn(f"{group}|combined", combined["daily_slot_statistics"])
+            self.assertIn(f"{group}|combined", combined["bootstrap"])
+            self.assertIn(f"{group}|2023", combined["daily_slot_statistics"])
+            self.assertIn(f"{group}|2024", combined["daily_slot_statistics"])
+            self.assertIn(f"{group}|2023", combined["bootstrap"])
+            self.assertIn(f"{group}|2024", combined["bootstrap"])
+        self.assertEqual("diagnostic", combined["bootstrap"]["strategy|combined"]["status"])
+
     def test_v22_exit_state_machine_and_sleeves(self) -> None:
         previous = stat(close=10.0)
         current = stat(close=10.0)
@@ -354,10 +389,12 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertTrue((run_dir / "outcomes" / "20240924.json").exists())
             self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
             before = {path.relative_to(run_dir).as_posix(): path.read_bytes() for path in run_dir.rglob("*") if path.is_file()}
+            calls.clear()
             with patch.object(module, "rank_v22_channels", side_effect=AssertionError("fast path recalculated")):
                 replay, replay_dir = run_v22_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
             self.assertEqual(development, replay)
             self.assertEqual(run_dir, replay_dir)
+            self.assertTrue(calls and all(count == 1 for count in calls.values()))
             self.assertEqual(before, {path.relative_to(run_dir).as_posix(): path.read_bytes() for path in run_dir.rglob("*") if path.is_file()})
             content["value"] = "equal_size_rewrite"
             with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch"):
@@ -380,6 +417,62 @@ class TailNextMorningV2Tests(unittest.TestCase):
         with patch("mining.tail_next_morning_v2.run_v22_development", return_value=({"execution_label": "tnm_v22_development_completed"}, Path("synthetic"))) as runner:
             self.assertEqual(0, main(["v22-development", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "development-id"]))
         self.assertEqual("development-id", runner.call_args.kwargs["resume_run_id"])
+
+    def test_v22_development_daily_commit_ignores_orphan_outcome_and_resumes_once(self) -> None:
+        """An outcome written before its marker is audit-only and cannot duplicate economics."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923", "20240924"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        day, prior = a_inputs()
+        calls: dict[str, int] = {}
+
+        def fake_load(_root, trade_date, requested_codes=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            requested = set(codes) if requested_codes is None else set(requested_codes)
+            value = copy.deepcopy(day if positions[trade_date] >= 10 else prior[positions[trade_date]])
+            if positions[trade_date] == 11:
+                value["a_exit"] = {"decision_status": "ready", "decision_close": 10.9, "sell": {"status": "ready", "vwap": 10.8}, "decision_window": "10:29-10:30", "sell_window": "10:30-10:35"}
+            values = {code: copy.deepcopy(value) for code in requested}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"{trade_date}|{code}".encode()).hexdigest() for code in requested}}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        patchers = (
+            patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)),
+            patch.object(module, "_v22_development_input_manifest", return_value=manifest),
+            patch.object(module, "load_day_v2_statistics", side_effect=fake_load),
+            patch.object(module, "development_listing_evidence", return_value=LISTED),
+        )
+        with tempfile.TemporaryDirectory() as clean_root, tempfile.TemporaryDirectory() as interrupted_root, patchers[0], patchers[1], patchers[2], patchers[3]:
+            _, clean_dir = run_v22_development("synthetic", "synthetic", clean_root)
+            clean_economics = {name: (clean_dir / name).read_bytes() for name in ("daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz")}
+            writer = module._write_json
+            interrupted = {"done": False}
+
+            def interrupt_after_outcome(path, value):
+                writer(path, value)
+                if not interrupted["done"] and path.parent.name == "outcomes" and path.name == "20240924.json":
+                    interrupted["done"] = True
+                    raise KeyboardInterrupt
+
+            with patch.object(module, "_write_json", side_effect=interrupt_after_outcome):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_v22_development("synthetic", "synthetic", interrupted_root)
+            run_dir = next(Path(interrupted_root).glob("v22-development-*"))
+            self.assertEqual("CANCELLED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+            self.assertTrue((run_dir / "outcomes" / "20240924.json").exists())
+            self.assertFalse((run_dir / "daily_commits" / "20240924.json").exists())
+            calls.clear()
+            resumed, resumed_dir = run_v22_development("synthetic", "synthetic", interrupted_root, resume_run_id=run_dir.name)
+            self.assertEqual(run_dir, resumed_dir)
+            self.assertEqual("tnm_v22_development_completed", resumed["execution_label"])
+            self.assertTrue(calls and all(count == 1 for count in calls.values()))
+            self.assertTrue(all(count == 1 for count in resumed["source_open_counts"].values()))
+            self.assertLessEqual(resumed["max_cached_market_days"], 11)
+            self.assertTrue((run_dir / "orphans" / "20240924" / "outcomes" / "20240924.json").exists())
+            self.assertTrue((run_dir / "outcomes" / "20240924.json").exists())
+            self.assertEqual(clean_economics, {name: (run_dir / name).read_bytes() for name in clean_economics})
+            self.assertFalse((run_dir / "run.lock").exists())
 
     def test_v22_development_marks_terminal_open_events_unresolved(self) -> None:
         from mining import tail_next_morning_v2 as module

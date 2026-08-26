@@ -1493,6 +1493,26 @@ def _v22_relative_month_bootstrap(strategy: Iterable[Mapping[str, Any]], control
     return {"status": "diagnostic", "ci95": [float(series.quantile(.025)), float(series.quantile(.975))]}
 
 
+def _v22_combined_channel_slots(slots: Iterable[Mapping[str, Any]], group: str) -> list[dict[str, Any]]:
+    """Combine same-day A/B slots by their actual fixed-slot weights, not event counts."""
+    by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in slots:
+        if str(row["strategy_or_control"]) == group and str(row["channel"]) in {"A", "B"}:
+            by_day[str(row["trade_date"])].append(dict(row))
+    result: list[dict[str, Any]] = []
+    for trade_date, members in sorted(by_day.items()):
+        blocked = any(member.get("daily_slot_net") is None for member in members)
+        actual_weight = sum(float(member.get("selected_slot_weight", 0.0)) for member in members)
+        weighted_net = sum(float(member["daily_slot_net"]) * float(member["nominal_slots"]) for member in members if member.get("daily_slot_net") is not None)
+        result.append({
+            "trade_date": trade_date, "channel": "AB", "strategy_or_control": group,
+            "daily_slot_net": None if blocked or actual_weight <= 0 else weighted_net / actual_weight,
+            "nominal_slots": V22_A_LIMIT + V22_B_LIMIT, "selected_slots": sum(int(member.get("selected_slots", 0)) for member in members),
+            "selected_slot_weight": actual_weight, "status": "blocked_unresolved" if blocked else "ready",
+        })
+    return result
+
+
 def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     """Shared canary/development consumer with year/month, slots and deterministic bootstrap."""
     rows = [dict(event) for event in events]
@@ -1521,7 +1541,30 @@ def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]
             strategy_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == strategy]
             control_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == best]
             bootstrap[f"{strategy}|combined"]["relative_best_control"] = {"control": best, **_v22_relative_month_bootstrap(strategy_slots, control_slots)}
-    return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "daily_slot_statistics": slot_stats, "bootstrap": bootstrap}
+    combined_groups = sorted({str(event["strategy_or_control"]) for event in rows})
+    combined_channel: dict[str, Any] = {"overall": {}, "yearly": {}, "monthly": {}, "daily_slot_net": [], "daily_slot_statistics": {}, "bootstrap": {}}
+    for group in combined_groups:
+        group_rows = [event for event in rows if str(event["strategy_or_control"]) == group and str(event["channel"]) in {"A", "B"}]
+        combined_channel["overall"][group] = _v22_group_metrics(group_rows)
+        for year in sorted({str(event["trade_date"])[:4] for event in group_rows}):
+            combined_channel["yearly"][f"{group}|{year}"] = _v22_group_metrics(event for event in group_rows if str(event["trade_date"]).startswith(year))
+        for month in sorted({str(event["trade_date"])[:6] for event in group_rows}):
+            combined_channel["monthly"][f"{group}|{month}"] = _v22_group_metrics(event for event in group_rows if str(event["trade_date"]).startswith(month))
+        scoped = _v22_combined_channel_slots(slots, group)
+        combined_channel["daily_slot_net"].extend(scoped)
+        combined_channel["daily_slot_statistics"][f"{group}|combined"] = _v22_fixed_slot_summary(scoped)
+        combined_channel["bootstrap"][f"{group}|combined"] = _v22_month_block_bootstrap(scoped)
+        for year in sorted({str(row["trade_date"])[:4] for row in scoped}):
+            annual = [row for row in scoped if str(row["trade_date"]).startswith(year)]
+            combined_channel["daily_slot_statistics"][f"{group}|{year}"] = _v22_fixed_slot_summary(annual)
+            combined_channel["bootstrap"][f"{group}|{year}"] = _v22_month_block_bootstrap(annual)
+    controls = [group for group in combined_groups if group != "strategy"]
+    if "strategy" in combined_groups and controls:
+        best = max(controls, key=lambda group: (combined_channel["daily_slot_statistics"][f"{group}|combined"]["mean"] if combined_channel["daily_slot_statistics"][f"{group}|combined"]["mean"] is not None else -math.inf, group))
+        strategy_slots = [row for row in combined_channel["daily_slot_net"] if row["strategy_or_control"] == "strategy"]
+        control_slots = [row for row in combined_channel["daily_slot_net"] if row["strategy_or_control"] == best]
+        combined_channel["bootstrap"]["strategy|combined"]["relative_best_control"] = {"control": best, **_v22_relative_month_bootstrap(strategy_slots, control_slots)}
+    return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "daily_slot_statistics": slot_stats, "bootstrap": bootstrap, "combined_channel": combined_channel}
 
 
 def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -1801,19 +1844,96 @@ def _v22_development_outcome_identity(
     return _unit_consumed_input(_unit_minute_members(records, {trade_date: codes, previous_date: codes}), {})
 
 
-def _v22_development_replay_outcomes(run_dir: Path, run_hash: str, events: list[dict[str, Any]], minute_root: str | Path) -> set[str]:
-    journals = []
+def _v22_development_sha_bound_file(run_dir: Path, reference: Mapping[str, Any], kind: str) -> tuple[Path, dict[str, Any]]:
+    """Read one marker-owned file and reject a missing or changed payload."""
+    try:
+        relative = PurePosixPath(str(reference["path"]))
+        if relative.is_absolute() or ".." in relative.parts:
+            raise ValueError("non_relative")
+        path = run_dir / Path(*relative.parts)
+        if path.resolve().parent != (run_dir / Path(*relative.parts[:-1])).resolve():
+            raise ValueError("non_relative")
+        if not path.is_file() or _sha256(path) != str(reference["sha256"]):
+            raise ValueError("hash")
+        return path, json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise TailDataError(f"v22_development_daily_commit_{kind}_mismatch") from exc
+
+
+def _v22_development_read_commits(
+    run_dir: Path, run_hash: str, calendar: list[str], positions: Mapping[str, int], *, isolate_orphans: bool,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]], set[str], int]:
+    """Return only marker-committed facts; anything else is retained as audit evidence."""
+    markers: list[tuple[int, dict[str, Any], dict[str, Any], dict[str, Any] | None, dict[str, Any] | None]] = []
+    marker_dir = run_dir / "daily_commits"
+    for marker_path in sorted(marker_dir.glob("*.json")) if marker_dir.exists() else []:
+        marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        if marker.get("run_hash") != run_hash:
+            raise TailDataError("v22_development_daily_commit_hash_mismatch")
+        trade_date = str(marker.get("trade_date"))
+        state_path, state = _v22_development_sha_bound_file(run_dir, marker.get("state", {}), "state")
+        index = int(state.get("last_processed_index", -1))
+        if trade_date not in positions or index != positions[trade_date] or state.get("last_processed_date") != trade_date:
+            raise TailDataError("v22_development_daily_commit_state_mismatch")
+        if state_path.parent != run_dir / "states":
+            raise TailDataError("v22_development_daily_commit_state_path")
+        signal = None
+        if marker.get("signal") is not None:
+            _, checkpoint = _v22_development_sha_bound_file(run_dir, marker["signal"], "signal")
+            if checkpoint.get("run_hash") != run_hash or checkpoint.get("unit") != f"market:{trade_date}":
+                raise TailDataError("v22_development_daily_commit_signal_mismatch")
+            signal = dict(checkpoint.get("result", {}))
+        outcome = None
+        if marker.get("outcome") is not None:
+            _, outcome = _v22_development_sha_bound_file(run_dir, marker["outcome"], "outcome")
+            if outcome.get("run_hash") != run_hash or str(outcome.get("trade_date")) != trade_date:
+                raise TailDataError("v22_development_daily_commit_outcome_mismatch")
+        markers.append((index, marker, state, signal, outcome))
+    markers.sort(key=lambda value: value[0])
+    if [index for index, *_ in markers] != list(range(len(markers))):
+        raise TailDataError("v22_development_daily_commit_frontier_gap")
+    committed_dates = {str(state["last_processed_date"]) for _, _, state, _, _ in markers}
+    if isolate_orphans:
+        for directory in ("outcomes", "checkpoints", "states"):
+            folder = run_dir / directory
+            for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+                stem = path.stem.replace("market_", "")
+                if stem in committed_dates:
+                    continue
+                target = run_dir / "orphans" / stem / directory / path.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    target = target.with_name(f"{path.stem}.{_sha256(path)[:12]}{path.suffix}")
+                os.replace(path, target)
+    completed: dict[str, dict[str, Any]] = {}
+    journals: list[dict[str, Any]] = []
+    outcomes: set[str] = set()
+    for _, _, _, signal, outcome in markers:
+        if signal is not None:
+            completed[f"market:{signal['daily']['trade_date']}"] = signal
+        if outcome is not None:
+            journals.append(outcome)
+            outcomes.add(str(outcome["trade_date"]))
+    return completed, journals, outcomes, markers[-1][0] if markers else -1
+
+
+def _v22_development_required_members(
+    completed: Mapping[str, Mapping[str, Any]], journals: Iterable[Mapping[str, Any]],
+) -> dict[str, set[str]]:
     required: dict[str, set[str]] = defaultdict(set)
-    for path in sorted((run_dir / "outcomes").glob("*.json")) if (run_dir / "outcomes").exists() else []:
-        journal = json.loads(path.read_text(encoding="utf-8"))
-        if journal.get("run_hash") != run_hash:
-            raise TailDataError("v22_development_outcome_hash_mismatch")
-        journals.append(journal)
-        for day, codes in journal.get("unit_consumed_input", {}).get("minute_members", {}).items():
+    for result in list(completed.values()) + list(journals):
+        identity = result.get("unit_consumed_input", {})
+        for day, codes in identity.get("minute_members", {}).items():
             required[str(day)].update(str(code) for code in codes)
-    records: dict[str, dict[str, Any]] = {}
-    for day, codes in sorted(required.items()):
-        _, records[day] = load_day_v2_statistics(minute_root, day, codes)
+    return required
+
+
+def _v22_development_verify_and_replay(
+    completed: Mapping[str, Mapping[str, Any]], journals: Iterable[Mapping[str, Any]], events: list[dict[str, Any]], records: Mapping[str, Mapping[str, Any]],
+) -> set[str]:
+    """Verify selection/outcome identities against one already-loaded source map."""
+    for unit, result in sorted(completed.items()):
+        _verify_checkpoint_consumed_input(unit, result, records)
     by_id = {str(event["event_id"]): event for event in events}
     dates: set[str] = set()
     for journal in journals:
@@ -1829,18 +1949,43 @@ def _v22_development_replay_outcomes(run_dir: Path, run_hash: str, events: list[
     return dates
 
 
-def _v22_development_write_resume_state(
-    path: Path, run_hash: str, completed: Mapping[str, Mapping[str, Any]], last_index: int,
+def _v22_development_resume_state(
+    run_hash: str, completed: Mapping[str, Mapping[str, Any]], last_index: int,
     calendar: list[str], outcome_dates: Iterable[str], source_open_counts: Mapping[str, int],
-) -> None:
-    _write_json(path, {
+) -> dict[str, Any]:
+    return {
         "run_hash": run_hash,
         "completed_signal_dates": sorted(str(result["daily"]["trade_date"]) for result in completed.values()),
         "last_processed_index": last_index,
         "last_processed_date": calendar[last_index] if last_index >= 0 else None,
         "outcome_journal_dates": sorted(outcome_dates),
         "source_open_counts": dict(sorted(source_open_counts.items())),
-    })
+    }
+
+
+def _v22_development_commit_day(
+    run_dir: Path, run_hash: str, trade_date: str, state: Mapping[str, Any], *, outcome: Mapping[str, Any] | None, signal: Mapping[str, Any] | None,
+) -> None:
+    """Publish one day atomically: only this marker makes its files economic facts."""
+    outcome_ref = None
+    if outcome is not None:
+        path = run_dir / "outcomes" / f"{trade_date}.json"
+        _write_json(path, outcome)
+        outcome_ref = {"path": path.relative_to(run_dir).as_posix(), "sha256": _sha256(path)}
+    signal_ref = None
+    if signal is not None:
+        path = run_dir / "checkpoints" / f"market_{trade_date}.json"
+        _write_json(path, {"run_hash": run_hash, "unit": f"market:{trade_date}", "result": signal})
+        signal_ref = {"path": path.relative_to(run_dir).as_posix(), "sha256": _sha256(path)}
+    state_path = run_dir / "states" / f"{trade_date}.json"
+    _write_json(state_path, dict(state))
+    marker = {
+        "run_hash": run_hash, "trade_date": trade_date,
+        "outcome": outcome_ref, "signal": signal_ref,
+        "state": {"path": state_path.relative_to(run_dir).as_posix(), "sha256": _sha256(state_path)},
+    }
+    _write_json(run_dir / "daily_commits" / f"{trade_date}.json", marker)
+    _write_json(run_dir / "resume_state.json", dict(state))
 
 
 def _v22_development_signal_result(
@@ -1909,58 +2054,73 @@ def run_v22_development(minute_root: str | Path, daily_root: str | Path, output_
         return values
 
     try:
+        succeeded_fast_path = False
         if completion_path.exists():
             completion = json.loads(completion_path.read_text(encoding="utf-8"))
             if completion.get("status") == "SUCCEEDED":
                 if resume_run_id is None or completion.get("run_hash") != run_hash:
                     raise TailDataError("v22_development_succeeded_requires_explicit_matching_resume")
-                saved = _v22_verify_saved_units(run_dir, run_hash, minute_root)
-                saved_events = [dict(event) for _, result in sorted(saved.items()) for event in result.get("seed_events", [])]
-                _v22_development_replay_outcomes(run_dir, run_hash, saved_events, minute_root)
-                _v22_verify_development_artifacts(run_dir, completion)
-                return json.loads((run_dir / "development_summary.json").read_text(encoding="utf-8")), run_dir
-            if completion.get("status") == "FAILED":
+                succeeded_fast_path = True
+            elif completion.get("status") == "FAILED":
                 raise TailDataError("v22_development_failed_requires_review")
-            if completion.get("status") != "CANCELLED" or resume_run_id is None:
+            elif completion.get("status") != "CANCELLED" or resume_run_id is None:
                 raise TailDataError("v22_development_terminal_requires_explicit_resume")
-            previous_completion = run_dir / "completion.cancelled.json"
-            if not previous_completion.exists():
-                _write_json(previous_completion, completion)
-            preserve_existing_terminal = False
-        lock = _v22_development_claim_lock(run_dir, run_hash)
+            elif not succeeded_fast_path:
+                previous_completion = run_dir / "completion.cancelled.json"
+                if not previous_completion.exists():
+                    _write_json(previous_completion, completion)
+                preserve_existing_terminal = False
+        if not succeeded_fast_path:
+            lock = _v22_development_claim_lock(run_dir, run_hash)
         if resume_run_id is not None:
-            completed = _v22_verify_saved_units(run_dir, run_hash, minute_root)
+            completed, journals, outcome_dates, frontier = _v22_development_read_commits(
+                run_dir, run_hash, calendar, positions, isolate_orphans=not succeeded_fast_path,
+            )
             for unit, result in sorted(completed.items()):
                 if "seed_events" not in result:
                     raise TailDataError(f"v22_development_checkpoint_missing_seeds:{unit}")
                 events.extend(dict(event) for event in result["seed_events"])
-            outcome_dates = _v22_development_replay_outcomes(run_dir, run_hash, events, minute_root)
             if resume_path.exists():
                 state = json.loads(resume_path.read_text(encoding="utf-8"))
                 if state.get("run_hash") != run_hash:
                     raise TailDataError("v22_development_resume_state_hash_mismatch")
-                source_open_counts.update({str(day): int(count) for day, count in state.get("source_open_counts", {}).items()})
-        completed_dates = {str(result["daily"]["trade_date"]) for result in completed.values()}
-        start_index = max((positions[day] for day in completed_dates), default=-1) + 1
-        if start_index and start_index < len(calendar):
-            for index in range(max(0, start_index - 10), start_index):
-                load(index)
+            start_index = frontier + 1
+            required = _v22_development_required_members(completed, journals)
+            warm_indexes = set(range(max(0, start_index - 10), start_index))
+            validation_records: dict[str, dict[str, Any]] = {}
+            demands = {positions[day] for day in required}
+            for index in sorted(demands | warm_indexes):
+                trade_date = calendar[index]
+                requested = None if index in warm_indexes else required[trade_date]
+                values, record = load_day_v2_statistics(minute_root, trade_date, requested)
+                source_open_counts[trade_date] += int(record.get("container_open_count", 1))
+                if index in warm_indexes:
+                    cache[trade_date], records[trade_date] = values, record
+                else:
+                    validation_records[trade_date] = record
+            max_cached_days = len(cache)
+            source_records = dict(validation_records) | records
+            outcome_dates = _v22_development_verify_and_replay(completed, journals, events, source_records)
+        else:
+            start_index = 0
+        if succeeded_fast_path:
+            _v22_verify_development_artifacts(run_dir, completion)
+            return json.loads((run_dir / "development_summary.json").read_text(encoding="utf-8")), run_dir
         progress("input_frozen" if start_index == 0 else "resumed", start_index - 1)
         for index in range(start_index, len(calendar)):
             day = load(index)
+            journal: dict[str, Any] | None = None
             if index:
                 open_events = _v22_apply_exit_day(events, calendar, index, day, cache[calendar[index - 1]])
                 if open_events:
                     codes = {str(event["sec_code"]) for event in open_events}
-                    journal_path = run_dir / "outcomes" / f"{calendar[index]}.json"
-                    if journal_path.exists():
-                        raise TailDataError(f"v22_development_outcome_exists:{calendar[index]}")
-                    _write_json(journal_path, {
+                    journal = {
                         "run_hash": run_hash, "trade_date": calendar[index],
                         "updates": [{"event_id": event["event_id"], "event": _public_row(event)} for event in open_events],
                         "unit_consumed_input": _v22_development_outcome_identity(records, calendar[index], calendar[index - 1], codes),
-                    })
+                    }
                     outcome_dates.add(calendar[index])
+            result: dict[str, Any] | None = None
             if index >= 10 and index + 1 < len(calendar):
                 target, unit = calendar[index], f"market:{calendar[index]}"
                 if unit not in completed:
@@ -1979,19 +2139,15 @@ def run_v22_development(minute_root: str | Path, daily_root: str | Path, output_
                                 event = _v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {}), signal_stat=day.get(row["sec_code"]), slot_weight=slot_weight)
                                 event["event_id"] = f"{target}|{channel}|{group}|{rank}|{event['sec_code']}"
                                 target_events.append(event)
-                    checkpoint_path = run_dir / "checkpoints" / f"{unit.replace(':', '_')}.json"
-                    if checkpoint_path.exists():
-                        raise TailDataError(f"v22_development_checkpoint_exists:{unit}")
                     result = _v22_development_signal_result(records, daily_consumed, target, index, rows, ranked, target_events, calendar)
-                    _checkpoint(run_dir, run_hash, unit, result)
                     completed[unit] = result
                     events.extend(target_events)
-                    _v22_development_write_resume_state(resume_path, run_hash, completed, index, calendar, outcome_dates, source_open_counts)
+            state = _v22_development_resume_state(run_hash, completed, index, calendar, outcome_dates, source_open_counts)
+            _v22_development_commit_day(run_dir, run_hash, calendar[index], state, outcome=journal, signal=result)
             progress(f"source:{calendar[index]}", index)
         for event in events:
             if event["outcome_status"] == "open":
                 event.update({"outcome_status": "unresolved_at_development_end", "holding_days": len(calendar) - int(event["start_index"]) - 1})
-        _v22_development_write_resume_state(resume_path, run_hash, completed, len(calendar) - 1, calendar, outcome_dates, source_open_counts)
         all_daily = [row for _, result in sorted(completed.items()) for row in result["eligible_rows"]]
         daily = {str(result["daily"]["trade_date"]): result["daily"] for _, result in sorted(completed.items())}
         aggregates = _v22_event_aggregates(events)
@@ -2004,7 +2160,12 @@ def run_v22_development(minute_root: str | Path, daily_root: str | Path, output_
             "source_blob_identity": manifest["source_blob_identity"], "input_manifest_hash": manifest["input_manifest_hash"],
             "daily": daily, "event_count": len(events), "resolved_events": sum(event["outcome_status"] == "resolved" for event in events),
             "unresolved_events": sum(event["outcome_status"] == "unresolved_at_development_end" for event in events),
-            "strategy_channel_summary": {"A": _v22_group_metrics(event for event in strategy if event["channel"] == "A"), "B": _v22_group_metrics(event for event in strategy if event["channel"] == "B"), "combined": _v22_group_metrics(strategy)},
+            "strategy_channel_summary": {
+                "A": _v22_group_metrics(event for event in strategy if event["channel"] == "A"),
+                "B": _v22_group_metrics(event for event in strategy if event["channel"] == "B"),
+                "combined": _v22_group_metrics(strategy),
+                "AB": aggregates["combined_channel"]["overall"].get("strategy", _v22_group_metrics(())),
+            },
             "aggregates": aggregates, "account": account, "verified_checkpoint_consumed_identities": verified,
             "consumed_input_identity": _json_identity(verified), "source_open_counts": dict(sorted(source_open_counts.items())),
             "max_cached_market_days": max_cached_days,

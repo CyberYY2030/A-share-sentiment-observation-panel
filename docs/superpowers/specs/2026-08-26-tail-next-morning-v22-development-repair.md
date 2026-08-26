@@ -32,4 +32,21 @@ Terra 只可写 `mining/tail_next_morning_v2.py`、`tests/test_tail_next_morning
 
 ## 6. 执行证据
 
-尚未执行。
+### TNM-V2.2 development runner 最窄修复（Terra，2026-08-26）
+
+状态：`tnm_v22_development_repair_verified`。日处理改为 outcome、signal checkpoint、state
+先分别原子落盘，再由单个 `daily_commits/<date>.json` marker 绑定三者 SHA-256 后发布；resume
+只读取 marker 引用的事实，未提交 outcome/signal/state 移入 `orphans/<date>/` 保留审计证据。
+合成故障注入覆盖 outcome 落盘后、signal/marker 前 `KeyboardInterrupt`：原 run 为
+`CANCELLED`，同 identity resume 成功，恢复经济 CSV 与不中断 run 字节一致，无重复退出或信号。
+
+resume 先合并 checkpoint、outcome identity 和最近十个全市场预热日需求；每个日期本进程
+只物理打开一次，非滚动验证记录在验证后释放，完整市场缓存最多 11 日，
+`source_open_counts` 不再继承历史进程。聚合新增明确的 `combined_channel`/`AB` 消费者，
+对 strategy 与三个 same-N controls 输出 overall、年/月、fixed daily-slot 及 month-block bootstrap；
+同日 A/B 按实际 slot weight 合并，九袖套保持原定义。
+
+本地验证：Python 3.11 `tests.test_tail_next_morning_v2` 50 passed / 1 skipped；
+`tests.test_tail_next_morning` 25 passed；`py_compile` 和 `git diff --check` 通过。
+全程未读取 E 盘、未创建真实 preflight/canary/development identity、未读取 2025/2026、无任务进程。
+shared dirty 保留，未 push。等待 Sol 独立复审；真实 development 继续锁定。Lessons：`skip`。
