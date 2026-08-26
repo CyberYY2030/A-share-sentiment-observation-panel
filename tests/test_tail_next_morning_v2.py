@@ -8,6 +8,7 @@ import json
 import math
 import os
 import random
+import shutil
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -22,6 +23,7 @@ from mining.tail_next_morning_v2 import (
     MIN_D1_AMOUNT,
     _checkpoint,
     _content_identity,
+    _final_row,
     _gate_counts,
     _prepare_canary_run,
     _spec_hash,
@@ -230,6 +232,25 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertEqual(1, counts["predicate_fail_counts"]["d1_liquidity_failed"])
         self.assertEqual(1, counts["predicate_fail_counts"]["A"]["tail_return<-0.03"])
         self.assertEqual(1, counts["predicate_fail_counts"]["A"]["range_expansion<1.50"])
+
+    def test_final_row_skipped_listing_is_a_shape_failure_not_listing_failure(self) -> None:
+        from mining import tail_next_morning_v2 as module
+
+        day, prior = a_inputs()
+        day["signal"].update({"tail_return": -0.04, "range1450": .01})
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "development_listing_evidence", side_effect=AssertionError("listing was read for a shape failure")):
+            skipped = _final_row("300704", "20240923", 20, day, prior, temporary, {})
+        self.assertFalse(skipped["shape_pass"])
+        self.assertEqual("not_evaluated_shape_or_liquidity_failed", skipped["listing_age_source"])
+        skipped_counts = _gate_counts([skipped], rank_channels([skipped]), {"universe": 1, "survivors": 1})
+        self.assertEqual(0, skipped_counts["predicate_fail_counts"]["listing_failed"])
+        self.assertEqual(1, skipped_counts["first_failure_counts"]["both_channel_shape_failed"])
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "development_listing_evidence", return_value={"listing_age_source": "daily_k_date_threshold_proof", "listing_history_count_status": "exact_below_threshold", "listing_history_sessions": 19}):
+            listed = _final_row("300705", "20240923", 20, *a_inputs(), temporary, {})
+        listed_counts = _gate_counts([listed], rank_channels([listed]), {"universe": 1, "survivors": 1})
+        self.assertEqual(1, listed_counts["predicate_fail_counts"]["listing_failed"])
+        self.assertEqual(1, listed_counts["first_failure_counts"]["listing"])
 
     def test_a_shape_and_strict_d1_liquidity(self) -> None:
         day, prior = a_inputs(d1_amount=MIN_D1_AMOUNT)
@@ -524,11 +545,24 @@ class TailNextMorningV2Tests(unittest.TestCase):
 
         manifest = {"minute_containers": [], "daily_root": "synthetic", "targets": list(positions), "market_targets": ["20240923", "20240926"]}
         with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_calendar_for_targets", return_value=(calendar, positions)), patch.object(module, "_canary_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
-            summary, run_dir = run_canary("synthetic", "synthetic", temporary)
+            source_base = Path(temporary) / "source"
+            summary, run_dir = run_canary("synthetic", "synthetic", source_base)
+            copied_base = Path(temporary) / "copied"
+            copied_run = copied_base / run_dir.name
+            shutil.copytree(run_dir, copied_run)
+            before = {
+                path.relative_to(copied_run).as_posix(): (path.read_bytes(), hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+                for path in copied_run.rglob("*") if path.is_file()
+            }
             with patch.object(module, "rank_channels", side_effect=AssertionError("SUCCEEDED fast path recalculated rankings")):
-                resumed, resumed_dir = run_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+                resumed, resumed_dir = run_canary("synthetic", "synthetic", copied_base, resume_run_id=run_dir.name)
+            after = {
+                path.relative_to(copied_run).as_posix(): (path.read_bytes(), hashlib.sha256(path.read_bytes()).hexdigest(), path.stat().st_mtime_ns)
+                for path in copied_run.rglob("*") if path.is_file()
+            }
             self.assertEqual(summary, resumed)
-            self.assertEqual(run_dir, resumed_dir)
+            self.assertEqual(copied_run, resumed_dir)
+            self.assertEqual(before, after)
         self.assertEqual(2, calls["20240924"])
 
     @unittest.skipUnless(Path(r"E:\分钟数据").exists(), "real minute source unavailable")

@@ -44,7 +44,7 @@ from mining.tail_next_morning import (
 )
 
 
-TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-recovery-task-card.md"
+TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v2-ranking-final-evidence-repair.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
@@ -617,13 +617,14 @@ def _gate_counts(rows: Iterable[Mapping[str, Any]], ranked: Mapping[str, Any], p
             b_fail[str(reason)] += 1
         a_qualified = bool(row.get("a_shape_pass") and row.get("liquidity_pass") and row.get("listing_pass") and row.get("common_quality_pass"))
         b_qualified = bool(row.get("b_shape_pass") and row.get("liquidity_pass") and row.get("listing_pass") and row.get("common_quality_pass"))
+        listing_evaluated = row.get("listing_age_source") != "not_evaluated_shape_or_liquidity_failed"
         if a_qualified and b_qualified:
             overlap += 1
         if not row.get("common_quality_pass"):
             first["common_quality"] += 1
         elif not row.get("liquidity_pass"):
             first["d1_liquidity"] += 1
-        elif not row.get("listing_pass"):
+        elif listing_evaluated and not row.get("listing_pass"):
             first["listing"] += 1
         elif a_qualified:
             first["eligible_A"] += 1
@@ -636,7 +637,10 @@ def _gate_counts(rows: Iterable[Mapping[str, Any]], ranked: Mapping[str, Any], p
         "B": dict(sorted(b_fail.items())),
         "common_quality_failed": sum(not bool(row.get("common_quality_pass")) for row in evaluated),
         "d1_liquidity_failed": sum(not bool(row.get("liquidity_pass")) for row in evaluated),
-        "listing_failed": sum(not bool(row.get("listing_pass")) for row in evaluated),
+        "listing_failed": sum(
+            row.get("listing_age_source") != "not_evaluated_shape_or_liquidity_failed" and not bool(row.get("listing_pass"))
+            for row in evaluated
+        ),
         "a_b_overlap_excluded_from_B": overlap,
         "tail_limit_touch_before_channel": sum(bool(row.get("tail_limit_touch")) for row in evaluated if row.get("common_quality_pass")),
     }
@@ -795,6 +799,18 @@ def _checkpoint(run_dir: Path, run_hash: str, unit: str, result: Mapping[str, An
     _write_json(run_dir / "checkpoints" / f"{unit.replace('|', '_').replace(':', '_')}.json", {"run_hash": run_hash, "unit": unit, "result": result})
 
 
+def _verify_succeeded_artifacts(run_dir: Path, completion: Mapping[str, Any]) -> None:
+    artifact_path = run_dir / "artifact_manifest.json"
+    expected = json.loads(artifact_path.read_text(encoding="utf-8"))
+    actual = {
+        path.name: {"size_bytes": path.stat().st_size, "sha256": _sha256(path)}
+        for path in sorted(run_dir.iterdir())
+        if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}
+    }
+    if completion.get("artifact_manifest_sha256") != _sha256(artifact_path) or actual != expected:
+        raise TailDataError("succeeded_artifact_manifest_mismatch")
+
+
 def _final_row(code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]], daily_consumed: dict[str, dict[str, str]] | None = None) -> dict[str, Any]:
     provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
     row = build_signal_row(code, day, prior, provisional)
@@ -818,7 +834,7 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
     run_dir, run_manifest = _prepare_canary_run(output_dir, input_manifest, resume_run_id=resume_run_id)
     run_hash = run_manifest["run_hash"]
     progress_path, completion_path = run_dir / "progress.json", run_dir / "completion.json"
-    _write_json(progress_path, {"run_hash": run_hash, "stage": "initializing", "completed_units": [], "elapsed_seconds": 0.0, "exception_counts": {}})
+    preserve_existing_terminal = completion_path.exists()
     stats_cache: dict[str, dict[str, dict[str, Any]]] = {}
     source_records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
@@ -888,7 +904,9 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
                     or summary.get("consumed_input_identity") != hashlib.sha256(_json_bytes(verified_unit_identities)).hexdigest()
                 ):
                     raise TailDataError("succeeded_summary_identity_mismatch")
+                _verify_succeeded_artifacts(run_dir, completion)
                 return summary, run_dir
+        _write_json(progress_path, {"run_hash": run_hash, "stage": "initializing", "completed_units": [], "elapsed_seconds": 0.0, "exception_counts": {}})
         daily_top: dict[str, Any] = {}
         fixture_rows: dict[str, Any] = {}
         eligible_rows: list[dict[str, Any]] = []
@@ -993,12 +1011,14 @@ def run_diagnostic(minute_root: str | Path, daily_root: str | Path, output_dir: 
         _write_json(completion_path, {"status": "SUCCEEDED", "run_hash": run_hash, "execution_label": label, "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json")})
         return summary, run_dir
     except KeyboardInterrupt:
-        _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash})
+        if not preserve_existing_terminal:
+            _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash})
         raise
 
 
     except Exception as exc:
-        _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        if not preserve_existing_terminal:
+            _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
         raise
 
 

@@ -28,4 +28,12 @@ tracked 白名单仅 V2 module、V2 tests、本卡执行证据。先跑 V2/V1/py
 
 ## 4. 执行证据
 
-尚未执行。
+2026-08-26，最终证据修复通过：
+
+- 本地验证：`python -m unittest tests.test_tail_next_morning_v2`（34 passed）、`python -m unittest tests.test_tail_next_morning`（25 passed）、`python -m py_compile mining\\tail_next_morning_v2.py tests\\test_tail_next_morning_v2.py`、`git diff --check` 均通过。
+- SUCCEEDED fast path：合成成功 run 复制后，先验证 checkpoint 内容 identity、completion、summary 与 artifact manifest；合法复用直接返回，递归记录的全部文件 bytes、SHA-256 与 mtime 完全不变，`progress.json` 不会退回 `initializing`。验证异常保留既有终态，fail closed。
+- listing 计数：production `_final_row` 路径证明 shape 失败时不读取上市证据，`listing_age_source=not_evaluated_shape_or_liquidity_failed` 归入 `both_channel_shape_failed`，不计 `listing_failed`；真实上市证据读取后失败才归入 `listing`。
+- 唯一真实运行：`output/tail-next-morning-v2/diagnostic/diagnostic-ba6bc1632df7-bce252f213e7`，`execution_label=tnm_v2_r1_diagnostic_ready`，`run_hash=bce252f213e770586c6289596da08d0159fd56cbefa30ffe981507343c6a3b12`，`consumed_input_identity=413c1f986cb35483e4d24d2300754caa8d0fe5ffab4ac9762a0e9dbb64ace6fd`。
+- 与 `diagnostic-d5a2f267b379-39d6a370a90a` 经济输出逐字一致：四池 Top10 JSON、eligible CSV、fixture JSON；eligible=135，`20240923 A/B=5/6`，`20240926 A/B=104/20`，涨停触及剔除=202，300085/300339 均为 A 第 2。
+- 新 gate counts：20240923 evaluated=185，first-failure=`common_quality:2, both_channel_shape_failed:172, eligible_A:5, eligible_B:6`；20240926 evaluated=1193，first-failure=`common_quality:3, both_channel_shape_failed:1066, eligible_A:104, eligible_B:20`。两日 `listing_failed=0`，first-failure total 均守恒；predicate 计数仍可重叠。
+- 仅读 2024，`read_2025_2026=false`、`e_drive_written=false`。真实诊断进程已正常退出；仅观察到既存共享 Python 进程，未停止它们，无任务自有临时文件待清理。
