@@ -134,3 +134,35 @@ progress 的 source_frontier/completed_units/open_exit_events/updated_at、compl
 已退出。该失败表明 development runner 仍错误复用了 canary 的 2024 年界，属于 P1；旧失败 identity、
 manifest、progress、completion 和日志全部保留，禁止 resume、第二次启动或读取 2025/2026。需新修复卡、
 合成回归和独立审核后才可重新申请 launch。Lessons：`create` 候选（development loader 年界必须与 mode 一致）。
+
+### TNM-V2.2 development 终态只读验收（Terra，2026-08-27）
+
+状态：`tnm_v22_development_terminal_verified_pending_sol`。唯一新 identity
+`v22-development-8fffe4a3fba4-7afabfa01de2` 已原子 `SUCCEEDED`：run hash
+`7afabfa01de259fffb6db850e212b67d98211ed9c244c82372497a30ea522c81`，base commit
+`e3fa688c7bed00eb942f9fe632314bccb6fe2cae`，spec hash
+`8fffe4a3fba47496d68c49269fca70bc83da3633eca89bc5ff06b54899365a45`，input manifest hash
+`45aaeaed69e27f44d53989085cee2893da64160d970e920b7416679cb7ff4a57`；module/test blob 分别为
+`f758c9b92d0f00546c6e1b28e08b193b4534576d`/
+`936ba5efc67ea5108b80b78a41dffb4034df2b2d`。
+
+`progress`/`resume_state` 闭合为 473/473 signal checkpoint 与 outcome journal，frontier
+`20241231`（index 483），`open_exit_events=0`；473 个 target 为 `20230117` 至 `20241230`。
+484 个来源日各物理打开一次（全部 open count=1），最大缓存 11 日。受管 artifact manifest 有 1,922
+项：473 checkpoints、473 outcomes、484 daily commits、484 states 及 8 个汇总根产物；逐项重算 SHA-256
+零不匹配，manifest SHA-256 为
+`a118994006d7f3a053ba05730305226db25ab21fa7f8d526748f6f38344324db`，与 completion 一致。daily
+commits/states 覆盖 484 个实际来源日，故大于 473 个 target-level checkpoint/outcome journal。
+
+`development_summary.json` 的 16,028 个事件均 resolved、unresolved=0，A/B/AB strategy coverage 均为
+1.0（A=2,649、B=1,358、AB=4,007）。A/B 各有 strategy + 三个 same-N controls 的 8 个 overall、16 个
+年度、192 个月度、24 个 fixed-slot 与 24 个 bootstrap 汇总；AB 合并通道有 4 个 overall、8 个年度、96
+个月度、12 个 fixed-slot 与 12 个 bootstrap 汇总，四组 strategy/control coverage 均为 1.0。九袖套账户
+`ready`，busy skip=250、stale mark days=5、MTM NAV=61,142.290713900235、total return=-0.9877715418572199；
+该结果仅记录，不调整经济规则。§4 要求的 summary、daily/event、ledger/NAV、resume/manifest/completion
+产物均存在。汇总声明 `read_2025_2026=false`、`e_drive_written=false`。
+
+进程已退出、run.lock 已清除、stderr=0；未启动/resume 任何批。旧失败 identity
+`v22-development-8fffe4a3fba4-969e9d05cd0a` 仍为原子 `FAILED/TailDataError`
+`v2_canary_year_guard:20230103`，其 manifest/progress/completion/log 均只读保留。现有 shared dirty 未变、
+暂存区在提交前为空；本次只追加本节。等待 Sol 最终独立审核，2025/2026 继续锁定。Lessons：`skip`。
