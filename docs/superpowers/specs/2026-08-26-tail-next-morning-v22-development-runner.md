@@ -84,3 +84,35 @@ A6/B3 及 event economics 完全一致，以及 controls/coverage/固定槽/九�
 `tests.test_tail_next_morning` 25 passed；`py_compile` 通过；`git diff --check` 通过。
 全程未读取 E 盘、未创建真实 development/preflight/canary identity、未读取 2025/2026、无任务进程。
 shared dirty 保持，未 push。后续真实批仍须按第 6 节另行批准。Lessons：`skip`。
+
+### TNM-V2.2 真实 development bounded 只读 preflight（Terra，2026-08-26）
+
+状态：`tnm_v22_development_preflight_ready_pending_launch_approval`。核验基线为
+`ba720c7bc6ddb616d40f00565c4205203f3380b7`，runner/test blob 分别为
+`b982a80c3de23e7416ee350ce0e3ebdda58dff81`、
+`d636c3a111a9c17190b1ed47b97d30de60397dde`；经济 spec hash 为
+`3178f827ce5b347fa5eea62605fff9d903cbc24a5eb2848098c3754876e30342`，
+development spec hash 为 `8fffe4a3fba47496d68c49269fca70bc83da3633eca89bc5ff06b54899365a45`。
+暂存区为空；既有 shared dirty 保持在白名单外。
+
+分钟源仅按 2023/2024 路径、文件名和 `stat` 元数据枚举：484 个会话（2023=242、2024=242），
+473 个 target（`20230117` 至 `20241230`，index 10 至 482），ZIP=242、目录=242；轻量日历
+冻结 SHA-256 为 `28bd5c40a639150148b14e1b26eea974a1b9fb755c528299c0fcb831a13f1415`。
+ZIP member read 和 `pandas.read_excel` 在预检中显式禁止。日 K 根可读，5532 个 `.xlsx`、
+3,694,499,418 bytes；生产身份方案仍为既有的 `relative_path,size_bytes,mtime_ns -> tree_digest`，
+不读取任何工作簿交易内容。未枚举分钟 2025/2026 路径，也未读取 2025/2026 内容。
+
+`output/tail-next-morning-v2/development/` 当前不存在，递归 `run.lock`=0，无同类 writer；D 盘空闲
+64,977,162,240 bytes。现有两日 canary 6,609,936 bytes 的线性 473-target 上界为
+1,566,554,832 bytes，容量充足。CLI `v22-development --help` 已解析。预期启动命令为：
+
+```text
+C:\Users\TY_trader1\AppData\Local\Programs\Python\Python311\python.exe -m mining.tail_next_morning_v2 v22-development --minute-root "E:\分钟数据" --daily-root "E:\日K线全部至202606" --output-dir "output\tail-next-morning-v2\development"
+```
+
+启动时 stdout/stderr 应分别重定向至 development 父目录的 `<run_id>.stdout.log` 和
+`<run_id>.stderr.log`；监控字段为 PID、run_manifest 的 spec/source/input/run hash、run.lock、
+progress 的 source_frontier/completed_units/open_exit_events/updated_at、completion 和 stderr。具体
+`run_id` 必须在获批 launch HEAD 下由完整 input manifest 计算；本 preflight 的 docs-only commit
+会改变 `base_commit`，所以不得把 preflight 前的 identity 当作可启动 identity。未启动 runner、
+未生成经济结果、未写 E 盘、无任务进程。等待规划会话批准 launch。Lessons：`skip`。
