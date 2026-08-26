@@ -45,6 +45,8 @@ from mining.tail_next_morning_v2 import (
     v22_impulse,
     v22_sleeve_step,
     _v22_sleeve_account,
+    _v22_group_metrics,
+    main,
     run_v22_canary,
 )
 
@@ -167,7 +169,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
         b_prior[7]["history"].update({"close": 10.6, "full_amount": 500_000_000.0})
         b_prior[6]["history"]["close"] = 10.0
         calls: dict[str, int] = {}
-        content_token = {"value": "original"}
+        content_token = {"value": "original", "exit": "original"}
 
         def future(value: dict) -> dict:
             result = copy.deepcopy(value)
@@ -187,7 +189,8 @@ class TailNextMorningV2Tests(unittest.TestCase):
                     values[code] = future(a_prior[-1] if code in a_codes else b_prior[-1])
                 else:
                     values[code] = copy.deepcopy(a_prior[index % 10] if code in a_codes else b_prior[index % 10])
-            digests = {code: hashlib.sha256(f"{content_token['value']}|{trade_date}|{code}".encode()).hexdigest() for code in requested}
+            token = content_token["exit"] if trade_date == calendar[11] else content_token["value"]
+            digests = {code: hashlib.sha256(f"{token}|{trade_date}|{code}".encode()).hexdigest() for code in requested}
             return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": digests}
 
         manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
@@ -199,9 +202,10 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(72, summary["event_count"])  # two days × (A6+B3) × strategy plus three same-N controls
             self.assertTrue(all(count == 1 for count in calls.values()))
             self.assertIn("A|strategy", summary["aggregates"]["overall"])
-            self.assertEqual("insufficient_sample", summary["aggregates"]["bootstrap"]["status"])
+            self.assertTrue(all(value["status"] == "insufficient_for_bootstrap" for value in summary["aggregates"]["bootstrap"].values()))
             self.assertEqual("ready", summary["account"]["status"])
             self.assertGreater((run_dir / "event_results.csv.gz").stat().st_size, 0)
+            self.assertIn("updated_at", json.loads((run_dir / "progress.json").read_text(encoding="utf-8")))
             before = {path.relative_to(run_dir).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns) for path in run_dir.rglob("*") if path.is_file()}
             with patch.object(module, "rank_v22_channels", side_effect=AssertionError("fast path recalculated")):
                 replay, replay_dir = run_v22_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
@@ -209,7 +213,9 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(summary, replay)
             self.assertEqual(run_dir, replay_dir)
             self.assertEqual(before, after)
-            content_token["value"] = "equal_size_rewrite"
+            checkpoint = json.loads((run_dir / "checkpoints" / "market_20240923.json").read_text(encoding="utf-8"))
+            self.assertIn(calendar[11], checkpoint["result"]["unit_consumed_input"]["minute_members"])
+            content_token["exit"] = "equal_size_exit_day_rewrite"
             with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240923"):
                 run_v22_canary("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
             final = {path.relative_to(run_dir).as_posix(): (path.read_bytes(), path.stat().st_mtime_ns) for path in run_dir.rglob("*") if path.is_file()}
@@ -229,6 +235,20 @@ class TailNextMorningV2Tests(unittest.TestCase):
             completion = json.loads((runs[0] / "completion.json").read_text(encoding="utf-8"))
             self.assertEqual("CANCELLED", completion["status"])
 
+    def test_v22_runner_time_limit_writes_cancelled_terminal(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202409{day:02d}" for day in range(2, 16)]
+        calendar[10], calendar[12] = "20240923", "20240926"
+        positions, manifest = {"20240923": 10, "20240926": 12}, {"minute_containers": [], "daily_k_root": {"files": []}}
+        def fake_load(_root, trade_date, codes=None):
+            requested = {"300085"} if codes is None else set(codes)
+            return {code: stat() for code in requested}, {"trade_date": trade_date, "consumed_member_sha256": {code: hashlib.sha256(code.encode()).hexdigest() for code in requested}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load):
+            with self.assertRaisesRegex(Exception, "canary_time_limit"):
+                run_v22_canary("synthetic", "synthetic", temporary, max_elapsed_seconds=0)
+            completion = json.loads(next(Path(temporary).glob("v22-canary-*/completion.json")).read_text(encoding="utf-8"))
+            self.assertEqual({"status": "CANCELLED", "reason": "canary_time_limit"}, {key: completion[key] for key in ("status", "reason")})
+
     def test_v22_account_reuses_morning_exit_cash_and_blocks_unresolved(self) -> None:
         resolved = {"trade_date": "20240923", "sec_code": "300001", "channel": "A", "strategy_or_control": "strategy", "rank": 1, "bought": True, "buy_price": 10.0, "exit_trade_date": "20240924", "net_return": .01, "last_mark_price": 10.1}
         same_day = {"trade_date": "20240924", "sec_code": "300002", "channel": "A", "strategy_or_control": "strategy", "rank": 1, "bought": True, "buy_price": 10.0, "exit_trade_date": "20240925", "net_return": .01, "last_mark_price": 10.1}
@@ -239,6 +259,24 @@ class TailNextMorningV2Tests(unittest.TestCase):
         unresolved = dict(same_day, exit_trade_date=None)
         _, _, blocked = _v22_sleeve_account([resolved, unresolved], ["20240923", "20240924", "20240925"])
         self.assertEqual("blocked_unresolved_account", blocked["status"])
+
+    def test_v22_coverage_marks_boundary_and_cli_contracts(self) -> None:
+        resolved = {"trade_date": "20240923", "sec_code": "300001", "channel": "A", "strategy_or_control": "strategy", "rank": 1, "bought": True, "outcome_status": "resolved", "gross_return": .02, "net_return": .017, "holding_days": 1}
+        missing = dict(resolved, sec_code="300002", outcome_status="unavailable_buy", bought=False, gross_return=None, net_return=None, holding_days=None)
+        metrics = _v22_group_metrics([resolved, missing])
+        self.assertEqual(.5, metrics["coverage"])
+        self.assertEqual("blocked_data_quality", metrics["economic_status"])
+        held = dict(resolved, outcome_status="unresolved_at_development_end", exit_trade_date=None, mark_price_by_date={"20240923": 10.0}, buy_price=10.0)
+        _, nav, account = _v22_sleeve_account([held], ["20240923", "20240924"])
+        self.assertEqual(5_000_000.0, nav[0]["nav"])
+        self.assertEqual(1, account["stale_mark_days"])
+        boundary = dict(held, rank=7)
+        _, _, boundary_account = _v22_sleeve_account([boundary], ["20240923"])
+        self.assertEqual("blocked_boundary_tie_account", boundary_account["status"])
+        with patch("mining.tail_next_morning_v2.run_v22_canary", return_value=({"execution_label": "tnm_v22_1_canary_verified"}, Path("synthetic"))) as runner:
+            self.assertEqual(0, main(["v22-canary", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "v22-id", "--max-elapsed-seconds", "7"]))
+        self.assertEqual("v22-id", runner.call_args.kwargs["resume_run_id"])
+        self.assertEqual(7.0, runner.call_args.kwargs["max_elapsed_seconds"])
 
     def test_standard_limit_fen_touch_and_post_1450_isolation(self) -> None:
         self.assertEqual(11.0, _standard_limit_evidence("600001", 10.0, 10.995)["limit_up_price"])

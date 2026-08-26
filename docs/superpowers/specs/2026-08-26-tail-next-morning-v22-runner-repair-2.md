@@ -48,4 +48,12 @@ Terra tracked 白名单仅：
 
 尚未执行。Terra 只能追加本节。
 
+### V22-1F2（Terra，2026-08-26）
+
+状态：`v22_1f2_code_verified`。仅执行本地实现与临时合成 production-runner 测试；未读取 `E:\`，未创建真实 canary/development identity。动态退出扫描现在按实际日期/代码累积 checkpoint 内容身份，合成测试确认单独改写退出日等长成员即拒绝 fast-path resume。coverage 低于99%返回 `blocked_data_quality`；每个开放事件持有 `mark_price_by_date`，NAV 不回填未来价格，缺失日计入 `stale_mark_days`。完全经济并列的事件按槽权重保存，九袖套对 rank 超出 A6/B3 的并列成员返回 `blocked_boundary_tie_account` 和证据。
+
+生产 CLI 现支持 `--resume-run-id` 与默认900秒 `--max-elapsed-seconds`，时间边界写原子 `CANCELLED:canary_time_limit`；progress 含 `updated_at`。通道×策略/对照的 gross/net/holding/coverage/fixed-slot schema、逐年/逐月及月 block bootstrap 已补齐，并以全期最大 mean daily slot net 的同通道对照计算配对差值。
+
+验证：`tests.test_tail_next_morning_v2` 43 项通过、1 项真实源测试显式禁用；`tests.test_tail_next_morning` 25 项通过；`py_compile`、`git diff --check` 通过。等待 Sol 复审；不得派发真实 identity。
+
 旧 attempts 和现有 shared dirty 全部保留；不 push。Lessons：`skip`。

@@ -1301,18 +1301,20 @@ def _v22_controls(pool: Iterable[Mapping[str, Any]], selected: Iterable[Mapping[
     }
 
 
-def _v22_seed_event(row: Mapping[str, Any], *, group: str, rank: int, start_index: int, buy: Mapping[str, Any]) -> dict[str, Any]:
+def _v22_seed_event(row: Mapping[str, Any], *, group: str, rank: int, start_index: int, buy: Mapping[str, Any], signal_stat: Mapping[str, Any] | None, slot_weight: float) -> dict[str, Any]:
     ready = buy.get("status") == "ready" and _finite(buy.get("vwap"))
     return {
         "trade_date": str(row["trade_date"]), "sec_code": canonical_code(str(row["sec_code"])), "channel": str(row["channel"]),
         "strategy_or_control": group, "rank": rank, "start_index": start_index,
+        "slot_weight": slot_weight,
         "selected": True, "bought": bool(ready), "outcome_status": "open" if ready else "unavailable_buy",
         "buy_price": float(buy["vwap"]) if ready else None, "exit_price": None, "gross_return": None, "net_return": None,
         "holding_days": None, "exit_trade_date": None, "exit_window": None, "decisions": [],
+        "mark_price_by_date": {str(row["trade_date"]): float(signal_stat["history"]["close"])} if _history_ready(signal_stat) else {},
     }
 
 
-def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any) -> None:
+def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any, consumed_codes_by_date: dict[str, set[str]]) -> None:
     """Resolve every open event date-by-date so a future container is opened once."""
     first = min((int(event["start_index"]) + 1 for event in events if event["outcome_status"] == "open"), default=len(calendar))
     for index in range(first, len(calendar)):
@@ -1320,6 +1322,8 @@ def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load:
         if not open_events:
             continue
         codes = {str(event["sec_code"]) for event in open_events}
+        consumed_codes_by_date.setdefault(calendar[index], set()).update(codes)
+        consumed_codes_by_date.setdefault(calendar[index - 1], set()).update(codes)
         current = load(calendar[index], codes)
         previous = load(calendar[index - 1], codes)
         for event in open_events:
@@ -1327,7 +1331,7 @@ def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load:
             event["decisions"].append({"trade_date": calendar[index], **decision})
             current_stat = current.get(event["sec_code"], {})
             if _history_ready(current_stat):
-                event["last_mark_price"] = float(current_stat["history"]["close"])
+                event["mark_price_by_date"][calendar[index]] = float(current_stat["history"]["close"])
             if decision["status"] == "exit":
                 gross = float(decision["exit_price"]) / float(event["buy_price"]) - 1.0
                 event.update({"outcome_status": "resolved", "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - int(event["start_index"]), "exit_trade_date": calendar[index], "exit_window": decision["exit_window"]})
@@ -1339,21 +1343,31 @@ def _v22_resolve_events(events: list[dict[str, Any]], calendar: list[str], load:
 
 def _v22_group_metrics(values: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     rows = [dict(value) for value in values]
-    resolved = [float(value["net_return"]) for value in rows if value.get("outcome_status") == "resolved"]
+    resolved_rows = [value for value in rows if value.get("outcome_status") == "resolved"]
+    resolved = [float(value["net_return"]) for value in resolved_rows]
+    gross = [float(value["gross_return"]) for value in resolved_rows]
+    holding = [float(value["holding_days"]) for value in resolved_rows if value.get("holding_days") is not None]
     dates = sorted({value["trade_date"] for value in rows})
     unresolved = sum(value.get("outcome_status") == "unresolved_at_development_end" for value in rows)
     return {
         "selected": len(rows), "bought": sum(bool(value.get("bought")) for value in rows), "resolved": len(resolved), "unresolved": unresolved,
-        "coverage": len(resolved) / len(rows) if rows else None, "win_rate": sum(value > 0 for value in resolved) / len(resolved) if resolved else None,
-        "mean_net_return": sum(resolved) / len(resolved) if resolved else None, "median_net_return": float(pd.Series(resolved).median()) if resolved else None,
-        "p10_net_return": float(pd.Series(resolved).quantile(.10)) if resolved else None, "p90_net_return": float(pd.Series(resolved).quantile(.90)) if resolved else None,
+        "unavailable_buy": sum(value.get("outcome_status") == "unavailable_buy" for value in rows),
+        "coverage": len(resolved) / len(rows) if rows else None, "gross_win_rate": sum(value > 0 for value in gross) / len(gross) if gross else None, "net_win_rate": sum(value > 0 for value in resolved) / len(resolved) if resolved else None,
+        "gross": _v22_distribution(gross), "net": _v22_distribution(resolved), "holding_sessions": _v22_distribution(holding),
         "sum_event_net_return": sum(resolved) if resolved else 0.0, "distinct_signal_dates": len(dates),
         "sample_status": "ready" if len(rows) >= 100 and len(dates) >= 60 else "insufficient_sample",
-        "economic_status": "blocked_unresolved" if unresolved else "ready",
+        "economic_status": "blocked_data_quality" if rows and len(resolved) / len(rows) < .99 else "blocked_unresolved" if unresolved else "ready",
     }
 
 
-def _v22_daily_slots(values: Iterable[Mapping[str, Any]], channel: str) -> list[dict[str, Any]]:
+def _v22_distribution(values: Iterable[float]) -> dict[str, float | None]:
+    series = pd.Series(list(values), dtype=float)
+    if series.empty:
+        return {key: None for key in ("mean", "median", "std", "p10", "p25", "p75", "p90", "min", "max")}
+    return {"mean": float(series.mean()), "median": float(series.median()), "std": float(series.std(ddof=0)), "p10": float(series.quantile(.10)), "p25": float(series.quantile(.25)), "p75": float(series.quantile(.75)), "p90": float(series.quantile(.90)), "min": float(series.min()), "max": float(series.max())}
+
+
+def _v22_daily_slots(values: Iterable[Mapping[str, Any]], channel: str, group: str) -> list[dict[str, Any]]:
     slots = V22_A_LIMIT if channel == "A" else V22_B_LIMIT
     by_day: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for value in values:
@@ -1361,8 +1375,8 @@ def _v22_daily_slots(values: Iterable[Mapping[str, Any]], channel: str) -> list[
     result = []
     for trade_date, rows in sorted(by_day.items()):
         unresolved = any(row.get("outcome_status") == "unresolved_at_development_end" for row in rows)
-        net = sum(float(row["net_return"]) for row in rows if row.get("outcome_status") == "resolved") / slots
-        result.append({"trade_date": trade_date, "channel": channel, "daily_slot_net": None if unresolved else net, "nominal_slots": slots, "selected_slots": len(rows), "status": "blocked_unresolved" if unresolved else "ready"})
+        weighted = sum(float(row["net_return"]) * float(row.get("slot_weight", 1.0)) for row in rows if row.get("outcome_status") == "resolved")
+        result.append({"trade_date": trade_date, "channel": channel, "strategy_or_control": group, "daily_slot_net": None if unresolved else weighted / slots, "nominal_slots": slots, "selected_slots": len(rows), "selected_slot_weight": sum(float(row.get("slot_weight", 1.0)) for row in rows), "status": "blocked_unresolved" if unresolved else "ready"})
     return result
 
 
@@ -1373,14 +1387,34 @@ def _v22_month_block_bootstrap(daily_slots: Iterable[Mapping[str, Any]]) -> dict
         by_month[str(row["trade_date"])[:6]].append(float(row["daily_slot_net"]))
     months = sorted(by_month)
     if len(months) < 2:
-        return {"status": "insufficient_sample", "replications": 0, "ci95": None}
-    samples = []
+        return {"status": "insufficient_for_bootstrap", "replications": 0, "mean_daily_slot_net_ci95": None, "daily_win_rate_ci95": None}
+    samples, wins = [], []
     for replicate in range(256):
         chosen = [months[int(hashlib.sha256(f"V22-bootstrap|{replicate}|{slot}".encode()).hexdigest(), 16) % len(months)] for slot in range(len(months))]
         values = [value for month in chosen for value in by_month[month]]
         samples.append(sum(values) / len(values))
+        wins.append(sum(value > 0 for value in values) / len(values))
     series = pd.Series(samples)
-    return {"status": "diagnostic", "replications": 256, "ci95": [float(series.quantile(.025)), float(series.quantile(.975))]}
+    win_series = pd.Series(wins)
+    return {"status": "diagnostic", "replications": 256, "mean_daily_slot_net_ci95": [float(series.quantile(.025)), float(series.quantile(.975))], "daily_win_rate_ci95": [float(win_series.quantile(.025)), float(win_series.quantile(.975))]}
+
+
+def _v22_relative_month_bootstrap(strategy: Iterable[Mapping[str, Any]], control: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    left = {str(row["trade_date"]): float(row["daily_slot_net"]) for row in strategy if row.get("daily_slot_net") is not None}
+    right = {str(row["trade_date"]): float(row["daily_slot_net"]) for row in control if row.get("daily_slot_net") is not None}
+    by_month: dict[str, list[float]] = defaultdict(list)
+    for trade_date in sorted(set(left) & set(right)):
+        by_month[trade_date[:6]].append(left[trade_date] - right[trade_date])
+    months = sorted(by_month)
+    if len(months) < 2:
+        return {"status": "insufficient_for_bootstrap", "ci95": None}
+    samples = []
+    for replicate in range(256):
+        picked = [months[int(hashlib.sha256(f"V22-relative|{replicate}|{slot}".encode()).hexdigest(), 16) % len(months)] for slot in range(len(months))]
+        values = [value for month in picked for value in by_month[month]]
+        samples.append(sum(values) / len(values))
+    series = pd.Series(samples)
+    return {"status": "diagnostic", "ci95": [float(series.quantile(.025)), float(series.quantile(.975))]}
 
 
 def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1392,8 +1426,18 @@ def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]
     overall = {name: _v22_group_metrics(values) for name, values in sorted(groups.items())}
     yearly = {f"{name}|{year}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(year)) for name, values in sorted(groups.items()) for year in sorted({str(value["trade_date"])[:4] for value in values})}
     monthly = {f"{name}|{month}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(month)) for name, values in sorted(groups.items()) for month in sorted({str(value["trade_date"])[:6] for value in values})}
-    slots = [slot for name, values in groups.items() for slot in _v22_daily_slots(values, name.split("|", 1)[0])]
-    return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "bootstrap": _v22_month_block_bootstrap(slots)}
+    slots = [slot for name, values in groups.items() for slot in _v22_daily_slots(values, name.split("|", 1)[0], name.split("|", 1)[1])]
+    slot_stats = {name: _v22_distribution(row["daily_slot_net"] for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == name and row["daily_slot_net"] is not None) for name in groups}
+    bootstrap = {name: _v22_month_block_bootstrap([row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == name]) for name in groups}
+    for channel in ("A", "B"):
+        controls = [name for name in groups if name.startswith(f"{channel}|") and not name.endswith("|strategy")]
+        strategy = f"{channel}|strategy"
+        if strategy in groups and controls:
+            best = max(controls, key=lambda name: (slot_stats[name]["mean"] if slot_stats[name]["mean"] is not None else -math.inf, name))
+            strategy_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == strategy]
+            control_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == best]
+            bootstrap[strategy]["relative_best_control"] = {"control": best, **_v22_relative_month_bootstrap(strategy_slots, control_slots)}
+    return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "daily_slot_statistics": slot_stats, "bootstrap": bootstrap}
 
 
 def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[str]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
@@ -1401,6 +1445,9 @@ def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[
     initial = 5_000_000.0 / 9.0
     sleeves = {f"A{rank}": {"cash": initial, "event": None} for rank in range(1, 7)} | {f"B{rank}": {"cash": initial, "event": None} for rank in range(1, 4)}
     strategy = [dict(event) for event in events if event["strategy_or_control"] == "strategy"]
+    boundary = [event for event in strategy if int(event["rank"]) > (V22_A_LIMIT if event["channel"] == "A" else V22_B_LIMIT)]
+    if boundary:
+        return [], [], {"status": "blocked_boundary_tie_account", "boundary_tie_members": [{"trade_date": event["trade_date"], "channel": event["channel"], "sec_code": event["sec_code"], "rank": event["rank"]} for event in boundary], "busy_skip": 0, "total_return": None, "diagnostic_mtm_nav": None, "stale_mark_days": 0}
     by_signal: dict[str, list[dict[str, Any]]] = defaultdict(list)
     by_exit: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for event in strategy:
@@ -1409,6 +1456,7 @@ def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[
             by_exit[str(event["exit_trade_date"])].append(event)
     ledger, nav = [], []
     busy_skip = 0
+    stale_mark_days = 0
     for trade_date in calendar:
         for event in by_exit.get(str(trade_date), []):
             sleeve = sleeves[f"{event['channel']}{event['rank']}"]
@@ -1429,10 +1477,22 @@ def _v22_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[
         value = 0.0
         for sleeve in sleeves.values():
             event = sleeve["event"]
-            value += float(sleeve["cash"]) if event is None else float(sleeve["cash"]) * float(event.get("last_mark_price") or event["buy_price"]) / float(event["buy_price"])
+            if event is None:
+                value += float(sleeve["cash"])
+                continue
+            marks = {str(key): float(mark) for key, mark in event.get("mark_price_by_date", {}).items() if str(key) <= str(trade_date)}
+            if str(trade_date) in marks:
+                mark = marks[str(trade_date)]
+            elif marks:
+                mark = marks[max(marks)]
+                stale_mark_days += 1
+            else:
+                mark = float(event["buy_price"])
+                stale_mark_days += 1
+            value += float(sleeve["cash"]) * mark / float(event["buy_price"])
         nav.append({"trade_date": trade_date, "nav": value, "utilization": sum(sleeve["event"] is not None for sleeve in sleeves.values()) / 9.0})
     unresolved = any(sleeve["event"] is not None for sleeve in sleeves.values())
-    return ledger, nav, {"status": "blocked_unresolved_account" if unresolved else "ready", "busy_skip": busy_skip, "total_return": None if unresolved else nav[-1]["nav"] / 5_000_000.0 - 1.0, "diagnostic_mtm_nav": nav[-1]["nav"] if nav else 5_000_000.0}
+    return ledger, nav, {"status": "blocked_unresolved_account" if unresolved else "ready", "busy_skip": busy_skip, "total_return": None if unresolved else nav[-1]["nav"] / 5_000_000.0 - 1.0, "diagnostic_mtm_nav": nav[-1]["nav"] if nav else 5_000_000.0, "stale_mark_days": stale_mark_days}
 
 
 def _v22_checkpoint_identity(
@@ -1448,12 +1508,16 @@ def _v22_checkpoint_identity(
         code = str(event["sec_code"])
         for decision in event.get("decisions", []):
             trade_date = str(decision["trade_date"])
-            if dependencies.get(trade_date) is not None:
-                dependencies.setdefault(trade_date, set()).add(code)
+            if trade_date not in dependencies:
+                dependencies[trade_date] = {code}
+            elif dependencies[trade_date] is not None:
+                dependencies[trade_date].add(code)
             previous_index = calendar.index(trade_date) - 1
             previous_date = calendar[previous_index]
-            if dependencies.get(previous_date) is not None:
-                dependencies.setdefault(previous_date, set()).add(code)
+            if previous_date not in dependencies:
+                dependencies[previous_date] = {code}
+            elif dependencies[previous_date] is not None:
+                dependencies[previous_date].add(code)
     daily_subset = {code: evidence for code, evidence in daily.items() if code in evaluated}
     return _unit_consumed_input(_unit_minute_members(records, dependencies), daily_subset)
 
@@ -1475,7 +1539,7 @@ def _v22_verify_saved_units(run_dir: Path, run_hash: str, minute_root: str | Pat
     return saved
 
 
-def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
+def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None, max_elapsed_seconds: float = 900.0) -> tuple[dict[str, Any], Path]:
     """V2.2's production chain: shared source batches, controls, events and sleeves."""
     started, run_dir = time.monotonic(), None
     calendar, positions = _v22_calendar(minute_root)
@@ -1490,7 +1554,11 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
     completed_sources: list[str] = []
 
     def progress(stage: str, completed: Iterable[str], open_events: int = 0) -> None:
-        _write_json(progress_path, {"run_hash": run_hash, "stage": stage, "completed_units": sorted(completed), "total_units": len(V22_MARKET_TARGETS), "source_frontier": completed_sources[-1] if completed_sources else None, "completed_source_dates": list(completed_sources), "open_exit_events": open_events, "elapsed_seconds": round(time.monotonic() - started, 6)})
+        _write_json(progress_path, {"run_hash": run_hash, "stage": stage, "completed_units": sorted(completed), "total_units": len(V22_MARKET_TARGETS), "source_frontier": completed_sources[-1] if completed_sources else None, "completed_source_dates": list(completed_sources), "open_exit_events": open_events, "elapsed_seconds": round(time.monotonic() - started, 6), "updated_at": datetime.now(timezone.utc).isoformat()})
+
+    def time_limit() -> None:
+        if time.monotonic() - started >= float(max_elapsed_seconds):
+            raise TailDataError("canary_time_limit")
 
     def load(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
         requested = None if codes is None else {canonical_code(code) for code in codes}
@@ -1502,6 +1570,7 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
         cache[trade_date], records[trade_date] = values, record
         completed_sources.append(trade_date)
         progress(f"source:{trade_date}", ())
+        time_limit()
         return values
 
     try:
@@ -1544,10 +1613,12 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
             daily_by_target[target] = {"trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]), "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]], "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"]}
             day = cache[target]
             for channel, pool, selected in (("A", ranked["a_pool"], ranked["a_selected"]), ("B", ranked["b_pool"], ranked["b_selected"])):
+                nominal = V22_A_LIMIT if channel == "A" else V22_B_LIMIT
                 for group, members in _v22_controls(pool, selected, channel).items():
                     for rank, row in enumerate(members, 1):
-                        events.append(_v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {})))
-        _v22_resolve_events(events, calendar, load, lambda frontier, open_events: progress(f"exit:{frontier}", saved, open_events))
+                        events.append(_v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {}), signal_stat=day.get(row["sec_code"]), slot_weight=nominal / len(members) if members else 0.0))
+        dynamic_exit_codes: dict[str, set[str]] = {}
+        _v22_resolve_events(events, calendar, load, lambda frontier, open_events: (progress(f"exit:{frontier}", saved, open_events), time_limit()), dynamic_exit_codes)
         all_daily: list[dict[str, Any]] = []
         completed = dict(saved)
         for target in V22_MARKET_TARGETS:
@@ -1555,7 +1626,7 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
             if unit in completed:
                 continue
             target_events = [event for event in events if event["trade_date"] == target]
-            result = {"daily": daily_by_target[target], "eligible_rows": [_public_row(row) for row in ranked_by_target[target]["a_pool"] + ranked_by_target[target]["b_pool"]], "events": target_events, "unit_consumed_input": _v22_checkpoint_identity(records, daily_consumed, target, positions[target], all_rows[target], target_events, calendar)}
+            result = {"daily": daily_by_target[target], "eligible_rows": [_public_row(row) for row in ranked_by_target[target]["a_pool"] + ranked_by_target[target]["b_pool"]], "events": target_events, "dynamic_exit_codes_by_date": {day: sorted(codes) for day, codes in sorted(dynamic_exit_codes.items())}, "unit_consumed_input": _v22_checkpoint_identity(records, daily_consumed, target, positions[target], all_rows[target], target_events, calendar)}
             _checkpoint(run_dir, run_hash, unit, result)
             completed[unit] = result
             progress(f"market:{target}", completed, sum(event["outcome_status"] == "open" for event in events))
@@ -1582,6 +1653,12 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
         if run_dir is not None and not preserve_existing_terminal:
             _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash, "reason": "KeyboardInterrupt"})
         raise
+    except TailDataError as exc:
+        if run_dir is not None and not preserve_existing_terminal and str(exc) == "canary_time_limit":
+            _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash, "reason": "canary_time_limit"})
+        elif run_dir is not None and not preserve_existing_terminal:
+            _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        raise
     except Exception as exc:
         if run_dir is not None and not preserve_existing_terminal:
             _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
@@ -1600,11 +1677,13 @@ def main(argv: list[str] | None = None) -> int:
     v22.add_argument("--minute-root", required=True)
     v22.add_argument("--daily-root", required=True)
     v22.add_argument("--output-dir", required=True)
+    v22.add_argument("--resume-run-id")
+    v22.add_argument("--max-elapsed-seconds", type=float, default=900.0)
     args = parser.parse_args(argv)
     if args.command == "diagnostic":
         summary, run_dir = run_diagnostic(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     elif args.command == "v22-canary":
-        summary, run_dir = run_v22_canary(args.minute_root, args.daily_root, args.output_dir)
+        summary, run_dir = run_v22_canary(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id, max_elapsed_seconds=args.max_elapsed_seconds)
     else:
         raise TailDataError("unsupported_v2_command")
     print(f"status={summary['execution_label']} run_dir={run_dir}")
