@@ -46,6 +46,8 @@ from mining.tail_next_morning_v2 import (
     v22_sleeve_step,
     _v22_sleeve_account,
     _v22_group_metrics,
+    _v22_event_aggregates,
+    _v22_slot_weights,
     main,
     run_v22_canary,
 )
@@ -138,6 +140,23 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertEqual(3, len(ranked["b_selected"]))
         self.assertFalse(ranked["a_boundary_tie_expanded"])
         self.assertFalse(ranked["b_boundary_tie_expanded"])
+
+    def test_v22_boundary_slot_weights_and_fixed_slot_years(self) -> None:
+        rows = lambda count: [{"sec_code": f"300{index:03d}", "pool_rank": index} for index in range(1, count + 1)]
+        self.assertEqual([1.0] * 5 + [1 / 3] * 3, _v22_slot_weights(rows(8), "A"))
+        self.assertEqual([1.0, 1.0, .5, .5], _v22_slot_weights(rows(4), "B"))
+        self.assertEqual([1.0] * 6, _v22_slot_weights(rows(6), "A"))
+        self.assertEqual([1.0] * 2, _v22_slot_weights(rows(2), "B"))
+        def event(day, value):
+            return {"trade_date": day, "sec_code": "300001", "channel": "A", "strategy_or_control": "strategy", "rank": 1, "slot_weight": 1.0, "outcome_status": "resolved", "bought": True, "gross_return": value + .003, "net_return": value, "holding_days": 1}
+        aggregates = _v22_event_aggregates([event("20231229", .10), event("20240102", -.20)])
+        yearly, combined = aggregates["daily_slot_statistics"]["A|strategy|2023"], aggregates["daily_slot_statistics"]["A|strategy|combined"]
+        self.assertAlmostEqual(.10 / 6, yearly["arithmetic_sum"])
+        self.assertAlmostEqual(-.10 / 6, combined["arithmetic_sum"])
+        self.assertAlmostEqual((1 + .10 / 6) * (1 - .20 / 6) - 1, combined["compound_diagnostic"])
+        self.assertLess(combined["max_drawdown"], 0)
+        self.assertIn("A|strategy|2023", aggregates["bootstrap"])
+        self.assertIn("A|strategy|combined", aggregates["bootstrap"])
 
     def test_v22_exit_state_machine_and_sleeves(self) -> None:
         previous = stat(close=10.0)

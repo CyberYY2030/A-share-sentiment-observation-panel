@@ -30,3 +30,11 @@ Terra 白名单仅 `mining/tail_next_morning_v2.py`、`tests/test_tail_next_morn
 ## 4. 执行证据
 
 尚未执行。旧产物与shared dirty保持不动，不push。Lessons：`skip`。
+
+### V22-1F3（Terra，2026-08-26）
+
+状态：`v22_1f3_code_verified`。仅进行本地实现与临时合成验证，未读取 `E:\`、未创建真实 identity。边界前唯一名次现在固定 `slot_weight=1`；仅 rank=边界槽的完全并列成员均分一个槽，并将同一权重序列用于策略和三个固定对照。不足额与无边界扩展成员均为1。
+
+fixed-slot 现对 `channel × strategy/control × year/combined` 分别输出完整分布、`arithmetic_sum`、`compound_diagnostic`、`max_drawdown` 与观测数；bootstrap 同时保留年度及 combined 键。合成测试覆盖 A5+3、B2+2、无并列、不足额，以及 2023/2024 两个不同收益序列的年度/combined 不混淆与三项公式。
+
+验证：`tests.test_tail_next_morning_v2` 44 项通过、1 项真实源测试显式禁用；`tests.test_tail_next_morning` 25 项通过；`py_compile`、`git diff --check` 通过。等待定向 Sol 审核，未经批准不得运行真实 canary。

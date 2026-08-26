@@ -1301,6 +1301,17 @@ def _v22_controls(pool: Iterable[Mapping[str, Any]], selected: Iterable[Mapping[
     }
 
 
+def _v22_slot_weights(selected: Iterable[Mapping[str, Any]], channel: str) -> list[float]:
+    """Unique ranks occupy one slot; only the expanded boundary group shares one."""
+    members = list(selected)
+    limit = V22_A_LIMIT if channel == "A" else V22_B_LIMIT
+    if len(members) <= limit:
+        return [1.0] * len(members)
+    boundary = [row for row in members if int(row.get("pool_rank", 0)) >= limit]
+    boundary_codes = {str(row["sec_code"]) for row in boundary}
+    return [1.0 / len(boundary) if str(row["sec_code"]) in boundary_codes else 1.0 for row in members]
+
+
 def _v22_seed_event(row: Mapping[str, Any], *, group: str, rank: int, start_index: int, buy: Mapping[str, Any], signal_stat: Mapping[str, Any] | None, slot_weight: float) -> dict[str, Any]:
     ready = buy.get("status") == "ready" and _finite(buy.get("vwap"))
     return {
@@ -1380,6 +1391,17 @@ def _v22_daily_slots(values: Iterable[Mapping[str, Any]], channel: str, group: s
     return result
 
 
+def _v22_fixed_slot_summary(rows: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    values = [float(row["daily_slot_net"]) for row in sorted(rows, key=lambda row: str(row["trade_date"])) if row.get("daily_slot_net") is not None]
+    distribution = _v22_distribution(values)
+    equity, peak, max_drawdown = 1.0, 1.0, 0.0
+    for value in values:
+        equity *= 1.0 + value
+        peak = max(peak, equity)
+        max_drawdown = min(max_drawdown, equity / peak - 1.0)
+    return {**distribution, "arithmetic_sum": sum(values), "compound_diagnostic": equity - 1.0, "max_drawdown": max_drawdown, "observation_count": len(values)}
+
+
 def _v22_month_block_bootstrap(daily_slots: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
     ready = [dict(row) for row in daily_slots if row.get("daily_slot_net") is not None]
     by_month: dict[str, list[float]] = defaultdict(list)
@@ -1427,16 +1449,24 @@ def _v22_event_aggregates(events: Iterable[Mapping[str, Any]]) -> dict[str, Any]
     yearly = {f"{name}|{year}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(year)) for name, values in sorted(groups.items()) for year in sorted({str(value["trade_date"])[:4] for value in values})}
     monthly = {f"{name}|{month}": _v22_group_metrics(value for value in values if str(value["trade_date"]).startswith(month)) for name, values in sorted(groups.items()) for month in sorted({str(value["trade_date"])[:6] for value in values})}
     slots = [slot for name, values in groups.items() for slot in _v22_daily_slots(values, name.split("|", 1)[0], name.split("|", 1)[1])]
-    slot_stats = {name: _v22_distribution(row["daily_slot_net"] for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == name and row["daily_slot_net"] is not None) for name in groups}
-    bootstrap = {name: _v22_month_block_bootstrap([row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == name]) for name in groups}
+    slot_stats: dict[str, dict[str, Any]] = {}
+    bootstrap: dict[str, dict[str, Any]] = {}
+    for name in groups:
+        scoped = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == name]
+        slot_stats[f"{name}|combined"] = _v22_fixed_slot_summary(scoped)
+        bootstrap[f"{name}|combined"] = _v22_month_block_bootstrap(scoped)
+        for year in sorted({str(row["trade_date"])[:4] for row in scoped}):
+            annual = [row for row in scoped if str(row["trade_date"]).startswith(year)]
+            slot_stats[f"{name}|{year}"] = _v22_fixed_slot_summary(annual)
+            bootstrap[f"{name}|{year}"] = _v22_month_block_bootstrap(annual)
     for channel in ("A", "B"):
         controls = [name for name in groups if name.startswith(f"{channel}|") and not name.endswith("|strategy")]
         strategy = f"{channel}|strategy"
         if strategy in groups and controls:
-            best = max(controls, key=lambda name: (slot_stats[name]["mean"] if slot_stats[name]["mean"] is not None else -math.inf, name))
+            best = max(controls, key=lambda name: (slot_stats[f"{name}|combined"]["mean"] if slot_stats[f"{name}|combined"]["mean"] is not None else -math.inf, name))
             strategy_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == strategy]
             control_slots = [row for row in slots if f"{row['channel']}|{row['strategy_or_control']}" == best]
-            bootstrap[strategy]["relative_best_control"] = {"control": best, **_v22_relative_month_bootstrap(strategy_slots, control_slots)}
+            bootstrap[f"{strategy}|combined"]["relative_best_control"] = {"control": best, **_v22_relative_month_bootstrap(strategy_slots, control_slots)}
     return {"overall": overall, "yearly": yearly, "monthly": monthly, "daily_slot_net": slots, "daily_slot_statistics": slot_stats, "bootstrap": bootstrap}
 
 
@@ -1613,10 +1643,10 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
             daily_by_target[target] = {"trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]), "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]], "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"]}
             day = cache[target]
             for channel, pool, selected in (("A", ranked["a_pool"], ranked["a_selected"]), ("B", ranked["b_pool"], ranked["b_selected"])):
-                nominal = V22_A_LIMIT if channel == "A" else V22_B_LIMIT
+                weights = _v22_slot_weights(selected, channel)
                 for group, members in _v22_controls(pool, selected, channel).items():
-                    for rank, row in enumerate(members, 1):
-                        events.append(_v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {}), signal_stat=day.get(row["sec_code"]), slot_weight=nominal / len(members) if members else 0.0))
+                    for rank, (row, slot_weight) in enumerate(zip(members, weights), 1):
+                        events.append(_v22_seed_event(row, group=group, rank=rank, start_index=index, buy=day.get(row["sec_code"], {}).get("buy", {}), signal_stat=day.get(row["sec_code"]), slot_weight=slot_weight))
         dynamic_exit_codes: dict[str, set[str]] = {}
         _v22_resolve_events(events, calendar, load, lambda frontier, open_events: (progress(f"exit:{frontier}", saved, open_events), time_limit()), dynamic_exit_codes)
         all_daily: list[dict[str, Any]] = []
