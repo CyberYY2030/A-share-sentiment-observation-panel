@@ -55,6 +55,7 @@ from mining.tail_next_morning_v2 import (
     run_v22_development,
     V23_FIXTURES,
     _v23_spec_hash,
+    _v23_development_spec_hash,
     _v23_prior5_evidence,
     _v23_risk_fixture_evidence,
     _v23_leave_best_month,
@@ -63,6 +64,7 @@ from mining.tail_next_morning_v2 import (
     v23_risk_snapshot,
     _v23_sleeve_account,
     run_v23_canary,
+    run_v23_development,
 )
 
 
@@ -1352,6 +1354,156 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertGreater(rejected["missing_code_count"], 0)
             self.assertTrue(rejected["missing_codes_sha256"])
             self.assertEqual("FAILED", json.loads((failed_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+
+    def test_v23_development_streams_v23_economics_and_exact_point_in_time_identity(self) -> None:
+        """Development reuses V2.3 selection/exits while D-1 extras stay outside a D universe identity."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [
+            "20240902", "20240903", "20240904", "20240905", "20240906", "20240909", "20240910", "20240911",
+            "20240912", "20240913", "20240923", "20240924", "20240925", "20240926", "20240927", "20240930",
+        ]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300701", "300702", "300801", "300802"}
+        day, prior = a_inputs()
+        calls: dict[str, int] = {}
+        first_requests: dict[str, set[str] | None] = {}
+        latest_records: dict[str, dict] = {}
+        source_revision = {"value": "initial"}
+
+        def future(value: dict) -> dict:
+            result = copy.deepcopy(value)
+            result["v23_exit"] = {
+                "decision_status": "ready", "decision_close": 10.9, "sell": {"status": "ready", "vwap": 10.8},
+                "decision_window": "13:04-13:05", "sell_window": "13:05-13:10",
+            }
+            return result
+
+        def fake_load(_root, trade_date, requested=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            first_requests.setdefault(trade_date, None if requested is None else set(requested))
+            universe = set(codes) if requested is None else set(requested)
+            if trade_date == "20240913" and requested is None:
+                universe.add("399999")
+            index = positions[trade_date]
+            values = {}
+            for code in universe:
+                values[code] = copy.deepcopy(day) if index >= 10 else copy.deepcopy(prior[index])
+                if index in {11, 14}:
+                    values[code] = future(values[code])
+                if code == "300085" and index in {5, 6, 7, 8}:
+                    values[code]["history"]["full_amount"] = 100_000_000.0
+            record = {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"v23-dev|{source_revision['value']}|{trade_date}|{code}".encode()).hexdigest() for code in universe}}
+            latest_records[trade_date] = copy.deepcopy(record)
+            return values, record
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_input_manifest", return_value=manifest), patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            canary, _ = run_v23_canary("synthetic", "synthetic", temporary, max_elapsed_seconds=900)
+            calls.clear()
+            first_requests.clear()
+            summary, run_dir = run_v23_development("synthetic", "synthetic", temporary)
+            self.assertEqual("tnm_v23_development_completed", summary["execution_label"])
+            self.assertEqual(canary["daily"]["20240923"], summary["daily"]["20240923"])
+            self.assertEqual(canary["daily"]["20240926"], summary["daily"]["20240926"])
+            self.assertEqual(len(calendar) - 10, summary["target_count"])
+            self.assertLessEqual(summary["max_cached_market_days"], 11)
+            self.assertTrue(all(count == 1 for count in calls.values()))
+            self.assertIn("event_exit", summary["first_open_consumers"]["20240924"])
+            self.assertIsNone(first_requests["20240924"])
+            self.assertFalse(summary["read_2025_2026"])
+            self.assertFalse(summary["e_drive_written"])
+            self.assertGreater(summary["event_count"], 0)
+            self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+            self.assertEqual(len(calendar), len(list((run_dir / "daily_commits").glob("*.json"))))
+            self.assertFalse((run_dir / "run.lock").exists())
+            for relative in ("development_summary.json", "daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz", "account_holdings_1304.csv.gz", "risk_state.csv.gz", "cooldown_skips.csv.gz", "artifact_manifest.json"):
+                self.assertTrue((run_dir / relative).is_file(), relative)
+            checkpoint = json.loads((run_dir / "checkpoints" / "market_20240923.json").read_text(encoding="utf-8"))["result"]
+            identity = _verify_checkpoint_consumed_input("market:20240923", checkpoint, latest_records)
+            self.assertIn("399999", latest_records["20240913"]["consumed_member_sha256"])
+            extra = copy.deepcopy(latest_records)
+            extra["20240913"]["consumed_member_sha256"]["399999"] = "unused-d1-extra-rewritten"
+            self.assertEqual(identity, _verify_checkpoint_consumed_input("market:20240923", checkpoint, extra))
+            consumed = checkpoint["consumption_ledger"]
+            used_code = consumed["20240913"][0]
+            used = copy.deepcopy(latest_records)
+            used["20240913"]["consumed_member_sha256"][used_code] = "used-member-rewritten"
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240923"):
+                _verify_checkpoint_consumed_input("market:20240923", checkpoint, used)
+            with patch.object(module, "rank_v22_channels", side_effect=AssertionError("fast_path_recalculated")):
+                replay, replay_dir = run_v23_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+            self.assertEqual(run_dir, replay_dir)
+            self.assertEqual(summary, replay)
+            source_revision["value"] = "content-rewritten-with-restored-metadata"
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240923"):
+                run_v23_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+
+    def test_v23_development_year_guard_and_cli_contract(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        with self.assertRaisesRegex(Exception, "v22_development_year_guard:20250102"):
+            _v22_development_input_manifest("synthetic", "synthetic", ["20250102"])
+        first = _v23_development_spec_hash()
+        self.assertEqual(first, _v23_development_spec_hash())
+        with patch.object(module, "run_v23_development", return_value=({"execution_label": "tnm_v23_development_completed"}, Path("synthetic"))) as runner:
+            self.assertEqual(0, main(["v23-development", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "development-id"]))
+        self.assertEqual("development-id", runner.call_args.kwargs["resume_run_id"])
+
+    def test_v23_development_marks_terminal_events_unresolved_without_2025(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        a_day, a_prior = a_inputs()
+
+        def fake_load(_root, trade_date, requested=None):
+            values = {code: copy.deepcopy(a_day if positions[trade_date] >= 10 else a_prior[positions[trade_date]]) for code in (codes if requested is None else set(requested))}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"v23-terminal|{trade_date}|{code}".encode()).hexdigest() for code in values}}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            summary, _ = run_v23_development("synthetic", "synthetic", temporary)
+        self.assertGreater(summary["event_count"], 0)
+        self.assertEqual(summary["event_count"], summary["unresolved_events"])
+        self.assertEqual("blocked_unresolved_account", summary["account"]["status"])
+        self.assertFalse(summary["read_2025_2026"])
+
+    def test_v23_development_daily_marker_cancels_and_resumes_atomically(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923", "20240924"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        a_day, a_prior = a_inputs()
+        calls: dict[str, int] = {}
+
+        def fake_load(_root, trade_date, requested=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            values = {code: copy.deepcopy(a_day if positions[trade_date] >= 10 else a_prior[positions[trade_date]]) for code in (codes if requested is None else set(requested))}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"v23-cancel|{trade_date}|{code}".encode()).hexdigest() for code in values}}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        original = module._v23_development_commit_day
+        interrupted = {"done": False}
+
+        def commit_then_interrupt(*args, **kwargs):
+            original(*args, **kwargs)
+            if not interrupted["done"]:
+                interrupted["done"] = True
+                raise KeyboardInterrupt
+
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            with patch.object(module, "_v23_development_commit_day", side_effect=commit_then_interrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_v23_development("synthetic", "synthetic", temporary)
+            run_dir = next(Path(temporary).glob("v23-development-*"))
+            self.assertEqual("CANCELLED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+            self.assertTrue((run_dir / "daily_commits" / f"{calendar[0]}.json").exists())
+            self.assertFalse((run_dir / "run.lock").exists())
+            calls.clear()
+            resumed, resumed_dir = run_v23_development("synthetic", "synthetic", temporary, resume_run_id=run_dir.name)
+            self.assertEqual(run_dir, resumed_dir)
+            self.assertEqual("tnm_v23_development_completed", resumed["execution_label"])
+            self.assertTrue(calls and all(count == 1 for count in calls.values()))
+            self.assertTrue((run_dir / "completion.cancelled.json").exists())
 
     def test_v23_two_phase_gate_matches_naive_rows_and_skips_failed_long_history(self) -> None:
         day, prior = a_inputs()
