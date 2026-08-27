@@ -252,6 +252,11 @@ SUCCEEDED 后 Terra 只做终态验收和紧凑汇总：target/信号/成交/未
 
 ## 10. 执行证据
 
-尚未执行。Terra 只能在本节追加紧凑证据，不得改写第1～9节。
+### TNM-V23-1（Terra，2026-08-27）
+
+- 状态：`tnm_v23_1_blocked`。合成 V2 58 项（1 项显式 real-source skip）、V1 25 项、`py_compile` 与 `git diff --check` 均通过；新增覆盖五日严格门槛、13:04/13:05 隔离、A/B 边界、风险快照/三日暂停/强制退出和最小生产链。
+- 唯一真实 canary：`v23-canary-6a8b222e31a1-6e38e7d68ffa`，`run_hash=6e38e7d68ffaa96ecc8e9825b90e7c12398e68533c859b2893ae0f08f0d06835`。在 900 秒受控上限后原子 `CANCELLED`（实际 `908.781s`，`reason=canary_time_limit`）；无经济 checkpoint、无 A6/B3 或 fixture 结论，禁止重跑/调参。
+- 已保留只读证据：`run_manifest.json`、`progress.json`、`completion.json`、stdout/stderr；progress 记录九个 2024 source 且均 `open_count=1`（D/D-1 全市场和部分幸存代码历史）。未读取 2025/2026、未写 E:、未改 V2.2 identity/产物；任务 PID 已退出。
+- 环境说明：`dispatching-task-cards/CASE_LAW.md` 本机缺失，标记 `environment-blocked`，不扩大冻结范围。shared dirty 与暂存边界保持原状；等待规划会话决定是否另立性能修复卡。
 
 Lessons 决策：`skip`。本卡是尚未验证的项目专属经济规则，没有形成跨任务可复用的新事实。

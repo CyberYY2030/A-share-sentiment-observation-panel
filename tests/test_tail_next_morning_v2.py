@@ -52,6 +52,13 @@ from mining.tail_next_morning_v2 import (
     main,
     run_v22_canary,
     run_v22_development,
+    V23_FIXTURES,
+    _v23_spec_hash,
+    build_v23_signal_row,
+    v23_exit_decision,
+    v23_risk_snapshot,
+    _v23_sleeve_account,
+    run_v23_canary,
 )
 
 
@@ -73,6 +80,16 @@ def stat(*, close=10.0, high=10.5, low=9.5, amount=100_000_000.0, full_amount=30
         },
         "buy": {"status": "ready", "vwap": close, "amount": 1_000.0, "volume": 100.0},
     }
+
+
+def v23_stat(*, close=10.0, decision_close=None, sell_price=None, sell_ready=True, full_amount=300_000_000.0) -> dict:
+    result = stat(close=close, high=close * 1.02, low=close * .98, full_amount=full_amount)
+    result["v23_exit"] = {
+        "decision_status": "ready", "decision_close": close if decision_close is None else decision_close,
+        "sell": {"status": "ready" if sell_ready else "invalid", "vwap": close if sell_price is None else sell_price},
+        "decision_window": "13:04-13:05", "sell_window": "13:05-13:10",
+    }
+    return result
 
 
 def a_inputs(*, d1_amount=300_000_000.0) -> tuple[dict, list[dict]]:
@@ -1055,6 +1072,180 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(copied_run, resumed_dir)
             self.assertEqual(before, after)
         self.assertEqual(2, calls["20240924"])
+
+    def test_v23_prior5_strict_gate_and_fixture_evidence(self) -> None:
+        day, prior = a_inputs()
+        for value in prior[-5:]:
+            value["history"]["full_amount"] = 200_000_001.0
+        row = build_v23_signal_row("300339", day, prior, LISTED)
+        self.assertTrue(row["prior5_amount_all_gt_200m"])
+        self.assertEqual(5, row["prior5_amount_pass_count"])
+        self.assertAlmostEqual(200_000_001.0, row["prior5_amount_min"])
+
+        exact = copy.deepcopy(prior)
+        exact[-3]["history"]["full_amount"] = 200_000_000.0
+        exact_row = build_v23_signal_row("300339", day, exact, LISTED)
+        self.assertFalse(exact_row["liquidity_pass"])
+        self.assertIn("prior5_amount_not_all_strictly_above_200m", exact_row["failure_reasons"])
+
+        missing = copy.deepcopy(prior)
+        missing[-5] = None
+        missing_row = build_v23_signal_row("300339", day, missing, LISTED)
+        self.assertEqual(4, missing_row["prior5_amount_pass_count"])
+        self.assertFalse(missing_row["prior5_amount_all_gt_200m"])
+
+        negative = copy.deepcopy(prior)
+        negative[-1]["history"]["full_amount"] = 0.0
+        self.assertFalse(build_v23_signal_row("300339", day, negative, LISTED)["liquidity_pass"])
+        self.assertEqual(1, V23_FIXTURES[("20240923", "300085")]["prior5_amount_pass_count"])
+        self.assertEqual(5, V23_FIXTURES[("20240926", "300339")]["prior5_amount_pass_count"])
+
+    def test_v23_afternoon_exit_windows_and_boundaries(self) -> None:
+        previous = v23_stat(close=10.0)
+        current = v23_stat(decision_close=11.0, sell_price=10.9)
+        self.assertEqual("continue_limit_up", v23_exit_decision("A", "600001", previous, current)["status"])
+        current["v23_exit"]["decision_close"] = 10.99
+        a_exit = v23_exit_decision("A", "600001", previous, current)
+        self.assertEqual("exit", a_exit["status"])
+        self.assertEqual("13:05-13:10", a_exit["exit_window"])
+        current["v23_exit"]["decision_close"] = 10.3
+        self.assertEqual("continue_return_ge_3pct", v23_exit_decision("B", "300001", previous, current)["status"])
+        current["v23_exit"]["decision_close"] = 10.299
+        self.assertEqual("exit", v23_exit_decision("B", "300001", previous, current)["status"])
+        current["v23_exit"]["sell"]["status"] = "invalid"
+        self.assertEqual("continue_unavailable_sell", v23_exit_decision("B", "300001", previous, current)["status"])
+
+        frame = raw_frame(close=10.0)
+        baseline = _v2_statistics_from_frame(frame)
+        future = frame.copy()
+        future.loc[future.index >= 220, ["open", "high", "low", "close", "volume", "amount"]] = [999, 1000, 1, 777, 0, 0]
+        self.assertEqual(baseline["v23_exit"], _v2_statistics_from_frame(future)["v23_exit"])
+
+    def test_v23_risk_snapshot_thresholds_stale_and_missing_marks(self) -> None:
+        def holding(code: str, price: float = 100.0, last_mark: float | None = None) -> dict:
+            return {"event": {"sec_code": code}, "buy_price": price, "last_mark": last_mark}
+
+        holdings = {f"A{rank}": holding(f"3000{rank:02d}") for rank in range(1, 4)}
+        losing = {value["event"]["sec_code"]: v23_stat(decision_close=99.0) for value in holdings.values()}
+        snapshot = v23_risk_snapshot(holdings, losing)
+        self.assertTrue(snapshot["all_losing"])
+        self.assertTrue(snapshot["risk_trigger"])
+        self.assertFalse(v23_risk_snapshot({"A1": holdings["A1"]}, losing)["all_losing"])
+        zero = {value["event"]["sec_code"]: v23_stat(decision_close=100.3) for value in holdings.values()}
+        self.assertFalse(v23_risk_snapshot(holdings, zero)["all_losing"])
+        exact_loss = {value["event"]["sec_code"]: v23_stat(decision_close=95.3) for value in holdings.values()}
+        self.assertFalse(v23_risk_snapshot(holdings, exact_loss)["mean_loss_over_5pct"])
+        below_loss = {value["event"]["sec_code"]: v23_stat(decision_close=95.2) for value in holdings.values()}
+        self.assertTrue(v23_risk_snapshot({"A1": holdings["A1"]}, below_loss)["mean_loss_over_5pct"])
+        self.assertFalse(v23_risk_snapshot({"A1": holdings["A1"], "A2": holdings["A2"]}, losing)["all_losing"])
+        stale = v23_risk_snapshot({"A1": holding("300001", last_mark=99.0)}, {"300001": {"v23_exit": {"decision_status": "invalid"}}})
+        self.assertEqual("ready", stale["status"])
+        self.assertTrue(stale["marks"][0]["stale"])
+        unavailable = v23_risk_snapshot({"A1": holding("300001")}, {"300001": {"v23_exit": {"decision_status": "invalid"}}})
+        self.assertEqual("risk_snapshot_unavailable", unavailable["status"])
+        self.assertFalse(unavailable["risk_trigger"])
+
+    def test_v23_account_risk_pause_forced_retry_and_event_independence(self) -> None:
+        dates = ["20240920", "20240923", "20240924", "20240925", "20240926", "20240927", "20240930"]
+
+        def event(trade_date: str, code: str, rank: int, net_return: float = -.01) -> dict:
+            return {
+                "event_id": f"{trade_date}|A|strategy|{rank}|{code}", "trade_date": trade_date,
+                "sec_code": code, "channel": "A", "strategy_or_control": "strategy", "rank": rank,
+                "slot_weight": 1.0, "bought": True, "buy_price": 100.0, "net_return": net_return,
+                "outcome_status": "resolved", "exit_price": 99.0, "gross_return": -.01,
+            }
+
+        events = [event(dates[0], f"3000{rank:02d}", rank) for rank in range(1, 4)]
+        events.extend(event(day, "300001", 1, -.02 if day == dates[2] else .02) for day in dates[1:])
+
+        def load(trade_date: str, codes=None) -> dict:
+            values = {}
+            for code in codes or []:
+                invalid = trade_date == dates[1] and code == "300001"
+                values[code] = v23_stat(decision_close=90.0 if trade_date == dates[1] else 99.0, sell_price=90.0 if trade_date == dates[1] else 99.0, sell_ready=not invalid)
+            return values
+
+        ledger, nav, account, holdings, risk, cooldown = _v23_sleeve_account(events, dates, load)
+        self.assertEqual(1, account["risk_trigger_count"])
+        self.assertEqual(3, account["cooldown_skip_count"])
+        self.assertGreaterEqual(account["forced_exit_unavailable_count"], 1)
+        self.assertTrue(any(row["action"] == "forced_risk_exit" for row in ledger))
+        self.assertEqual(3, len(cooldown))
+        self.assertTrue(any(row["action"] == "buy" and row["trade_date"] == dates[5] for row in ledger))
+        self.assertTrue(all(event["outcome_status"] == "resolved" for event in events))
+        self.assertEqual(len(dates), len(nav))
+        self.assertTrue(holdings)
+        self.assertTrue(any(row["triggered"] for row in risk))
+
+    def test_v23_production_canary_writes_complete_evidence_once(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        calendar = [
+            "20240902", "20240903", "20240904", "20240905", "20240906", "20240909", "20240910", "20240911",
+            "20240912", "20240913", "20240923", "20240924", "20240925", "20240926", "20240927", "20240930",
+        ]
+        positions = {"20240923": 10, "20240926": 13}
+        codes = ["300085", "300339", "300700", "300701", "300702", "300703", "300704", "300705"]
+        day, template_prior = a_inputs()
+        calls: dict[str, int] = {}
+
+        def future(value: dict) -> dict:
+            result = copy.deepcopy(value)
+            result["v23_exit"] = {
+                "decision_status": "ready", "decision_close": 10.9,
+                "sell": {"status": "ready", "vwap": 10.8},
+                "decision_window": "13:04-13:05", "sell_window": "13:05-13:10",
+            }
+            return result
+
+        def fake_load(_root, trade_date, requested=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            universe = set(codes) if requested is None else set(requested)
+            index = calendar.index(trade_date)
+            values = {}
+            for code in universe:
+                if index in positions.values():
+                    values[code] = copy.deepcopy(day)
+                elif index in {11, 14}:
+                    values[code] = future(template_prior[-1])
+                else:
+                    values[code] = copy.deepcopy(template_prior[index % 10])
+                if code == "300085" and index in {5, 6, 7, 8}:
+                    values[code]["history"]["full_amount"] = 100_000_000.0
+            digests = {code: hashlib.sha256(f"v23|{trade_date}|{code}".encode()).hexdigest() for code in universe}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": digests}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            summary, run_dir = run_v23_canary("synthetic", "synthetic", temporary, max_elapsed_seconds=900)
+            self.assertEqual("tnm_v23_1_canary_verified", summary["execution_label"])
+            self.assertEqual(1, summary["fixture_evidence"]["300085@20240923"]["prior5_amount_pass_count"])
+            self.assertEqual(5, summary["fixture_evidence"]["300339@20240926"]["prior5_amount_pass_count"])
+            self.assertTrue(all(count == 1 for count in calls.values()))
+            for relative in ("daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz", "account_holdings_1304.csv.gz", "risk_state.csv.gz", "cooldown_skips.csv.gz", "artifact_manifest.json", "completion.json"):
+                self.assertTrue((run_dir / relative).is_file(), relative)
+            self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+
+    def test_v23_spec_hash_ignores_evidence(self) -> None:
+        from mining import tail_next_morning_v2 as module
+        original = module.V23_TASK_CARD
+        with tempfile.TemporaryDirectory() as temporary:
+            card = Path(temporary) / "card.md"
+            card.write_text("frozen\n## 10. 执行证据\nfirst\n", encoding="utf-8")
+            with patch.object(module, "V23_TASK_CARD", card):
+                first = _v23_spec_hash()
+                card.write_text("frozen\n## 10. 执行证据\nsecond\n", encoding="utf-8")
+                self.assertEqual(first, _v23_spec_hash())
+                card.write_text("changed\n## 10. 执行证据\nsecond\n", encoding="utf-8")
+                self.assertNotEqual(first, _v23_spec_hash())
+        self.assertTrue(original.exists())
+
+    def test_v23_cli_accepts_only_verified_canary_label(self) -> None:
+        with patch("mining.tail_next_morning_v2.run_v23_canary", return_value=({"execution_label": "tnm_v23_1_canary_verified"}, Path("synthetic"))) as runner:
+            self.assertEqual(0, main(["v23-canary", "--minute-root", "minute", "--daily-root", "daily", "--output-dir", "output"]))
+            runner.assert_called_once()
+        with patch("mining.tail_next_morning_v2.run_v23_canary", return_value=({"execution_label": "changes_required_by_frozen_canary"}, Path("synthetic"))):
+            self.assertEqual(2, main(["v23-canary", "--minute-root", "minute", "--daily-root", "daily", "--output-dir", "output"]))
 
     @unittest.skipUnless(os.getenv("TNM_ENABLE_REAL_SOURCE_TESTS") == "1" and Path(r"E:\分钟数据").exists(), "real minute source tests disabled")
     def test_fixed_64_code_real_small_universe_full_vs_selective(self) -> None:

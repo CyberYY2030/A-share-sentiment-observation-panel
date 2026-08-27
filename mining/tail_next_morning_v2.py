@@ -47,6 +47,7 @@ from mining.tail_next_morning import (
 
 TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v22-task-cards.md"
 DEVELOPMENT_RUNNER_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-26-tail-next-morning-v22-development-runner.md"
+V23_TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-27-tail-next-morning-v23-task-cards.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
@@ -59,6 +60,11 @@ A_VWAP_DIST_MIN = 0.01
 V22_A_LIMIT = 6
 V22_B_LIMIT = 3
 V22_MARKET_TARGETS = ("20240923", "20240926")
+V23_MARKET_TARGETS = ("20240923", "20240926")
+V23_FIXTURES = {
+    ("20240923", "300085"): {"prior5_amount_pass_count": 1, "prior5_amount_all_gt_200m": False, "eligible_pass": False},
+    ("20240926", "300339"): {"prior5_amount_pass_count": 5, "prior5_amount_all_gt_200m": True},
+}
 FIXTURES = {
     ("20240923", "300085"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
     ("20240926", "300339"): {"a_shape_pass": True, "liquidity_pass": True, "a_top": True},
@@ -116,6 +122,15 @@ def _v22_development_spec_hash() -> str:
     if not marker:
         raise TailDataError("v22_development_execution_marker_missing")
     return _json_identity({"economic_spec_hash": _spec_hash(), "runner_contract": definition})
+
+
+def _v23_spec_hash() -> str:
+    """Bind TNM-V2.3's frozen definition, never its execution evidence."""
+    text = V23_TASK_CARD.read_text(encoding="utf-8").replace("\r\n", "\n")
+    definition, marker, _ = text.partition("## 10. 执行证据")
+    if not marker:
+        raise TailDataError("v23_task_card_execution_marker_missing")
+    return hashlib.sha256(definition.encode("utf-8")).hexdigest()
 
 
 def _git_blob(path: Path) -> str:
@@ -325,6 +340,23 @@ def _v2_statistics_from_frame(raw: pd.DataFrame) -> dict[str, Any]:
                 "decision_window": f"{decision_start}-{sell_start}",
                 "sell_window": f"{sell_start}-{sell_end}",
             }
+    try:
+        decision = validate_minute_window(bars, "13:04", "13:05")
+        result["v23_exit"] = {
+            "decision_status": "ready",
+            "decision_close": float(decision.iloc[-1]["close"]),
+            "sell": vwap_for_window(bars, "13:05", "13:10"),
+            "decision_window": "13:04-13:05",
+            "sell_window": "13:05-13:10",
+        }
+    except TailDataError as exc:
+        result["v23_exit"] = {
+            "decision_status": "invalid",
+            "decision_close": None,
+            "sell": {"status": "invalid_window", "reason": exc.reason, "vwap": None, "amount": None, "volume": None},
+            "decision_window": "13:04-13:05",
+            "sell_window": "13:05-13:10",
+        }
     return result
 
 
@@ -1140,6 +1172,35 @@ def build_v22_signal_row(code: str, day: Mapping[str, Any] | None, prior: Iterab
     return row
 
 
+def _v23_apply_prior5_liquidity(row: dict[str, Any], prior: Iterable[Mapping[str, Any] | None]) -> None:
+    """Replace V2.2's D-1 gate with V2.3's five strict full-session amounts."""
+    values = list(prior)[-5:]
+    amounts: list[float | None] = []
+    for value in values:
+        history = (value or {}).get("history", {}) if isinstance(value, Mapping) else {}
+        amount = history.get("full_amount")
+        amounts.append(float(amount) if _finite(amount) and float(amount) > 0 else None)
+    valid = len(values) == 5 and all(amount is not None for amount in amounts)
+    pass_count = sum(amount is not None and amount > MIN_D1_AMOUNT for amount in amounts)
+    row["prior5_amounts"] = amounts
+    row["prior5_amount_pass_count"] = pass_count
+    row["prior5_amount_min"] = min(amount for amount in amounts if amount is not None) if valid else None
+    row["prior5_amount_all_gt_200m"] = bool(valid and pass_count == 5)
+    row["liquidity_pass"] = row["prior5_amount_all_gt_200m"]
+    row["failure_reasons"] = [reason for reason in row["failure_reasons"] if reason != "d1_amount_not_strictly_above_200m"]
+    if not row["liquidity_pass"]:
+        row["failure_reasons"].append("prior5_amount_not_all_strictly_above_200m")
+
+
+def build_v23_signal_row(code: str, day: Mapping[str, Any] | None, prior: Iterable[Mapping[str, Any] | None], listing: Mapping[str, Any]) -> dict[str, Any]:
+    """V2.3 keeps V2.2 A/B shapes and scores, changing only common liquidity."""
+    history = list(prior)
+    row = build_v22_signal_row(code, day, history, listing)
+    _v23_apply_prior5_liquidity(row, history)
+    row["eligible_pass"] = bool(row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"] and row["listing_pass"])
+    return row
+
+
 def _v22_sort_a(row: Mapping[str, Any]) -> tuple[float, ...]:
     return (-float(row["score_A"]), -float(row["ret1450"]), -float(row["volume_score"]), -float(row["range_expansion"]), -float(row["amount1450"]), -float(row["vwap_dist"]), -float(row["position1450"]), -float(row["tail_return"]))
 
@@ -1197,6 +1258,29 @@ def v22_exit_decision(channel: str, code: str, previous: Mapping[str, Any] | Non
         day_return = decision_close / previous_close - 1.0
         if day_return >= .03:
             return {"status": "continue_return_ge_3pct", "decision_close": decision_close, "day_return_1100": day_return}
+    return {"status": "exit", "exit_price": float(sell["vwap"]), "exit_window": detail["sell_window"], "decision_close": decision_close, "decision_window": detail["decision_window"]}
+
+
+def v23_exit_decision(channel: str, code: str, previous: Mapping[str, Any] | None, current: Mapping[str, Any] | None) -> dict[str, Any]:
+    """V2.3's causal 13:04 decision and 13:05--13:10 executable exit."""
+    if not _history_ready(previous) or not current or current.get("status") != "ready":
+        return {"status": "continue_invalid_previous_or_day"}
+    detail = current.get("v23_exit", {})
+    if detail.get("decision_status") != "ready" or not _finite(detail.get("decision_close")):
+        return {"status": "continue_invalid_decision", "exit_window": detail.get("sell_window")}
+    sell = detail.get("sell", {})
+    if sell.get("status") != "ready" or not _finite(sell.get("vwap")):
+        return {"status": "continue_unavailable_sell", "exit_window": detail.get("sell_window")}
+    decision_close = float(detail["decision_close"])
+    previous_close = float(previous["history"]["close"])
+    if channel == "A":
+        limit = _standard_limit_evidence(code, previous_close, decision_close)
+        if limit["tail_limit_touch"]:
+            return {"status": "continue_limit_up", "decision_close": decision_close, **limit}
+    else:
+        day_return = decision_close / previous_close - 1.0
+        if day_return >= .03:
+            return {"status": "continue_return_ge_3pct", "decision_close": decision_close, "day_return_1304": day_return}
     return {"status": "exit", "exit_price": float(sell["vwap"]), "exit_window": detail["sell_window"], "decision_close": decision_close, "decision_window": detail["decision_window"]}
 
 
@@ -1269,6 +1353,28 @@ def _v22_final_row(
     return row
 
 
+def _v23_final_row(
+    code: str, target: str, index: int, day: Mapping[str, Any] | None, prior: list[Mapping[str, Any] | None],
+    calendar: list[str], daily_root: str | Path, listing_cache: dict[str, dict[str, Any]], daily_consumed: dict[str, dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    provisional = {"listing_history_count_status": "at_least_threshold", "listing_history_sessions": MIN_HISTORY_SESSIONS, "listing_age_source": "deferred_until_shape_and_liquidity_pass"}
+    row = build_v23_signal_row(code, day, prior, provisional)
+    if row["common_quality_pass"] and row["shape_pass"] and row["liquidity_pass"]:
+        listing = development_listing_evidence(daily_root, code, target, minute_visible_sessions=min(index, MIN_HISTORY_SESSIONS), cache=listing_cache)
+        workbook = Path(daily_root) / f"{canonical_code(code)}.xlsx"
+        if daily_consumed is not None and workbook.exists():
+            daily_consumed[canonical_code(code)] = {"path": str(workbook), "sha256": _sha256(workbook)}
+        row = build_v23_signal_row(code, day, prior, listing)
+    else:
+        row.update({"listing_pass": False, "listing_age_source": "not_evaluated_shape_or_liquidity_failed", "listing_history_sessions": None, "listing_history_count_status": "not_evaluated", "eligible_pass": False})
+    row["trade_date"] = target
+    row["prior5_amount_by_trade_date"] = [
+        {"trade_date": calendar[index - 5 + offset], "full_amount": amount}
+        for offset, amount in enumerate(row["prior5_amounts"])
+    ]
+    return row
+
+
 def _v22_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str, Any] | None) -> dict[str, Any]:
     """Only necessary local conditions; B deliberately has no activity/close gate."""
     result = necessary_preselection(code, day, d1)
@@ -1278,6 +1384,11 @@ def _v22_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str,
     result["survives"] = bool(result["liquidity_pass"] and (result["a_local_necessary"] or result["b_local_necessary"]))
     result["reason"] = None if result["survives"] else "local_necessary_condition_failed"
     return result
+
+
+def _v23_preselection(code: str, day: Mapping[str, Any] | None, d1: Mapping[str, Any] | None) -> dict[str, Any]:
+    """D/D-1 remains a necessary-only prefilter; D-5..D-2 is checked later exactly."""
+    return _v22_preselection(code, day, d1)
 
 
 def _v22_input_manifest(minute_root: str | Path, daily_root: str | Path, calendar: Iterable[str]) -> dict[str, Any]:
@@ -1404,6 +1515,223 @@ def _v22_apply_exit_day(
             gross = float(decision["exit_price"]) / float(event["buy_price"]) - 1.0
             event.update({"outcome_status": "resolved", "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - int(event["start_index"]), "exit_trade_date": calendar[index], "exit_window": decision["exit_window"]})
     return open_events
+
+
+def _v23_apply_exit_day(
+    events: Iterable[dict[str, Any]], calendar: list[str], index: int,
+    current: Mapping[str, Mapping[str, Any]], previous: Mapping[str, Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Event research remains independent of the V2.3 account risk pause."""
+    open_events = [event for event in events if event["outcome_status"] == "open" and int(event["start_index"]) < index]
+    for event in open_events:
+        code = str(event["sec_code"])
+        current_stat = current.get(code, {})
+        detail = current_stat.get("v23_exit", {})
+        if detail.get("decision_status") == "ready" and _finite(detail.get("decision_close")):
+            event.setdefault("mark_1304_by_date", {})[calendar[index]] = float(detail["decision_close"])
+        decision = v23_exit_decision(event["channel"], code, previous.get(code), current_stat)
+        event["decisions"].append({"trade_date": calendar[index], **decision})
+        if decision["status"] == "exit":
+            gross = float(decision["exit_price"]) / float(event["buy_price"]) - 1.0
+            event.update({"outcome_status": "resolved", "exit_price": float(decision["exit_price"]), "gross_return": gross, "net_return": gross - .003, "holding_days": index - int(event["start_index"]), "exit_trade_date": calendar[index], "exit_window": decision["exit_window"]})
+    return open_events
+
+
+def _v23_resolve_events(events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any, consumed_codes_by_date: dict[str, set[str]]) -> None:
+    first = min((int(event["start_index"]) + 1 for event in events if event["outcome_status"] == "open"), default=len(calendar))
+    for index in range(first, len(calendar)):
+        open_events = [event for event in events if event["outcome_status"] == "open" and int(event["start_index"]) < index]
+        if not open_events:
+            continue
+        codes = {str(event["sec_code"]) for event in open_events}
+        consumed_codes_by_date.setdefault(calendar[index], set()).update(codes)
+        consumed_codes_by_date.setdefault(calendar[index - 1], set()).update(codes)
+        _v23_apply_exit_day(events, calendar, index, load(calendar[index], codes), load(calendar[index - 1], codes))
+        on_frontier(calendar[index], len([event for event in events if event["outcome_status"] == "open"]))
+    for event in events:
+        if event["outcome_status"] == "open":
+            event.update({"outcome_status": "unresolved_at_development_end", "holding_days": len(calendar) - int(event["start_index"]) - 1})
+
+
+def v23_risk_snapshot(holdings: Mapping[str, Mapping[str, Any]], current: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Mark every actual holding at 13:04, failing closed if any mark is absent."""
+    marks, missing = [], []
+    for sleeve, holding in sorted(holdings.items()):
+        code = str(holding["event"]["sec_code"])
+        detail = current.get(code, {}).get("v23_exit", {})
+        if detail.get("decision_status") == "ready" and _finite(detail.get("decision_close")):
+            mark, stale = float(detail["decision_close"]), False
+        elif _finite(holding.get("last_mark")):
+            mark, stale = float(holding["last_mark"]), True
+        else:
+            missing.append(sleeve)
+            continue
+        net_return = Decimal(str(mark)) / Decimal(str(holding["buy_price"])) - Decimal("1") - Decimal("0.003")
+        marks.append({"sleeve": sleeve, "sec_code": code, "mark_1304": mark, "stale": stale, "net_return": float(net_return)})
+    if missing:
+        return {"status": "risk_snapshot_unavailable", "holding_count": len(holdings), "missing_sleeves": missing, "marks": marks, "risk_trigger": False}
+    returns = [Decimal(str(value["net_return"])) for value in marks]
+    all_losing = len(returns) >= 3 and all(value < 0 for value in returns)
+    mean_decimal = sum(returns) / len(returns) if returns else None
+    mean_return = float(mean_decimal) if mean_decimal is not None else None
+    mean_loss_over_5pct = bool(mean_decimal is not None and mean_decimal < Decimal("-0.05"))
+    return {"status": "ready", "holding_count": len(returns), "marks": marks, "all_losing": all_losing, "mean_holding_return": mean_return, "mean_loss_over_5pct": mean_loss_over_5pct, "risk_trigger": bool(all_losing or mean_loss_over_5pct), "stale_mark_count": sum(value["stale"] for value in marks)}
+
+
+def _v23_exit_from_account(sleeve: str, state: dict[str, Any], current: Mapping[str, Mapping[str, Any]], trade_date: str, ledger: list[dict[str, Any]], *, forced: bool) -> bool:
+    holding = state.get("holding")
+    if holding is None:
+        return False
+    detail = current.get(str(holding["event"]["sec_code"]), {}).get("v23_exit", {})
+    sell = detail.get("sell", {})
+    if sell.get("status") != "ready" or not _finite(sell.get("vwap")):
+        holding["force_exit_pending"] = True
+        ledger.append({"trade_date": trade_date, "sleeve": sleeve, "action": "forced_exit_unavailable" if forced else "continue_unavailable_sell", "sec_code": holding["event"]["sec_code"], "exit_window": detail.get("sell_window")})
+        return False
+    exit_price = float(sell["vwap"])
+    net_return = exit_price / float(holding["buy_price"]) - 1.0 - .003
+    state["cash"] *= 1.0 + net_return
+    state["holding"] = None
+    ledger.append({"trade_date": trade_date, "sleeve": sleeve, "action": "forced_risk_exit" if forced else "sell", "sec_code": holding["event"]["sec_code"], "buy_price": holding["buy_price"], "exit_price": exit_price, "net_return": net_return, "exit_window": detail.get("sell_window")})
+    return True
+
+
+def _v23_sleeve_account(events: Iterable[Mapping[str, Any]], calendar: Iterable[str], load: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Actual nine-sleeve account; event economics are deliberately not mutated."""
+    dates = list(calendar)
+    initial = 5_000_000.0 / 9.0
+    sleeves = {f"A{rank}": {"cash": initial, "holding": None} for rank in range(1, V22_A_LIMIT + 1)} | {f"B{rank}": {"cash": initial, "holding": None} for rank in range(1, V22_B_LIMIT + 1)}
+    strategy = [dict(event) for event in events if event["strategy_or_control"] == "strategy"]
+    boundary = [event for event in strategy if int(event["rank"]) > (V22_A_LIMIT if event["channel"] == "A" else V22_B_LIMIT)]
+    if boundary:
+        return [], [], {"status": "blocked_boundary_tie_account", "boundary_tie_members": boundary}, [], [], []
+    by_signal: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in strategy:
+        by_signal[str(event["trade_date"])].append(event)
+    ledger: list[dict[str, Any]] = []
+    nav: list[dict[str, Any]] = []
+    holdings_rows: list[dict[str, Any]] = []
+    risk_rows: list[dict[str, Any]] = []
+    cooldown_skips: list[dict[str, Any]] = []
+    episodes: list[dict[str, Any]] = []
+    cooldown_dates: set[int] = set()
+    risk_episode = False
+    trigger_counts = {"all_losing": 0, "mean_loss_over_5pct": 0, "both": 0}
+    stale_marks = busy_skip = forced_unavailable = 0
+    realized: list[float] = []
+    for index, trade_date in enumerate(dates):
+        active = {name: sleeve["holding"] for name, sleeve in sleeves.items() if sleeve["holding"] is not None}
+        had_holdings_at_start = bool(active)
+        codes = {str(holding["event"]["sec_code"]) for holding in active.values()}
+        current = load(trade_date, codes) if codes else {}
+        previous = load(dates[index - 1], codes) if codes and index else {}
+        snapshot = v23_risk_snapshot(active, current) if active else {"status": "no_holdings", "holding_count": 0, "marks": [], "risk_trigger": False}
+        for mark in snapshot.get("marks", []):
+            holding = sleeves[mark["sleeve"]]["holding"]
+            if holding is not None and not mark["stale"]:
+                holding["last_mark"] = float(mark["mark_1304"])
+                holding["last_mark_date"] = trade_date
+            stale_marks += int(mark["stale"])
+            holdings_rows.append({"trade_date": trade_date, **mark})
+        trigger = bool(snapshot.get("risk_trigger")) and not risk_episode
+        if trigger:
+            risk_episode = True
+            cooldown_dates = set(range(index + 1, min(index + 4, len(dates))))
+            trigger_counts["all_losing"] += int(bool(snapshot["all_losing"]))
+            trigger_counts["mean_loss_over_5pct"] += int(bool(snapshot["mean_loss_over_5pct"]))
+            trigger_counts["both"] += int(bool(snapshot["all_losing"] and snapshot["mean_loss_over_5pct"]))
+            episodes.append({"trigger_trade_date": trade_date, "holding_count": snapshot["holding_count"], "marks": snapshot["marks"], "mean_holding_return": snapshot["mean_holding_return"], "stale_mark_count": snapshot["stale_mark_count"], "earliest_restore_trade_date": dates[index + 4] if index + 4 < len(dates) else None, "planned_forced_exits": len(active), "actual_forced_exits": 0})
+            for name in sorted(active):
+                if _v23_exit_from_account(name, sleeves[name], current, trade_date, ledger, forced=True):
+                    episodes[-1]["actual_forced_exits"] += 1
+                    realized.append(float(ledger[-1]["net_return"]))
+                else:
+                    forced_unavailable += 1
+        else:
+            for name in sorted(active):
+                holding = sleeves[name]["holding"]
+                if holding is None:
+                    continue
+                if holding.get("force_exit_pending"):
+                    if _v23_exit_from_account(name, sleeves[name], current, trade_date, ledger, forced=True):
+                        realized.append(float(ledger[-1]["net_return"]))
+                    else:
+                        forced_unavailable += 1
+                    continue
+                decision = v23_exit_decision(holding["event"]["channel"], holding["event"]["sec_code"], previous.get(holding["event"]["sec_code"]), current.get(holding["event"]["sec_code"]))
+                if decision["status"] == "exit":
+                    exit_price = float(decision["exit_price"])
+                    net_return = exit_price / float(holding["buy_price"]) - 1.0 - .003
+                    sleeves[name]["cash"] *= 1.0 + net_return
+                    sleeves[name]["holding"] = None
+                    ledger.append({"trade_date": trade_date, "sleeve": name, "action": "sell", "sec_code": holding["event"]["sec_code"], "buy_price": holding["buy_price"], "exit_price": exit_price, "net_return": net_return, "exit_window": decision["exit_window"]})
+                    realized.append(net_return)
+        if risk_episode and index not in cooldown_dates and not trigger and not had_holdings_at_start and not any(sleeve["holding"] is not None for sleeve in sleeves.values()):
+            risk_episode = False
+            if episodes and episodes[-1].get("actual_restore_trade_date") is None:
+                episodes[-1]["actual_restore_trade_date"] = trade_date
+                earliest = episodes[-1].get("earliest_restore_trade_date")
+                episodes[-1]["delayed_clear_days"] = max(0, index - dates.index(earliest)) if earliest else None
+        for event in sorted(by_signal.get(trade_date, []), key=lambda value: (value["channel"], value["rank"])):
+            sleeve_name, sleeve = f"{event['channel']}{event['rank']}", sleeves[f"{event['channel']}{event['rank']}"]
+            if trigger:
+                ledger.append({"trade_date": trade_date, "sleeve": sleeve_name, "action": "risk_trigger_no_buy", "sec_code": event["sec_code"]})
+            elif index in cooldown_dates:
+                record = {"trade_date": trade_date, "sleeve": sleeve_name, "sec_code": event["sec_code"], "action": "cooldown_skip", "hypothetical_net_return": event.get("net_return")}
+                cooldown_skips.append(record)
+                ledger.append(record)
+            elif risk_episode:
+                ledger.append({"trade_date": trade_date, "sleeve": sleeve_name, "action": "risk_off_waiting_for_clear", "sec_code": event["sec_code"]})
+            elif sleeve["holding"] is not None:
+                busy_skip += 1
+                ledger.append({"trade_date": trade_date, "sleeve": sleeve_name, "action": "busy_skip", "sec_code": event["sec_code"]})
+            elif not event["bought"]:
+                ledger.append({"trade_date": trade_date, "sleeve": sleeve_name, "action": "unavailable_buy", "sec_code": event["sec_code"]})
+            else:
+                sleeve["holding"] = {"event": event, "buy_price": float(event["buy_price"]), "last_mark": float(event["buy_price"]), "last_mark_date": trade_date, "force_exit_pending": False}
+                ledger.append({"trade_date": trade_date, "sleeve": sleeve_name, "action": "buy", "sec_code": event["sec_code"], "buy_price": event["buy_price"]})
+        value = 0.0
+        active_after = 0
+        for sleeve in sleeves.values():
+            holding = sleeve["holding"]
+            if holding is None:
+                value += float(sleeve["cash"])
+            else:
+                active_after += 1
+                value += float(sleeve["cash"]) * float(holding["last_mark"]) / float(holding["buy_price"])
+        risk_rows.append({"trade_date": trade_date, "state": "RISK_OFF" if risk_episode or trigger else "NORMAL", "triggered": trigger, **snapshot})
+        nav.append({"trade_date": trade_date, "nav": value, "utilization": active_after / 9.0})
+    peak, drawdown = 0.0, 0.0
+    for row in nav:
+        peak = max(peak, float(row["nav"]))
+        drawdown = min(drawdown, float(row["nav"]) / peak - 1.0)
+    skipped = [value.get("hypothetical_net_return") for value in cooldown_skips if _finite(value.get("hypothetical_net_return"))]
+    longest_loss = current_loss = 0
+    for value in realized:
+        current_loss = current_loss + 1 if value < 0 else 0
+        longest_loss = max(longest_loss, current_loss)
+    unresolved = any(sleeve["holding"] is not None for sleeve in sleeves.values())
+    annual_returns: dict[str, float] = {}
+    monthly_returns: dict[str, float] = {}
+    for index in range(1, len(nav)):
+        daily_return = float(nav[index]["nav"]) / float(nav[index - 1]["nav"]) - 1.0
+        for bucket, key in ((annual_returns, str(nav[index]["trade_date"])[:4]), (monthly_returns, str(nav[index]["trade_date"])[:6])):
+            bucket[key] = (1.0 + bucket.get(key, 0.0)) * (1.0 + daily_return) - 1.0
+    account = {
+        "status": "blocked_unresolved_account" if unresolved else "ready", "busy_skip": busy_skip,
+        "total_return": None if unresolved else nav[-1]["nav"] / 5_000_000.0 - 1.0,
+        "diagnostic_mtm_nav": nav[-1]["nav"] if nav else 5_000_000.0, "max_drawdown": drawdown,
+        "average_utilization": sum(float(row["utilization"]) for row in nav) / len(nav) if nav else 0.0,
+        "realized_trade_count": len(realized), "realized_win_rate": sum(value > 0 for value in realized) / len(realized) if realized else None,
+        "realized_net_mean": sum(realized) / len(realized) if realized else None, "realized_net_median": float(pd.Series(realized).median()) if realized else None,
+        "longest_consecutive_loss": longest_loss, "risk_trigger_count": len(episodes), "risk_trigger_all_losing_count": trigger_counts["all_losing"],
+        "risk_trigger_mean_loss_over_5pct_count": trigger_counts["mean_loss_over_5pct"], "risk_trigger_both_count": trigger_counts["both"],
+        "forced_exit_unavailable_count": forced_unavailable, "stale_mark_count": stale_marks, "cooldown_skip_count": len(cooldown_skips),
+        "cooldown_avoided_hypothetical_loss": sum(-float(value) for value in skipped if value < 0),
+        "cooldown_missed_hypothetical_profit": sum(float(value) for value in skipped if value > 0), "risk_episodes": episodes,
+        "annual_returns": annual_returns, "monthly_returns": monthly_returns,
+    }
+    return ledger, nav, account, holdings_rows, risk_rows, cooldown_skips
 
 
 def _v22_group_metrics(values: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
@@ -1812,6 +2140,246 @@ def run_v22_canary(minute_root: str | Path, daily_root: str | Path, output_dir: 
         raise
 
 
+def _v23_outcome_journals(
+    run_dir: Path, run_hash: str, events: Iterable[Mapping[str, Any]], calendar: list[str],
+    records: Mapping[str, Mapping[str, Any]], dynamic_codes: Mapping[str, set[str]],
+) -> dict[str, str]:
+    """Persist day-owned V2.3 event updates without treating account pauses as event facts."""
+    event_by_date: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for event in events:
+        for decision in event.get("decisions", []):
+            event_by_date[str(decision["trade_date"])].append({"event_id": event["event_id"], "event": _public_row(event)})
+    hashes: dict[str, str] = {}
+    for trade_date, updates in sorted(event_by_date.items()):
+        index = calendar.index(trade_date)
+        codes = set(dynamic_codes.get(trade_date, set()))
+        dependencies: dict[str, set[str] | None] = {trade_date: codes}
+        if index:
+            dependencies[calendar[index - 1]] = codes
+        journal = {
+            "run_hash": run_hash, "trade_date": trade_date, "updates": updates,
+            "unit_consumed_input": _unit_consumed_input(_unit_minute_members(records, dependencies), {}),
+        }
+        path = run_dir / "outcomes" / f"{trade_date}.json"
+        _write_json(path, journal)
+        hashes[trade_date] = _sha256(path)
+    return hashes
+
+
+def run_v23_canary(
+    minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, max_elapsed_seconds: float = 900.0,
+) -> tuple[dict[str, Any], Path]:
+    """The single bounded V2.3 canary: V2.2 selection plus new liquidity, exits and account guard."""
+    started, run_dir = time.monotonic(), None
+    if float(max_elapsed_seconds) <= 0:
+        raise TailDataError("v23_canary_max_elapsed_must_be_positive")
+    calendar, positions = _v22_calendar(minute_root)
+    if any(target not in positions or positions[target] < 10 for target in V23_MARKET_TARGETS):
+        raise TailDataError("v23_canary_calendar_missing_dependency")
+    manifest_input = _v22_input_manifest(minute_root, daily_root, calendar)
+    run_dir, manifest = _v22_prepare_run(
+        output_dir, manifest_input, resume_run_id=None, mode="tnm-v23-1-canary",
+        run_prefix="v23-canary", spec_hash=_v23_spec_hash(),
+    )
+    run_hash, progress_path, completion_path = manifest["run_hash"], run_dir / "progress.json", run_dir / "completion.json"
+    cache: dict[str, dict[str, dict[str, Any]]] = {}
+    records: dict[str, dict[str, Any]] = {}
+    listing_cache: dict[str, dict[str, Any]] = {}
+    daily_consumed: dict[str, dict[str, str]] = {}
+    completed_sources: list[str] = []
+    source_open_counts: dict[str, int] = defaultdict(int)
+
+    def progress(stage: str, completed: Iterable[str], open_events: int = 0) -> None:
+        _write_json(progress_path, {
+            "run_hash": run_hash, "stage": stage, "completed_units": sorted(completed),
+            "total_units": len(V23_MARKET_TARGETS),
+            "source_frontier": completed_sources[-1] if completed_sources else None,
+            "completed_source_dates": list(completed_sources),
+            "source_open_counts": dict(sorted(source_open_counts.items())),
+            "open_exit_events": open_events,
+            "elapsed_seconds": round(time.monotonic() - started, 6),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        })
+
+    def time_limit() -> None:
+        if time.monotonic() - started >= float(max_elapsed_seconds):
+            raise TailDataError("canary_time_limit")
+
+    def load(trade_date: str, codes: Iterable[str] | None) -> dict[str, dict[str, Any]]:
+        requested = None if codes is None else {canonical_code(code) for code in codes}
+        if trade_date in cache:
+            if requested is not None and not requested.issubset(cache[trade_date]):
+                raise TailDataError(f"v23_container_reopen_forbidden:{trade_date}")
+            return cache[trade_date]
+        values, record = load_day_v2_statistics(minute_root, trade_date, requested)
+        cache[trade_date], records[trade_date] = values, record
+        completed_sources.append(trade_date)
+        source_open_counts[trade_date] += int(record.get("container_open_count", 1))
+        progress(f"source:{trade_date}", ())
+        time_limit()
+        return values
+
+    try:
+        progress("input_frozen", ())
+        all_rows: dict[str, list[dict[str, Any]]] = {}
+        ranked_by_target: dict[str, dict[str, Any]] = {}
+        preselected: dict[str, tuple[int, dict[str, dict[str, Any]], set[str]]] = {}
+        for target in V23_MARKET_TARGETS:
+            index = positions[target]
+            day, d1 = load(target, None), load(calendar[index - 1], None)
+            pre = {code: _v23_preselection(code, day.get(code), d1.get(code)) for code in day}
+            fixture_codes = {code for (fixture_date, code) in V23_FIXTURES if fixture_date == target}
+            evaluation = {code for code, proof in pre.items() if proof["survives"]} | fixture_codes
+            preselected[target] = (index, day, evaluation)
+
+        evaluation_union = set().union(*(evaluation for _, _, evaluation in preselected.values()))
+        shared_history_dates = {
+            dependency for _, (index, _, _) in preselected.items()
+            for dependency in calendar[index - 10:index - 1]
+        }
+        for dependency in sorted(shared_history_dates, key=calendar.index):
+            load(dependency, evaluation_union)
+
+        for target in V23_MARKET_TARGETS:
+            index, day, evaluation = preselected[target]
+            d1 = cache[calendar[index - 1]]
+            rows = [
+                _v23_final_row(
+                    code, target, index, day.get(code),
+                    [cache[value].get(code) for value in calendar[index - 10:index - 1]] + [d1.get(code)],
+                    calendar, daily_root, listing_cache, daily_consumed,
+                )
+                for code in sorted(evaluation)
+            ]
+            all_rows[target], ranked_by_target[target] = rows, rank_v22_channels(rows)
+            progress(f"selection:{target}", ())
+
+        events: list[dict[str, Any]] = []
+        daily_by_target: dict[str, Any] = {}
+        for target in V23_MARKET_TARGETS:
+            index = positions[target]
+            ranked = ranked_by_target[target]
+            daily_by_target[target] = {
+                "trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]),
+                "A6": [_public_row(row) for row in ranked["a_selected"]], "B3": [_public_row(row) for row in ranked["b_selected"]],
+                "A_boundary_tie_expanded": ranked["a_boundary_tie_expanded"], "B_boundary_tie_expanded": ranked["b_boundary_tie_expanded"],
+            }
+            day = cache[target]
+            for channel, pool, selected in (("A", ranked["a_pool"], ranked["a_selected"]), ("B", ranked["b_pool"], ranked["b_selected"])):
+                weights = _v22_slot_weights(selected, channel)
+                for group, members in _v22_controls(pool, selected, channel).items():
+                    for rank, (row, slot_weight) in enumerate(zip(members, weights), 1):
+                        event = _v22_seed_event(
+                            row, group=group, rank=rank, start_index=index,
+                            buy=day.get(row["sec_code"], {}).get("buy", {}), signal_stat=day.get(row["sec_code"]), slot_weight=slot_weight,
+                        )
+                        event["event_id"] = f"{target}|{channel}|{group}|{rank}|{event['sec_code']}"
+                        events.append(event)
+
+        dynamic_exit_codes: dict[str, set[str]] = {}
+        _v23_resolve_events(
+            events, calendar, load,
+            lambda frontier, open_events: (progress(f"exit:{frontier}", (), open_events), time_limit()),
+            dynamic_exit_codes,
+        )
+        outcome_journals = _v23_outcome_journals(run_dir, run_hash, events, calendar, records, dynamic_exit_codes)
+        ledger, nav, account, holdings, risk_states, cooldown_skips = _v23_sleeve_account(events, calendar, load)
+
+        completed: dict[str, dict[str, Any]] = {}
+        for target in V23_MARKET_TARGETS:
+            unit, index = f"market:{target}", positions[target]
+            ranked = ranked_by_target[target]
+            target_events = [event for event in events if event["trade_date"] == target]
+            result = {
+                "daily": daily_by_target[target],
+                "eligible_rows": [_public_row(row) for row in ranked["a_pool"] + ranked["b_pool"]],
+                "all_candidate_rows": [_public_row(row) for row in all_rows[target]],
+                "events": target_events,
+                "dynamic_exit_codes_by_date": {day: sorted(codes) for day, codes in sorted(dynamic_exit_codes.items())},
+                "unit_consumed_input": _v22_checkpoint_identity(records, daily_consumed, target, index, all_rows[target], target_events, calendar),
+            }
+            _checkpoint(run_dir, run_hash, unit, result)
+            completed[unit] = result
+            progress(f"market:{target}", completed, sum(event["outcome_status"] == "open" for event in events))
+
+        fixture_evidence: dict[str, Any] = {}
+        for target, code in sorted(V23_FIXTURES):
+            row = next((value for value in all_rows[target] if value["sec_code"] == code), None)
+            selected = {
+                value["sec_code"]
+                for value in daily_by_target[target]["A6"] + daily_by_target[target]["B3"]
+            }
+            expectation = V23_FIXTURES[(target, code)]
+            fixture_evidence[f"{code}@{target}"] = {
+                "row_present": row is not None,
+                "prior5_amount_pass_count": None if row is None else row["prior5_amount_pass_count"],
+                "prior5_amount_all_gt_200m": None if row is None else row["prior5_amount_all_gt_200m"],
+                "liquidity_pass": None if row is None else row["liquidity_pass"],
+                "failure_reasons": None if row is None else row["failure_reasons"],
+                "selected_A6_or_B3": code in selected,
+                "expected": expectation,
+            }
+        fixture_ok = (
+            fixture_evidence["300085@20240923"]["row_present"]
+            and fixture_evidence["300085@20240923"]["prior5_amount_pass_count"] == 1
+            and not fixture_evidence["300085@20240923"]["prior5_amount_all_gt_200m"]
+            and not fixture_evidence["300085@20240923"]["selected_A6_or_B3"]
+            and fixture_evidence["300339@20240926"]["row_present"]
+            and fixture_evidence["300339@20240926"]["prior5_amount_pass_count"] == 5
+            and fixture_evidence["300339@20240926"]["prior5_amount_all_gt_200m"]
+            and fixture_evidence["300339@20240926"]["liquidity_pass"]
+        )
+        all_daily = [row for target in V23_MARKET_TARGETS for row in completed[f"market:{target}"]["eligible_rows"]]
+        verified = {unit: _verify_checkpoint_consumed_input(unit, result, records) for unit, result in sorted(completed.items())}
+        aggregates = _v22_event_aggregates(events)
+        summary = {
+            "execution_label": "tnm_v23_1_canary_verified" if fixture_ok else "changes_required_by_frozen_canary",
+            "targets": list(V23_MARKET_TARGETS), "run_hash": run_hash, "spec_hash": manifest["spec_hash"],
+            "base_commit": manifest["base_commit"], "source_blob_identity": manifest["source_blob_identity"],
+            "input_manifest_hash": manifest["input_manifest_hash"], "daily": daily_by_target,
+            "event_count": len(events), "resolved_events": sum(event["outcome_status"] == "resolved" for event in events),
+            "unresolved_events": sum(event["outcome_status"] == "unresolved_at_development_end" for event in events),
+            "aggregates": aggregates, "account": account, "fixture_evidence": fixture_evidence,
+            "outcome_journals": outcome_journals, "verified_checkpoint_consumed_identities": verified,
+            "consumed_input_identity": _json_identity(verified), "source_open_counts": dict(sorted(source_open_counts.items())),
+            "read_2025_2026": False, "e_drive_written": False,
+            "elapsed_seconds": round(time.monotonic() - started, 6), "source_records": records,
+        }
+        _write_json(run_dir / "v23_summary.json", summary)
+        _write_csv_gz(run_dir / "daily_results.csv.gz", all_daily)
+        _write_csv_gz(run_dir / "event_results.csv.gz", events)
+        _write_csv_gz(run_dir / "account_ledger.csv.gz", ledger)
+        _write_csv_gz(run_dir / "account_nav.csv.gz", nav)
+        _write_csv_gz(run_dir / "account_holdings_1304.csv.gz", holdings)
+        _write_csv_gz(run_dir / "risk_state.csv.gz", risk_states)
+        _write_csv_gz(run_dir / "cooldown_skips.csv.gz", cooldown_skips)
+        progress("aggregated", completed)
+        artifacts = {
+            path.relative_to(run_dir).as_posix(): {"size_bytes": path.stat().st_size, "sha256": _sha256(path)}
+            for path in sorted(run_dir.rglob("*"))
+            if path.is_file() and path.name not in {"artifact_manifest.json", "completion.json"}
+        }
+        _write_json(run_dir / "artifact_manifest.json", artifacts)
+        _write_json(completion_path, {
+            "status": "SUCCEEDED", "run_hash": run_hash, "execution_label": summary["execution_label"],
+            "artifact_manifest_sha256": _sha256(run_dir / "artifact_manifest.json"),
+        })
+        return summary, run_dir
+    except KeyboardInterrupt:
+        if run_dir is not None:
+            _write_json(completion_path, {"status": "CANCELLED", "run_hash": run_hash, "reason": "KeyboardInterrupt"})
+        raise
+    except TailDataError as exc:
+        if run_dir is not None:
+            status = "CANCELLED" if str(exc) == "canary_time_limit" else "FAILED"
+            _write_json(completion_path, {"status": status, "run_hash": run_hash, "reason": str(exc)})
+        raise
+    except Exception as exc:
+        if run_dir is not None:
+            _write_json(completion_path, {"status": "FAILED", "run_hash": run_hash, "reason": type(exc).__name__, "detail": str(exc)})
+        raise
+
+
 def _v22_development_claim_lock(run_dir: Path, run_hash: str) -> Path:
     lock = run_dir / "run.lock"
     owner = {"pid": os.getpid(), "run_hash": run_hash, "started_at": datetime.now(timezone.utc).isoformat(), "command": " ".join(os.sys.argv)}
@@ -2207,6 +2775,11 @@ def main(argv: list[str] | None = None) -> int:
     v22.add_argument("--output-dir", required=True)
     v22.add_argument("--resume-run-id")
     v22.add_argument("--max-elapsed-seconds", type=float, default=900.0)
+    v23 = subparsers.add_parser("v23-canary")
+    v23.add_argument("--minute-root", required=True)
+    v23.add_argument("--daily-root", required=True)
+    v23.add_argument("--output-dir", required=True)
+    v23.add_argument("--max-elapsed-seconds", type=float, default=900.0)
     development = subparsers.add_parser("v22-development")
     development.add_argument("--minute-root", required=True)
     development.add_argument("--daily-root", required=True)
@@ -2217,12 +2790,14 @@ def main(argv: list[str] | None = None) -> int:
         summary, run_dir = run_diagnostic(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     elif args.command == "v22-canary":
         summary, run_dir = run_v22_canary(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id, max_elapsed_seconds=args.max_elapsed_seconds)
+    elif args.command == "v23-canary":
+        summary, run_dir = run_v23_canary(args.minute_root, args.daily_root, args.output_dir, max_elapsed_seconds=args.max_elapsed_seconds)
     elif args.command == "v22-development":
         summary, run_dir = run_v22_development(args.minute_root, args.daily_root, args.output_dir, resume_run_id=args.resume_run_id)
     else:
         raise TailDataError("unsupported_v2_command")
     print(f"status={summary['execution_label']} run_dir={run_dir}")
-    return 0 if summary["execution_label"] in {"tnm_v2_r1_diagnostic_ready", "tnm_v22_1_canary_verified", "tnm_v22_development_completed"} else 2
+    return 0 if summary["execution_label"] in {"tnm_v2_r1_diagnostic_ready", "tnm_v22_1_canary_verified", "tnm_v22_development_completed", "tnm_v23_1_canary_verified"} else 2
 
 
 if __name__ == "__main__":
