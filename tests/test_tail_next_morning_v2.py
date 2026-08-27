@@ -1232,7 +1232,8 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(1, summary["fixture_evidence"]["300085@20240923"]["prior5_amount_pass_count"])
             self.assertEqual(5, summary["fixture_evidence"]["300339@20240926"]["prior5_amount_pass_count"])
             self.assertTrue(all(count == 1 for count in calls.values()))
-            self.assertTrue(all("300085" not in (requests[calendar[index]] or set()) for index in range(0, 5)))
+            early_checkpoint = json.loads((run_dir / "checkpoints" / "market_20240923.json").read_text(encoding="utf-8"))["result"]
+            self.assertTrue(all("300085" not in early_checkpoint["unit_consumed_input"]["minute_members"][calendar[index]] for index in range(0, 5)))
             self.assertTrue(summary["read_phase_events"])
             self.assertTrue(any(event["phase"] == "short" for event in summary["read_phase_events"]))
             self.assertTrue(any(event["phase"] == "long" for event in summary["read_phase_events"]))
@@ -1243,6 +1244,114 @@ class TailNextMorningV2Tests(unittest.TestCase):
             for relative in ("daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz", "account_holdings_1304.csv.gz", "risk_state.csv.gz", "cooldown_skips.csv.gz", "artifact_manifest.json", "completion.json"):
                 self.assertTrue((run_dir / relative).is_file(), relative)
             self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+
+    def test_v23_r2_unifies_first_open_consumers_and_binds_consumption_identity(self) -> None:
+        """A later short request must carry an earlier event exit on its first physical open."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [
+            "20240902", "20240903", "20240904", "20240905", "20240906", "20240909", "20240910", "20240911",
+            "20240912", "20240913", "20240923", "20240924", "20240925", "20240926", "20240927", "20240930",
+        ]
+        positions = {"20240923": 10, "20240926": 13}
+        early_codes = {"300085", "300701", "300702"}
+        later_codes = {"300339", "300801", "300802"}
+        day, template_prior = a_inputs()
+        calls: dict[str, int] = {}
+        first_requests: dict[str, set[str] | None] = {}
+
+        def future(value: dict) -> dict:
+            result = copy.deepcopy(value)
+            result["v23_exit"] = {
+                "decision_status": "ready", "decision_close": 10.9,
+                "sell": {"status": "ready", "vwap": 10.8},
+                "decision_window": "13:04-13:05", "sell_window": "13:05-13:10",
+            }
+            return result
+
+        def full_universe(trade_date: str) -> set[str]:
+            if trade_date == "20240923":
+                return early_codes | later_codes
+            if trade_date == "20240913":
+                return early_codes | later_codes
+            if trade_date in {"20240926", "20240925"}:
+                return later_codes
+            return early_codes | later_codes
+
+        def fake_load(_root, trade_date, requested=None):
+            calls[trade_date] = calls.get(trade_date, 0) + 1
+            universe = full_universe(trade_date) if requested is None else set(requested)
+            first_requests.setdefault(trade_date, None if requested is None else set(requested))
+            index = calendar.index(trade_date)
+            values = {}
+            for code in universe:
+                values[code] = copy.deepcopy(day) if index in positions.values() else copy.deepcopy(template_prior[index % 10])
+                if trade_date == "20240923" and code in later_codes:
+                    values[code]["signal"]["amount"] = 0.0
+                if index in {11, 14}:
+                    values[code] = future(values[code])
+                if code == "300085" and index in {5, 6, 7, 8}:
+                    values[code]["history"]["full_amount"] = 100_000_000.0
+            digests = {code: hashlib.sha256(f"v23-r2|{trade_date}|{code}".encode()).hexdigest() for code in universe}
+            return values, {
+                "trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0,
+                "source_fingerprint": {"path": f"synthetic/{trade_date}", "size_bytes": 240, "mtime_ns": 7},
+                "consumed_member_sha256": digests,
+            }
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        patches = (
+            patch.object(module, "_v22_calendar", return_value=(calendar, positions)),
+            patch.object(module, "_v22_input_manifest", return_value=manifest),
+            patch.object(module, "load_day_v2_statistics", side_effect=fake_load),
+            patch.object(module, "development_listing_evidence", return_value=LISTED),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with patches[0], patches[1], patches[2], patches[3]:
+                summary, run_dir = run_v23_canary("synthetic", "synthetic", temporary, max_elapsed_seconds=900)
+            self.assertEqual("tnm_v23_1_canary_verified", summary["execution_label"], summary["fixture_evidence"])
+            self.assertTrue(all(count == 1 for count in calls.values()))
+            first_0909 = next(event for event in summary["read_phase_events"] if event["source_date"] == "20240909" and not event["reused"])
+            self.assertEqual(["selection_short", "selection_long"], first_0909["consumer_types"])
+            first_0924 = next(event for event in summary["read_phase_events"] if event["source_date"] == "20240924" and not event["reused"])
+            self.assertEqual(["selection_short", "event_exit"], first_0924["consumer_types"])
+            early = json.loads((run_dir / "checkpoints" / "market_20240923.json").read_text(encoding="utf-8"))["result"]
+            early_event_code = next(event["sec_code"] for event in early["events"] if event["outcome_status"] == "resolved")
+            self.assertIn(early_event_code, first_requests["20240924"] or set())
+            self.assertTrue(later_codes.issubset(first_requests["20240924"] or set()))
+            ledger = early["consumption_ledger"]
+            self.assertIn(early_event_code, ledger["20240924"])
+            self.assertTrue(all("300085" in ledger[date] for date in calendar[5:9]))
+            self.assertTrue(all("300085" not in ledger[date] for date in calendar[0:5]))
+            records = copy.deepcopy(summary["source_records"])
+            expected_identity = _verify_checkpoint_consumed_input("market:20240923", early, records)
+            unused = copy.deepcopy(records)
+            unused["20240925"]["consumed_member_sha256"]["399999"] = "unused-content"
+            self.assertEqual(expected_identity, _verify_checkpoint_consumed_input("market:20240923", early, unused))
+            used_date = next(date for date, codes in ledger.items() if codes)
+            used_code = ledger[used_date][0]
+            rewritten = copy.deepcopy(records)
+            before = dict(rewritten[used_date]["source_fingerprint"])
+            rewritten[used_date]["consumed_member_sha256"][used_code] = "content-rewritten-same-size-mtime"
+            self.assertEqual(before, rewritten[used_date]["source_fingerprint"])
+            with self.assertRaisesRegex(Exception, "consumed_input_identity_mismatch:market:20240923"):
+                _verify_checkpoint_consumed_input("market:20240923", early, rewritten)
+
+        def reject_account(_events, _calendar, loader):
+            loader("20240924", {"399999"})
+            raise AssertionError("the non-subset request must have failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            with patches[0], patches[1], patches[2], patches[3], patch.object(module, "_v23_sleeve_account", side_effect=reject_account):
+                with self.assertRaisesRegex(Exception, "v23_container_reopen_forbidden:20240924"):
+                    run_v23_canary("synthetic", "synthetic", temporary, max_elapsed_seconds=900)
+            failed_dir = next(Path(temporary).iterdir())
+            failed_progress = json.loads((failed_dir / "progress.json").read_text(encoding="utf-8"))
+            rejected = failed_progress["phase_events"][-1]
+            self.assertEqual("rejected_non_subset", rejected["status"])
+            self.assertEqual("20240924", rejected["source_date"])
+            self.assertGreater(rejected["missing_code_count"], 0)
+            self.assertTrue(rejected["missing_codes_sha256"])
+            self.assertEqual("FAILED", json.loads((failed_dir / "completion.json").read_text(encoding="utf-8"))["status"])
 
     def test_v23_two_phase_gate_matches_naive_rows_and_skips_failed_long_history(self) -> None:
         day, prior = a_inputs()

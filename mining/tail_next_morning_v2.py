@@ -1550,7 +1550,10 @@ def _v23_apply_exit_day(
     return open_events
 
 
-def _v23_resolve_events(events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any, consumed_codes_by_date: dict[str, set[str]]) -> None:
+def _v23_resolve_events(
+    events: list[dict[str, Any]], calendar: list[str], load: Any, on_frontier: Any,
+    consumed_codes_by_date: dict[str, set[str]], consumed_by_target: dict[str, dict[str, set[str] | None]],
+) -> None:
     first = min((int(event["start_index"]) + 1 for event in events if event["outcome_status"] == "open"), default=len(calendar))
     for index in range(first, len(calendar)):
         open_events = [event for event in events if event["outcome_status"] == "open" and int(event["start_index"]) < index]
@@ -1559,6 +1562,11 @@ def _v23_resolve_events(events: list[dict[str, Any]], calendar: list[str], load:
         codes = {str(event["sec_code"]) for event in open_events}
         consumed_codes_by_date.setdefault(calendar[index], set()).update(codes)
         consumed_codes_by_date.setdefault(calendar[index - 1], set()).update(codes)
+        for event in open_events:
+            target = str(event["trade_date"])
+            code = str(event["sec_code"])
+            _v23_add_consumed_dependency(consumed_by_target[target], calendar[index], {code})
+            _v23_add_consumed_dependency(consumed_by_target[target], calendar[index - 1], {code})
         _v23_apply_exit_day(events, calendar, index, load(calendar[index], codes), load(calendar[index - 1], codes))
         on_frontier(calendar[index], len([event for event in events if event["outcome_status"] == "open"]))
     for event in events:
@@ -2139,6 +2147,39 @@ def _v22_checkpoint_identity(
     return _unit_consumed_input(_unit_minute_members(records, dependencies), daily_subset)
 
 
+def _v23_add_consumed_dependency(
+    dependencies: dict[str, set[str] | None], trade_date: str, codes: Iterable[str] | None,
+) -> None:
+    """Record one target's real source consumers without widening its identity."""
+    if codes is None:
+        dependencies[str(trade_date)] = None
+        return
+    requested = {canonical_code(code) for code in codes}
+    existing = dependencies.get(str(trade_date))
+    if existing is None and str(trade_date) in dependencies:
+        return
+    if existing is None:
+        dependencies[str(trade_date)] = requested
+    else:
+        existing.update(requested)
+
+
+def _v23_consumption_evidence(dependencies: Mapping[str, set[str] | None]) -> dict[str, list[str] | None]:
+    """Persist the explicit per-target source-use contract alongside the content proof."""
+    return {
+        str(trade_date): None if codes is None else sorted(codes)
+        for trade_date, codes in sorted(dependencies.items())
+    }
+
+
+def _v23_checkpoint_identity(
+    records: Mapping[str, Mapping[str, Any]], daily: Mapping[str, Mapping[str, str]],
+    dependencies: Mapping[str, set[str] | None],
+) -> dict[str, Any]:
+    """Bind a V2.3 unit to the exact short, long and event-exit members it consumed."""
+    return _unit_consumed_input(_unit_minute_members(records, dependencies), daily)
+
+
 def _v22_verify_saved_units(run_dir: Path, run_hash: str, minute_root: str | Path) -> dict[str, Any]:
     saved: dict[str, Any] = {}
     source_records: dict[str, dict[str, Any]] = {}
@@ -2347,10 +2388,11 @@ def run_v23_canary(
     cache: dict[str, dict[str, dict[str, Any]]] = {}
     records: dict[str, dict[str, Any]] = {}
     listing_cache: dict[str, dict[str, Any]] = {}
-    daily_consumed: dict[str, dict[str, str]] = {}
     completed_sources: list[str] = []
     source_open_counts: dict[str, int] = defaultdict(int)
     phase_events: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    first_open_requests: dict[str, set[str] | None] = {}
 
     def progress(stage: str, completed: Iterable[str], open_events: int = 0, *, phase: str | None = None, target: str | None = None, source_date: str | None = None, requested_code_count: int | None = None, survivor_count: int | None = None) -> None:
         _write_json(progress_path, {
@@ -2371,19 +2413,74 @@ def run_v23_canary(
         if time.monotonic() - started >= float(max_elapsed_seconds):
             raise TailDataError("canary_time_limit")
 
-    def load(trade_date: str, codes: Iterable[str] | None, *, phase: str = "exit", target: str = "shared", survivor_count: int | None = None) -> dict[str, dict[str, Any]]:
+    def request_hash(codes: Iterable[str]) -> str:
+        return hashlib.sha256("\n".join(sorted(codes)).encode("utf-8")).hexdigest()
+
+    def event_exit_codes(trade_date: str) -> set[str]:
+        index = calendar.index(trade_date)
+        return {
+            str(event["sec_code"])
+            for event in events
+            if event["outcome_status"] == "open" and int(event["start_index"]) < index
+        }
+
+    def selection_consumer_types(trade_date: str) -> list[str]:
+        """Describe all selection phases represented in a first-open union."""
+        kinds: list[str] = []
+        for index, _, _ in preselected.values():
+            if trade_date in calendar[index - 5:index - 1] and "selection_short" not in kinds:
+                kinds.append("selection_short")
+            if trade_date in calendar[index - 10:index - 5] and "selection_long" not in kinds:
+                kinds.append("selection_long")
+        return kinds
+
+    def reject_non_subset(
+        trade_date: str, requested: set[str] | None, first: set[str] | None, *, phase: str, target: str,
+        survivor_count: int | None, consumer_types: list[str],
+    ) -> None:
+        missing = set() if requested is None else requested - (first or set())
+        phase_events.append({
+            "phase": phase, "target": target, "source_date": trade_date,
+            "consumer_types": consumer_types, "status": "rejected_non_subset",
+            "requested_code_count": None if requested is None else len(requested),
+            "first_request_code_count": None if first is None else len(first),
+            "missing_code_count": None if requested is None else len(missing),
+            "missing_codes_sha256": None if requested is None else request_hash(missing),
+            "survivor_count": survivor_count, "open_count": source_open_counts[trade_date],
+        })
+        progress(
+            f"rejected_non_subset:{trade_date}", (), phase=phase, target=target, source_date=trade_date,
+            requested_code_count=None if requested is None else len(requested), survivor_count=survivor_count,
+        )
+        raise TailDataError(f"v23_container_reopen_forbidden:{trade_date}")
+
+    def load(
+        trade_date: str, codes: Iterable[str] | None, *, phase: str = "exit", target: str = "shared",
+        survivor_count: int | None = None, consumer_type: str | None = None,
+    ) -> dict[str, dict[str, Any]]:
         requested = None if codes is None else {canonical_code(code) for code in codes}
+        exit_codes = set() if requested is None else event_exit_codes(trade_date)
+        if requested is not None:
+            requested.update(exit_codes)
+        kind = consumer_type or ("event_exit" if phase == "exit" else f"selection_{phase}")
+        consumer_types = selection_consumer_types(trade_date) if phase in {"short", "long"} else [kind]
+        if not consumer_types:
+            consumer_types = [kind]
+        if exit_codes and "event_exit" not in consumer_types:
+            consumer_types.append("event_exit")
         if trade_date in cache:
-            if requested is not None and not requested.issubset(cache[trade_date]):
-                raise TailDataError(f"v23_container_reopen_forbidden:{trade_date}")
-            phase_events.append({"phase": phase, "target": target, "source_date": trade_date, "requested_code_count": None if requested is None else len(requested), "survivor_count": survivor_count, "open_count": source_open_counts[trade_date], "reused": True})
+            first = first_open_requests[trade_date]
+            if (requested is None and first is not None) or (requested is not None and first is not None and not requested.issubset(first)):
+                reject_non_subset(trade_date, requested, first, phase=phase, target=target, survivor_count=survivor_count, consumer_types=consumer_types)
+            phase_events.append({"phase": phase, "target": target, "source_date": trade_date, "consumer_types": consumer_types, "status": "accepted", "requested_code_count": None if requested is None else len(requested), "requested_codes_sha256": None if requested is None else request_hash(requested), "event_exit_code_count": len(exit_codes), "survivor_count": survivor_count, "open_count": source_open_counts[trade_date], "reused": True})
             progress(f"{phase}:reused:{trade_date}", (), phase=phase, target=target, source_date=trade_date, requested_code_count=None if requested is None else len(requested), survivor_count=survivor_count)
             return cache[trade_date]
         values, record = load_day_v2_statistics(minute_root, trade_date, requested)
         cache[trade_date], records[trade_date] = values, record
+        first_open_requests[trade_date] = requested
         completed_sources.append(trade_date)
         source_open_counts[trade_date] += int(record.get("container_open_count", 1))
-        phase_events.append({"phase": phase, "target": target, "source_date": trade_date, "requested_code_count": None if requested is None else len(requested), "survivor_count": survivor_count, "open_count": source_open_counts[trade_date], "reused": False})
+        phase_events.append({"phase": phase, "target": target, "source_date": trade_date, "consumer_types": consumer_types, "status": "accepted", "requested_code_count": None if requested is None else len(requested), "requested_codes_sha256": None if requested is None else request_hash(requested), "event_exit_code_count": len(exit_codes), "survivor_count": survivor_count, "open_count": source_open_counts[trade_date], "reused": False})
         progress(f"source:{trade_date}", (), phase=phase, target=target, source_date=trade_date, requested_code_count=None if requested is None else len(requested), survivor_count=survivor_count)
         time_limit()
         return values
@@ -2394,28 +2491,38 @@ def run_v23_canary(
         survivor_rows: dict[str, list[dict[str, Any]]] = {}
         ranked_by_target: dict[str, dict[str, Any]] = {}
         preselected: dict[str, tuple[int, dict[str, dict[str, Any]], set[str]]] = {}
+        consumed_by_target: dict[str, dict[str, set[str] | None]] = {target: {} for target in V23_MARKET_TARGETS}
+        daily_consumed_by_target: dict[str, dict[str, dict[str, str]]] = {target: {} for target in V23_MARKET_TARGETS}
         for target in V23_MARKET_TARGETS:
             index = positions[target]
             day, d1 = load(target, None, phase="preselection", target=target), load(calendar[index - 1], None, phase="preselection", target=target)
+            _v23_add_consumed_dependency(consumed_by_target[target], target, None)
+            _v23_add_consumed_dependency(consumed_by_target[target], calendar[index - 1], None)
             pre = {code: _v23_preselection(code, day.get(code), d1.get(code)) for code in day}
             fixture_codes = {code for (fixture_date, code) in V23_FIXTURES if fixture_date == target}
             evaluation = {code for code, proof in pre.items() if proof["survives"]} | fixture_codes
             preselected[target] = (index, day, evaluation)
 
-        short_requests: dict[str, set[str]] = defaultdict(set)
-        long_upper_requests: dict[str, set[str]] = defaultdict(set)
-        for target, (index, _, evaluation) in preselected.items():
-            for dependency in calendar[index - 5:index - 1]:
-                short_requests[dependency].update(evaluation)
-            for dependency in calendar[index - 10:index - 5]:
-                long_upper_requests[dependency].update(evaluation)
-        for dependency in sorted(short_requests, key=calendar.index):
-            request = short_requests[dependency] | long_upper_requests.get(dependency, set())
-            load(dependency, request, phase="short", target="shared")
-
         survivors_by_target: dict[str, set[str]] = {}
         short_rejected: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for target, (index, _, evaluation) in preselected.items():
+
+        def selection_union(trade_date: str) -> set[str]:
+            """First open covers every already-known and future selection consumer for this date."""
+            requested: set[str] = set()
+            for candidate_target, (candidate_index, _, evaluation) in preselected.items():
+                if trade_date in calendar[candidate_index - 5:candidate_index - 1]:
+                    requested.update(evaluation)
+                elif trade_date in calendar[candidate_index - 10:candidate_index - 5]:
+                    requested.update(survivors_by_target.get(candidate_target, evaluation))
+            return requested
+
+        daily_by_target: dict[str, Any] = {}
+        for target in V23_MARKET_TARGETS:
+            index, day, evaluation = preselected[target]
+            for dependency in calendar[index - 5:index - 1]:
+                request = selection_union(dependency)
+                load(dependency, request, phase="short", target=target, survivor_count=None, consumer_type="selection_short")
+                _v23_add_consumed_dependency(consumed_by_target[target], dependency, evaluation)
             d1 = cache[calendar[index - 1]]
             survivors: set[str] = set()
             for code in sorted(evaluation):
@@ -2426,34 +2533,21 @@ def run_v23_canary(
                     short_rejected[target].append({"sec_code": code, "trade_date": target, **evidence, "liquidity_pass": False, "eligible_pass": False, "failure_reasons": ["prior5_amount_not_all_strictly_above_200m"], "short_phase_only": True})
             survivors_by_target[target] = survivors
             progress(f"liquidity_gate:{target}", (), phase="short", target=target, survivor_count=len(survivors))
-
-        long_requests: dict[str, set[str]] = defaultdict(set)
-        for target, (index, _, _) in preselected.items():
             for dependency in calendar[index - 10:index - 5]:
-                if dependency not in cache:
-                    long_requests[dependency].update(survivors_by_target[target])
-        for dependency in sorted(long_requests, key=calendar.index):
-            load(dependency, long_requests[dependency], phase="long", target="shared", survivor_count=len(long_requests[dependency]))
-
-        for target in V23_MARKET_TARGETS:
-            index, day, _ = preselected[target]
-            d1 = cache[calendar[index - 1]]
+                request = selection_union(dependency)
+                load(dependency, request, phase="long", target=target, survivor_count=len(survivors), consumer_type="selection_long")
+                _v23_add_consumed_dependency(consumed_by_target[target], dependency, survivors)
             rows = [
                 _v23_final_row(
                     code, target, index, day.get(code),
                     [cache[value].get(code) for value in calendar[index - 10:index - 1]] + [d1.get(code)],
-                    calendar, daily_root, listing_cache, daily_consumed,
+                    calendar, daily_root, listing_cache, daily_consumed_by_target[target],
                 )
                 for code in sorted(survivors_by_target[target])
             ]
             survivor_rows[target] = rows
             all_rows[target], ranked_by_target[target] = short_rejected[target] + rows, rank_v22_channels(rows)
             progress(f"selection:{target}", (), phase="selection", target=target, survivor_count=len(rows))
-
-        events: list[dict[str, Any]] = []
-        daily_by_target: dict[str, Any] = {}
-        for target in V23_MARKET_TARGETS:
-            index = positions[target]
             ranked = ranked_by_target[target]
             daily_by_target[target] = {
                 "trade_date": target, "A_eligible_count": len(ranked["a_pool"]), "B_eligible_count": len(ranked["b_pool"]),
@@ -2476,7 +2570,7 @@ def run_v23_canary(
         _v23_resolve_events(
             events, calendar, load,
             lambda frontier, open_events: (progress(f"exit:{frontier}", (), open_events), time_limit()),
-            dynamic_exit_codes,
+            dynamic_exit_codes, consumed_by_target,
         )
         outcome_journals = _v23_outcome_journals(run_dir, run_hash, events, calendar, records, dynamic_exit_codes)
         ledger, nav, account, holdings, risk_states, cooldown_skips = _v23_sleeve_account(events, calendar, load)
@@ -2492,7 +2586,8 @@ def run_v23_canary(
                 "all_candidate_rows": [_public_row(row) for row in all_rows[target]],
                 "events": target_events,
                 "dynamic_exit_codes_by_date": {day: sorted(codes) for day, codes in sorted(dynamic_exit_codes.items())},
-                "unit_consumed_input": _v22_checkpoint_identity(records, daily_consumed, target, index, survivor_rows[target], target_events, calendar),
+                "consumption_ledger": _v23_consumption_evidence(consumed_by_target[target]),
+                "unit_consumed_input": _v23_checkpoint_identity(records, daily_consumed_by_target[target], consumed_by_target[target]),
             }
             _checkpoint(run_dir, run_hash, unit, result)
             completed[unit] = result
