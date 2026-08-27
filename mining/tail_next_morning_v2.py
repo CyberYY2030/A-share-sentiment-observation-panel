@@ -51,6 +51,7 @@ DEVELOPMENT_RUNNER_CARD = Path(__file__).resolve().parents[1] / "docs" / "superp
 V23_TASK_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-27-tail-next-morning-v23-task-cards.md"
 V23_DEVELOPMENT_RUNNER_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-27-tail-next-morning-v23-development-runner-task-card.md"
 V23_DEVELOPMENT_R1_REPAIR_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-27-tail-next-morning-v23-development-runner-r1-repair-card.md"
+V23_DEVELOPMENT_R2_REPAIR_CARD = Path(__file__).resolve().parents[1] / "docs" / "superpowers" / "specs" / "2026-08-27-tail-next-morning-v23-development-runner-r2-repair-card.md"
 TARGET_DATES = ("20240813", "20240826", "20240827", "20240923", "20240926")
 MARKET_TARGETS = ("20240923", "20240926")
 FIXTURE_TARGETS = (("20240813", "300328"), ("20240826", "300972"), ("20240827", "300972"))
@@ -142,6 +143,7 @@ def _v23_development_spec_hash() -> str:
         "economic_spec_hash": _v23_spec_hash(),
         "runner_contract": V23_DEVELOPMENT_RUNNER_CARD.read_text(encoding="utf-8").replace("\r\n", "\n"),
         "runner_repair_contract": V23_DEVELOPMENT_R1_REPAIR_CARD.read_text(encoding="utf-8").replace("\r\n", "\n"),
+        "runner_r2_repair_contract": V23_DEVELOPMENT_R2_REPAIR_CARD.read_text(encoding="utf-8").replace("\r\n", "\n"),
     })
 
 
@@ -156,6 +158,7 @@ def _v23_development_source_blob_identity() -> dict[str, str]:
         **_code_identity(), "economic_spec_blob": _git_blob(V23_TASK_CARD),
         "runner_contract_blob": _git_blob(V23_DEVELOPMENT_RUNNER_CARD),
         "runner_repair_card_blob": _git_blob(V23_DEVELOPMENT_R1_REPAIR_CARD),
+        "runner_r2_repair_card_blob": _git_blob(V23_DEVELOPMENT_R2_REPAIR_CARD),
     }
 
 
@@ -1862,15 +1865,21 @@ def _v23_development_project_result(result: Mapping[str, Any]) -> dict[str, Any]
     }
 
 
-def _v23_development_project_completed(completed: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
-    return {unit: _v23_development_project_result(result) for unit, result in completed.items()}
-
-
 def _v23_development_retained_evidence(completed: Mapping[str, Mapping[str, Any]]) -> dict[str, int]:
     """Report candidate memory separately from necessary event/account runtime state."""
     rows = sum(len(result.get("eligible_rows", [])) for result in completed.values())
     payload = sum(len(_json_bytes(result["eligible_rows"])) for result in completed.values() if result.get("eligible_rows"))
     return {"retained_candidate_rows": rows, "retained_candidate_estimated_bytes": payload}
+
+
+def _v23_development_observe_marker_payload(result: Mapping[str, Any]) -> dict[str, int]:
+    """Measure one full checkpoint while it is being projected, never its history."""
+    all_rows = result.get("all_candidate_rows", [])
+    eligible_rows = result.get("eligible_rows", [])
+    return {
+        "candidate_rows": len(all_rows) + len(eligible_rows),
+        "candidate_estimated_bytes": len(_json_bytes({"all_candidate_rows": all_rows, "eligible_rows": eligible_rows})),
+    }
 
 
 def _write_csv_gz_stream(path: Path, rows: Any) -> None:
@@ -1903,15 +1912,51 @@ def _v23_development_stream_eligible_rows(run_dir: Path, run_hash: str) -> Itera
 def _v23_development_backfill_hypothetical(
     events: Iterable[Mapping[str, Any]], *consumers: Iterable[dict[str, Any]],
 ) -> None:
-    """Rebind independently deserialized cooldown consumers to the final event outcome by id."""
-    by_id = {str(event.get("event_id")): event for event in events}
-    for rows in consumers:
+    """Fail closed unless both cooldown consumers have one stable final-event match."""
+    if len(consumers) != 2:
+        raise TailDataError("v23_development_cooldown_consumer_count_mismatch")
+    final: dict[str, Mapping[str, Any]] = {}
+    for event in events:
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            raise TailDataError("v23_development_cooldown_event_id_empty")
+        if event_id in final:
+            raise TailDataError(f"v23_development_cooldown_event_id_duplicate:{event_id}")
+        final[event_id] = event
+
+    def cooldown_rows(rows: Iterable[dict[str, Any]], name: str) -> dict[str, tuple[dict[str, Any], tuple[str, str, str]]]:
+        values: dict[str, tuple[dict[str, Any], tuple[str, str, str]]] = {}
         for row in rows:
             if row.get("action") != "cooldown_skip":
                 continue
-            event = by_id.get(str(row.get("event_id")))
-            if event is not None:
-                row["hypothetical_net_return"] = event.get("net_return")
+            event_id = row.get("event_id")
+            if not isinstance(event_id, str) or not event_id:
+                raise TailDataError(f"v23_development_cooldown_{name}_event_id_empty")
+            stable = (str(row.get("trade_date")), str(row.get("sleeve")), str(row.get("sec_code")))
+            if any(value == "None" or not value for value in stable):
+                raise TailDataError(f"v23_development_cooldown_{name}_stable_key_invalid:{event_id}")
+            if event_id in values:
+                raise TailDataError(f"v23_development_cooldown_{name}_event_id_duplicate:{event_id}")
+            values[event_id] = (row, stable)
+        return values
+
+    ledger = cooldown_rows(consumers[0], "ledger")
+    cooldown = cooldown_rows(consumers[1], "skips")
+    if set(ledger) != set(cooldown):
+        raise TailDataError("v23_development_cooldown_consumer_id_mismatch")
+    for event_id in sorted(ledger):
+        ledger_row, ledger_key = ledger[event_id]
+        cooldown_row, cooldown_key = cooldown[event_id]
+        if ledger_key != cooldown_key:
+            raise TailDataError(f"v23_development_cooldown_stable_key_mismatch:{event_id}")
+        event = final.get(event_id)
+        if event is None:
+            raise TailDataError(f"v23_development_cooldown_event_missing:{event_id}")
+        net_return = event.get("net_return")
+        if not _finite(net_return):
+            raise TailDataError(f"v23_development_cooldown_event_net_return_invalid:{event_id}")
+        ledger_row["hypothetical_net_return"] = float(net_return)
+        cooldown_row["hypothetical_net_return"] = float(net_return)
 
 
 def _v23_development_sleeve_snapshots(state: Mapping[str, Any], trade_date: str) -> list[dict[str, Any]]:
@@ -3192,74 +3237,185 @@ def _v23_development_write_resume_cache(
     _write_json(run_dir / "resume_state.json", cache)
 
 
-def _v23_development_marker_state(
-    run_dir: Path, run_hash: str, calendar: list[str], frontier: int,
-) -> dict[str, Any] | None:
-    """Read the latest continuous marker state; resume_state never supplies economic truth."""
-    if frontier < 0:
-        return None
-    trade_date = calendar[frontier]
-    marker_path = run_dir / "daily_commits" / f"{trade_date}.json"
-    try:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise TailDataError("v23_development_latest_marker_missing") from exc
-    if marker.get("run_hash") != run_hash or str(marker.get("trade_date")) != trade_date:
-        raise TailDataError("v23_development_latest_marker_mismatch")
-    _, state = _v22_development_sha_bound_file(run_dir, marker.get("state", {}), "state")
-    if state.get("run_hash") != run_hash or int(state.get("last_processed_index", -1)) != frontier or state.get("last_processed_date") != trade_date:
-        raise TailDataError("v23_development_latest_marker_state_mismatch")
-    cache_path = run_dir / "resume_state.json"
-    if cache_path.exists():
+def _v23_development_marker_headers(
+    run_dir: Path, run_hash: str, calendar: list[str], positions: Mapping[str, int],
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Retain only marker/state headers; checkpoint payloads are read one at a time."""
+    headers: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    marker_dir = run_dir / "daily_commits"
+    for marker_path in sorted(marker_dir.glob("*.json")) if marker_dir.exists() else []:
         try:
-            cache = json.loads(cache_path.read_text(encoding="utf-8"))
-            cache_ref = cache.get("marker_state", {})
-            cache_valid = (
-                cache.get("run_hash") == run_hash
-                and cache.get("last_processed_index") == frontier
-                and cache.get("last_processed_date") == trade_date
-                and dict(cache_ref) == dict(marker["state"])
-            )
-            if cache_valid:
-                _ = cache.get("v23_account_runtime")
-        except Exception:
-            pass
-    return state
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise TailDataError("v23_development_daily_commit_marker_mismatch") from exc
+        if not isinstance(marker, Mapping) or marker.get("run_hash") != run_hash:
+            raise TailDataError("v23_development_daily_commit_hash_mismatch")
+        trade_date = str(marker.get("trade_date"))
+        state_path, state = _v22_development_sha_bound_file(run_dir, marker.get("state", {}), "state")
+        try:
+            if not isinstance(state, Mapping):
+                raise TypeError("state_not_mapping")
+            index = int(state.get("last_processed_index", -1))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise TailDataError("v23_development_daily_commit_state_mismatch") from exc
+        if (
+            state_path.parent != run_dir / "states" or state.get("run_hash") != run_hash or trade_date not in positions or index != positions[trade_date]
+            or state.get("last_processed_date") != trade_date
+        ):
+            raise TailDataError("v23_development_daily_commit_state_mismatch")
+        headers.append((index, marker, state))
+    headers.sort(key=lambda value: value[0])
+    if [index for index, _, _ in headers] != list(range(len(headers))):
+        raise TailDataError("v23_development_daily_commit_frontier_gap")
+    return headers
 
 
-def _v23_development_read_account_days(run_dir: Path, run_hash: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    """Read only marker-owned account day journals; unmarked files remain audit-only orphans."""
-    rows: dict[str, list[dict[str, Any]]] = {"ledger": [], "nav": [], "holdings": [], "risk": [], "cooldown": []}
-    for marker_path in sorted((run_dir / "daily_commits").glob("*.json")) if (run_dir / "daily_commits").exists() else []:
-        marker = json.loads(marker_path.read_text(encoding="utf-8"))
-        if marker.get("run_hash") != run_hash or marker.get("account") is None:
+def _v23_development_iter_marker_payloads(
+    run_dir: Path, run_hash: str, headers: Iterable[tuple[int, Mapping[str, Any], Mapping[str, Any]]],
+) -> Iterable[tuple[int, Mapping[str, Any], Mapping[str, Any], Mapping[str, Any] | None, Mapping[str, Any] | None, Mapping[str, Any]]]:
+    """Yield one verified marker payload so the caller can project then release it."""
+    for index, marker, state in headers:
+        trade_date = str(marker["trade_date"])
+        signal: Mapping[str, Any] | None = None
+        if marker.get("signal") is not None:
+            signal_path, checkpoint = _v22_development_sha_bound_file(run_dir, marker["signal"], "signal")
+            if not isinstance(checkpoint, Mapping) or signal_path.parent != run_dir / "checkpoints" or checkpoint.get("run_hash") != run_hash or checkpoint.get("unit") != f"market:{trade_date}" or not isinstance(checkpoint.get("result"), Mapping):
+                raise TailDataError("v23_development_daily_commit_signal_mismatch")
+            signal = checkpoint["result"]
+        outcome: Mapping[str, Any] | None = None
+        if marker.get("outcome") is not None:
+            outcome_path, outcome = _v22_development_sha_bound_file(run_dir, marker["outcome"], "outcome")
+            if not isinstance(outcome, Mapping) or outcome_path.parent != run_dir / "outcomes" or outcome.get("run_hash") != run_hash or str(outcome.get("trade_date")) != trade_date:
+                raise TailDataError("v23_development_daily_commit_outcome_mismatch")
+        if marker.get("account") is None:
             raise TailDataError("v23_development_account_marker_mismatch")
-        _, journal = _v22_development_sha_bound_file(run_dir, marker["account"], "account")
-        if journal.get("run_hash") != run_hash or str(journal.get("trade_date")) != str(marker.get("trade_date")):
+        account_path, account = _v22_development_sha_bound_file(run_dir, marker["account"], "account")
+        if not isinstance(account, Mapping) or account_path.parent != run_dir / "account_days" or account.get("run_hash") != run_hash or str(account.get("trade_date")) != trade_date or not isinstance(account.get("result"), Mapping):
             raise TailDataError("v23_development_account_journal_mismatch")
-        for key in rows:
-            rows[key].extend(dict(value) for value in journal.get("result", {}).get(key, []))
-    return rows["ledger"], rows["nav"], rows["holdings"], rows["risk"], rows["cooldown"]
+        yield index, marker, state, signal, outcome, account
+
+
+def _v23_development_isolate_orphans(run_dir: Path, committed_dates: set[str]) -> None:
+    """Keep uncommitted files as evidence without allowing a resume to trust them."""
+    for directory in ("outcomes", "checkpoints", "states", "account_days"):
+        folder = run_dir / directory
+        for path in sorted(folder.glob("*.json")) if folder.exists() else []:
+            stem = path.stem.replace("market_", "")
+            if stem in committed_dates:
+                continue
+            target = run_dir / "orphans" / stem / directory / path.name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                target = target.with_name(f"{path.stem}.{_sha256(path)[:12]}{path.suffix}")
+            os.replace(path, target)
+
+
+def _v23_development_stream_projected_markers(
+    run_dir: Path, run_hash: str, calendar: list[str], positions: Mapping[str, int], minute_root: str | Path, *,
+    isolate_orphans: bool, warm_indexes: set[int] | None = None,
+) -> dict[str, Any]:
+    """Verify and project V2.3 markers without retaining a historical full checkpoint."""
+    headers = _v23_development_marker_headers(run_dir, run_hash, calendar, positions)
+    committed_dates = {str(marker["trade_date"]) for _, marker, _ in headers}
+    required: dict[str, set[str]] = defaultdict(set)
+    events: list[dict[str, Any]] = []
+    journals: list[dict[str, Any]] = []
+    account_rows: dict[str, list[dict[str, Any]]] = {"ledger": [], "nav": [], "holdings": [], "risk": [], "cooldown": []}
+    peak = {"candidate_rows": 0, "candidate_estimated_bytes": 0}
+
+    def collect() -> tuple[int, Mapping[str, Any] | None]:
+        frontier, latest_state = -1, None
+        for index, marker, state, signal, outcome, account in _v23_development_iter_marker_payloads(run_dir, run_hash, headers):
+            frontier, latest_state = index, state
+            if signal is not None:
+                if "seed_events" not in signal or not isinstance(signal.get("unit_consumed_input"), Mapping):
+                    raise TailDataError(f"v23_development_checkpoint_missing_seeds:market:{marker['trade_date']}")
+                observed = _v23_development_observe_marker_payload(signal)
+                peak["candidate_rows"] = max(peak["candidate_rows"], int(observed["candidate_rows"]))
+                peak["candidate_estimated_bytes"] = max(peak["candidate_estimated_bytes"], int(observed["candidate_estimated_bytes"]))
+                events.extend(dict(event) for event in signal["seed_events"])
+                for day, codes in signal["unit_consumed_input"].get("minute_members", {}).items():
+                    if not isinstance(codes, Mapping):
+                        raise TailDataError("v23_development_consumed_member_shape_invalid")
+                    required[str(day)].update(str(code) for code in codes)
+            if outcome is not None:
+                journals.append(dict(outcome))
+                identity = outcome.get("unit_consumed_input", {})
+                for day, codes in identity.get("minute_members", {}).items():
+                    if not isinstance(codes, Mapping):
+                        raise TailDataError("v23_development_outcome_member_shape_invalid")
+                    required[str(day)].update(str(code) for code in codes)
+            for key in account_rows:
+                account_rows[key].extend(dict(row) for row in account["result"].get(key, []))
+        return frontier, latest_state
+
+    frontier, latest_state = collect()
+    if isolate_orphans:
+        _v23_development_isolate_orphans(run_dir, committed_dates)
+    if frontier >= 0 and (latest_state is None or "v23_account_runtime" not in latest_state):
+        raise TailDataError("v23_development_marker_account_state_missing")
+    warm_indexes = set() if warm_indexes is None else set(warm_indexes)
+    values_by_date: dict[str, dict[str, dict[str, Any]]] = {}
+    records: dict[str, dict[str, Any]] = {}
+    source_open_counts: dict[str, int] = {}
+    source_requests: dict[str, set[str] | None] = {}
+    requested_dates = set(required) | {calendar[index] for index in warm_indexes}
+    for trade_date in sorted(requested_dates, key=lambda value: positions.get(value, -1)):
+        if trade_date not in positions:
+            raise TailDataError(f"v23_development_consumed_date_outside_calendar:{trade_date}")
+        index = positions[trade_date]
+        requested = None if index in warm_indexes else set(required[trade_date])
+        values, record = load_day_v2_statistics(minute_root, trade_date, requested)
+        records[trade_date] = record
+        source_open_counts[trade_date] = int(record.get("container_open_count", 1))
+        source_requests[trade_date] = requested
+        if index in warm_indexes:
+            values_by_date[trade_date] = values
+
+    completed: dict[str, dict[str, Any]] = {}
+    outcome_dates: set[str] = set()
+
+    def verify_and_project() -> None:
+        for _, marker, _, signal, outcome, _ in _v23_development_iter_marker_payloads(run_dir, run_hash, headers):
+            if signal is not None:
+                unit = f"market:{marker['trade_date']}"
+                _verify_checkpoint_consumed_input(unit, signal, records)
+                completed[unit] = _v23_development_project_result(signal)
+            if outcome is not None:
+                trade_date = str(outcome["trade_date"])
+                _verify_checkpoint_consumed_input(f"outcome:{trade_date}", {"unit_consumed_input": outcome["unit_consumed_input"]}, records)
+                outcome_dates.add(trade_date)
+
+    verify_and_project()
+    by_id = {str(event.get("event_id")): event for event in events}
+    for journal in journals:
+        for update in journal.get("updates", []):
+            event_id = str(update.get("event_id"))
+            if event_id not in by_id:
+                raise TailDataError(f"v22_development_outcome_unknown_event:{event_id}")
+            by_id[event_id].clear()
+            by_id[event_id].update(update["event"])
+    warm_values = {calendar[index]: values_by_date[calendar[index]] for index in sorted(warm_indexes) if calendar[index] in values_by_date}
+    warm_records = {trade_date: records[trade_date] for trade_date in warm_values}
+    return {
+        "completed": completed, "events": events, "outcome_dates": outcome_dates, "frontier": frontier,
+        "marker_state": latest_state, "account_rows": account_rows, "warm_values": warm_values,
+        "warm_records": warm_records, "source_open_counts": source_open_counts, "source_requests": source_requests,
+        "projection_peak": peak,
+    }
 
 
 def _v23_development_verify_saved_units(
     run_dir: Path, run_hash: str, calendar: list[str], positions: Mapping[str, int], minute_root: str | Path,
 ) -> dict[str, str]:
     """A SUCCEEDED fast path still rechecks only each unit's explicit consumed members."""
-    completed, journals, _, frontier = _v22_development_read_commits(run_dir, run_hash, calendar, positions, isolate_orphans=False)
-    _v23_development_marker_state(run_dir, run_hash, calendar, frontier)
-    events: list[dict[str, Any]] = []
-    for unit, result in sorted(completed.items()):
-        if "seed_events" not in result:
-            raise TailDataError(f"v23_development_checkpoint_missing_seeds:{unit}")
-        events.extend(dict(event) for event in result["seed_events"])
-    required = _v22_development_required_members(completed, journals)
-    records: dict[str, dict[str, Any]] = {}
-    for trade_date, codes in sorted(required.items()):
-        _, records[trade_date] = load_day_v2_statistics(minute_root, trade_date, codes)
-    _v22_development_verify_and_replay(completed, journals, events, records)
-    _v23_development_read_account_days(run_dir, run_hash)
-    return {unit: str(result["unit_consumed_input"]["unit_consumed_input_identity"]) for unit, result in sorted(completed.items())}
+    restored = _v23_development_stream_projected_markers(
+        run_dir, run_hash, calendar, positions, minute_root, isolate_orphans=False,
+    )
+    return {
+        unit: str(result["unit_consumed_input"]["unit_consumed_input_identity"])
+        for unit, result in sorted(restored["completed"].items())
+    }
 
 
 def run_v22_development(minute_root: str | Path, daily_root: str | Path, output_dir: str | Path, *, resume_run_id: str | None = None) -> tuple[dict[str, Any], Path]:
@@ -3454,7 +3610,7 @@ def run_v23_development(minute_root: str | Path, daily_root: str | Path, output_
         run_prefix="v23-development", spec_hash=_v23_development_spec_hash(),
         source_blob_identity=_v23_development_source_blob_identity(),
     )
-    run_hash, progress_path, completion_path, resume_path = manifest["run_hash"], run_dir / "progress.json", run_dir / "completion.json", run_dir / "resume_state.json"
+    run_hash, progress_path, completion_path = manifest["run_hash"], run_dir / "progress.json", run_dir / "completion.json"
     preserve_existing_terminal = completion_path.exists()
     completed: dict[str, dict[str, Any]] = {}
     events: list[dict[str, Any]] = []
@@ -3471,6 +3627,7 @@ def run_v23_development(minute_root: str | Path, daily_root: str | Path, output_
     account_holdings: list[dict[str, Any]] = []
     risk_states: list[dict[str, Any]] = []
     cooldown_skips: list[dict[str, Any]] = []
+    recovery_projection_peak = {"candidate_rows": 0, "candidate_estimated_bytes": 0}
 
     def total_targets() -> int:
         return sum(index >= 10 for index in range(len(calendar)))
@@ -3483,6 +3640,8 @@ def run_v23_development(minute_root: str | Path, daily_root: str | Path, output_
             "source_open_counts": dict(sorted(source_open_counts.items())), "first_open_consumers": dict(sorted(first_open_consumers.items())),
             "cached_market_days": len(cache), "max_cached_market_days": max_cached_days,
             **retained,
+            "resume_projection_peak_candidate_rows": recovery_projection_peak["candidate_rows"],
+            "resume_projection_peak_candidate_estimated_bytes": recovery_projection_peak["candidate_estimated_bytes"],
             "open_exit_events": sum(event["outcome_status"] == "open" for event in events), "error": error,
             "elapsed_seconds": round(time.monotonic() - started, 6), "updated_at": datetime.now(timezone.utc).isoformat(),
         })
@@ -3534,35 +3693,33 @@ def run_v23_development(minute_root: str | Path, daily_root: str | Path, output_
         if not succeeded_fast_path:
             lock = _v22_development_claim_lock(run_dir, run_hash)
         if resume_run_id is not None and not succeeded_fast_path:
-            complete_checkpoints, journals, outcome_dates, frontier = _v22_development_read_commits(run_dir, run_hash, calendar, positions, isolate_orphans=True)
-            marker_state = _v23_development_marker_state(run_dir, run_hash, calendar, frontier)
-            for unit, result in sorted(complete_checkpoints.items()):
-                if "seed_events" not in result:
-                    raise TailDataError(f"v23_development_checkpoint_missing_seeds:{unit}")
-                events.extend(dict(event) for event in result["seed_events"])
+            headers = _v23_development_marker_headers(run_dir, run_hash, calendar, positions)
+            known_frontier = headers[-1][0] if headers else -1
+            warm_indexes = set(range(max(0, known_frontier + 1 - 10), known_frontier + 1))
+            restored = _v23_development_stream_projected_markers(
+                run_dir, run_hash, calendar, positions, minute_root, isolate_orphans=True, warm_indexes=warm_indexes,
+            )
+            frontier = int(restored["frontier"])
+            marker_state = restored["marker_state"]
+            events = restored["events"]
+            outcome_dates = restored["outcome_dates"]
+            completed = restored["completed"]
+            recovery_projection_peak = dict(restored["projection_peak"])
             if marker_state is not None:
                 if "v23_account_runtime" not in marker_state:
                     raise TailDataError("v23_development_marker_account_state_missing")
                 account_state = _v23_development_account_state(marker_state["v23_account_runtime"])
-            account_ledger, account_nav, account_holdings, risk_states, cooldown_skips = _v23_development_read_account_days(run_dir, run_hash)
+            account_rows = restored["account_rows"]
+            account_ledger, account_nav = account_rows["ledger"], account_rows["nav"]
+            account_holdings, risk_states, cooldown_skips = account_rows["holdings"], account_rows["risk"], account_rows["cooldown"]
             start_index = frontier + 1
-            required = _v22_development_required_members(complete_checkpoints, journals)
-            warm_indexes = set(range(max(0, start_index - 10), start_index))
-            validation_records: dict[str, dict[str, Any]] = {}
-            demands = {positions[day] for day in required}
-            for index in sorted(demands | warm_indexes):
-                trade_date = calendar[index]
-                requested = None if index in warm_indexes else required[trade_date]
-                values, record = load_day_v2_statistics(minute_root, trade_date, requested)
-                source_open_counts[trade_date] += int(record.get("container_open_count", 1))
-                first_open_requests[trade_date] = requested
-                if index in warm_indexes:
-                    cache[trade_date], records[trade_date] = values, record
-                else:
-                    validation_records[trade_date] = record
+            cache = dict(restored["warm_values"])
+            records = dict(restored["warm_records"])
+            source_open_counts.update(restored["source_open_counts"])
+            first_open_requests.update(restored["source_requests"])
+            for trade_date, requested in restored["source_requests"].items():
+                first_open_consumers[trade_date] = ["resume_identity_validation"] if requested is not None else ["resume_warm_cache"]
             max_cached_days = len(cache)
-            _v22_development_verify_and_replay(complete_checkpoints, journals, events, dict(validation_records) | records)
-            completed = _v23_development_project_completed(complete_checkpoints)
         else:
             start_index = 0
         if succeeded_fast_path:

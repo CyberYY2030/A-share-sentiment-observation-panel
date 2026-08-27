@@ -1457,12 +1457,17 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertEqual(first, _v23_development_spec_hash())
         identity = module._v23_development_source_blob_identity()
         self.assertIn("runner_repair_card_blob", identity)
+        self.assertIn("runner_r2_repair_card_blob", identity)
         with tempfile.TemporaryDirectory() as temporary:
             repair = Path(temporary) / "repair.md"
             repair.write_text("repair-one", encoding="utf-8")
             with patch.object(module, "V23_DEVELOPMENT_R1_REPAIR_CARD", repair):
                 repaired = _v23_development_spec_hash()
                 repair.write_text("repair-two", encoding="utf-8")
+                self.assertNotEqual(repaired, _v23_development_spec_hash())
+            with patch.object(module, "V23_DEVELOPMENT_R2_REPAIR_CARD", repair):
+                repaired = _v23_development_spec_hash()
+                repair.write_text("repair-three", encoding="utf-8")
                 self.assertNotEqual(repaired, _v23_development_spec_hash())
         with patch.object(module, "run_v23_development", return_value=({"execution_label": "tnm_v23_development_completed"}, Path("synthetic"))) as runner:
             self.assertEqual(0, main(["v23-development", "--minute-root", "m", "--daily-root", "d", "--output-dir", "o", "--resume-run-id", "development-id"]))
@@ -1652,6 +1657,130 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(0, progress["retained_candidate_estimated_bytes"])
             with gzip.open(run_dir / "daily_results.csv.gz", "rt", encoding="utf-8") as handle:
                 self.assertGreater(sum(1 for _ in handle), 1)
+
+    def test_v23_development_resume_and_fast_path_project_each_large_marker(self) -> None:
+        """Recovery observes one full marker at a time and never reuses V2.2's aggregate reader."""
+        from mining import tail_next_morning_v2 as module
+        calendar = [f"2024{index:04d}" for index in range(36)]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {f"300{value:03d}" for value in range(100, 130)}
+        _, prior = a_inputs()
+        source_revision = {"value": "initial"}
+
+        def fake_load(_root, trade_date, requested=None):
+            index = positions[trade_date]
+            values: dict[str, dict] = {}
+            for code in (codes if requested is None else set(requested)):
+                value = copy.deepcopy(prior[min(index, 9)])
+                if index >= 10:
+                    ordinal = int(code[-3:])
+                    value = copy.deepcopy(a_inputs()[0])
+                    value["signal"].update({"amount": 100_000_000.0 + ordinal, "volume": (100_000_000.0 + ordinal) / 10.25, "tail_return": .01 + ordinal / 1_000_000.0})
+                values[code] = value
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"v23-stream|{source_revision['value']}|{trade_date}|{code}".encode()).hexdigest() for code in values}}
+
+        def outputs(run_dir: Path) -> dict[str, bytes]:
+            return {relative: (run_dir / relative).read_bytes() for relative in (
+                "development_summary.json", "daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz",
+                "account_holdings_1304.csv.gz", "risk_state.csv.gz", "cooldown_skips.csv.gz",
+            )}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        original_write = module._v23_development_write_resume_cache
+        interrupted = {"done": False}
+
+        def interrupt_after_marker(*args, **kwargs):
+            state = args[1]
+            if state["last_processed_date"] == calendar[24] and not interrupted["done"]:
+                interrupted["done"] = True
+                raise KeyboardInterrupt
+            original_write(*args, **kwargs)
+
+        observed: list[dict[str, int]] = []
+        original_observer = module._v23_development_observe_marker_payload
+
+        def observe(result):
+            value = original_observer(result)
+            observed.append(value)
+            return value
+
+        with tempfile.TemporaryDirectory() as baseline_root, tempfile.TemporaryDirectory() as interrupted_root, patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED):
+            baseline, baseline_dir = run_v23_development("synthetic", "synthetic", baseline_root)
+            with patch.object(module, "_v23_development_write_resume_cache", side_effect=interrupt_after_marker):
+                with self.assertRaises(KeyboardInterrupt):
+                    run_v23_development("synthetic", "synthetic", interrupted_root)
+            run_dir = next(Path(interrupted_root).glob("v23-development-*"))
+            with patch.object(module, "_v22_development_read_commits", side_effect=AssertionError("v22_aggregate_reader_used")), patch.object(module, "_v23_development_observe_marker_payload", side_effect=observe):
+                resumed, _ = run_v23_development("synthetic", "synthetic", interrupted_root, resume_run_id=run_dir.name)
+            self.assertEqual(baseline, resumed)
+            self.assertEqual(outputs(baseline_dir), outputs(run_dir))
+            progress = json.loads((run_dir / "progress.json").read_text(encoding="utf-8"))
+            self.assertGreater(len(observed), 10)
+            self.assertLessEqual(max(value["candidate_rows"] for value in observed), 60)
+            self.assertEqual(max(value["candidate_rows"] for value in observed), progress["resume_projection_peak_candidate_rows"])
+            self.assertEqual(max(value["candidate_estimated_bytes"] for value in observed), progress["resume_projection_peak_candidate_estimated_bytes"])
+            observed.clear()
+            with patch.object(module, "_v22_development_read_commits", side_effect=AssertionError("v22_aggregate_reader_used")), patch.object(module, "_v23_development_observe_marker_payload", side_effect=observe), patch.object(module, "rank_v22_channels", side_effect=AssertionError("fast_path_recalculated")):
+                replay, _ = run_v23_development("synthetic", "synthetic", interrupted_root, resume_run_id=run_dir.name)
+            self.assertEqual(resumed, replay)
+            self.assertGreater(len(observed), 20)
+            self.assertLessEqual(max(value["candidate_rows"] for value in observed), 60)
+            source_revision["value"] = "rewritten"
+            with self.assertRaisesRegex(module.TailDataError, "consumed_input_identity_mismatch"):
+                run_v23_development("synthetic", "synthetic", interrupted_root, resume_run_id=run_dir.name)
+            source_revision["value"] = "initial"
+            marker_path = run_dir / "daily_commits" / f"{calendar[10]}.json"
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            marker["run_hash"] = "tampered"
+            marker_path.write_text(json.dumps(marker), encoding="utf-8")
+            with self.assertRaisesRegex(module.TailDataError, "daily_commit_hash_mismatch"):
+                run_v23_development("synthetic", "synthetic", interrupted_root, resume_run_id=run_dir.name)
+            artifact = baseline_dir / "artifact_manifest.json"
+            artifact.write_bytes(artifact.read_bytes() + b" ")
+            with self.assertRaisesRegex(module.TailDataError, "artifact_manifest_mismatch"):
+                run_v23_development("synthetic", "synthetic", baseline_root, resume_run_id=baseline_dir.name)
+
+    def test_v23_development_cooldown_identity_is_fail_closed_and_atomic(self) -> None:
+        from mining import tail_next_morning_v2 as module
+
+        def event(event_id="event-1", net_return=.03):
+            return {"event_id": event_id, "net_return": net_return}
+
+        def row(event_id="event-1", *, sec_code="300001"):
+            return {"action": "cooldown_skip", "event_id": event_id, "trade_date": "20240926", "sleeve": "A1", "sec_code": sec_code}
+
+        normal_ledger, normal_cooldown = [row()], [row()]
+        module._v23_development_backfill_hypothetical([event()], normal_ledger, normal_cooldown)
+        self.assertEqual(.03, normal_ledger[0]["hypothetical_net_return"])
+        self.assertEqual(.03, normal_cooldown[0]["hypothetical_net_return"])
+        cases = (
+            ("event_id_duplicate", [event(), event()], [row()], [row()]),
+            ("event_id_empty", [event("")], [row()], [row()]),
+            ("event_missing", [event("other")], [row()], [row()]),
+            ("consumer_id_mismatch", [event(), event("extra")], [row(), row("extra")], [row()]),
+            ("consumer_id_mismatch", [event(), event("extra")], [row()], [row(), row("extra")]),
+            ("stable_key_mismatch", [event()], [row()], [row(sec_code="300002")]),
+        )
+        for expected, events, ledger, cooldown in cases:
+            with self.subTest(expected=expected), self.assertRaisesRegex(module.TailDataError, expected):
+                module._v23_development_backfill_hypothetical(events, ledger, cooldown)
+
+        calendar = [f"202312{day:02d}" for day in range(1, 11)] + ["20240923"]
+        positions = {value: index for index, value in enumerate(calendar)}
+        codes = {"300085", "300339", "300700", "300701", "300702", "300703"}
+        day, prior = a_inputs()
+
+        def fake_load(_root, trade_date, requested=None):
+            values = {code: copy.deepcopy(day if positions[trade_date] >= 10 else prior[positions[trade_date]]) for code in (codes if requested is None else set(requested))}
+            return values, {"trade_date": trade_date, "container_open_count": 1, "invalid_file_count": 0, "consumed_member_sha256": {code: hashlib.sha256(f"v23-cooldown-failure|{trade_date}|{code}".encode()).hexdigest() for code in values}}
+
+        manifest = {"minute_containers": [], "daily_k_root": {"files": []}}
+        with tempfile.TemporaryDirectory() as temporary, patch.object(module, "_v22_development_calendar", return_value=(calendar, positions)), patch.object(module, "_v22_development_input_manifest", return_value=manifest), patch.object(module, "load_day_v2_statistics", side_effect=fake_load), patch.object(module, "development_listing_evidence", return_value=LISTED), patch.object(module, "_v23_development_backfill_hypothetical", side_effect=module.TailDataError("v23_development_cooldown_event_missing:event-1")):
+            with self.assertRaisesRegex(module.TailDataError, "cooldown_event_missing"):
+                run_v23_development("synthetic", "synthetic", temporary)
+            failed_dir = next(Path(temporary).glob("v23-development-*"))
+            self.assertEqual("FAILED", json.loads((failed_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+            self.assertFalse((failed_dir / "development_summary.json").exists())
 
     def test_v23_two_phase_gate_matches_naive_rows_and_skips_failed_long_history(self) -> None:
         day, prior = a_inputs()
