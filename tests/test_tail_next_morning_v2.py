@@ -47,6 +47,7 @@ from mining.tail_next_morning_v2 import (
     _v22_sleeve_account,
     _v22_group_metrics,
     _v22_event_aggregates,
+    _v22_daily_slots,
     _v22_slot_weights,
     _v22_development_input_manifest,
     main,
@@ -54,6 +55,9 @@ from mining.tail_next_morning_v2 import (
     run_v22_development,
     V23_FIXTURES,
     _v23_spec_hash,
+    _v23_prior5_evidence,
+    _v23_risk_fixture_evidence,
+    _v23_leave_best_month,
     build_v23_signal_row,
     v23_exit_decision,
     v23_risk_snapshot,
@@ -1173,6 +1177,10 @@ class TailNextMorningV2Tests(unittest.TestCase):
         self.assertTrue(any(row["action"] == "forced_risk_exit" for row in ledger))
         self.assertEqual(3, len(cooldown))
         self.assertTrue(any(row["action"] == "buy" and row["trade_date"] == dates[5] for row in ledger))
+        self.assertEqual(3, account["risk_episodes"][0]["actual_forced_exits"])
+        self.assertEqual(5_000_000.0, account["initial_nav"])
+        self.assertEqual(len(dates), account["N"])
+        self.assertIn("annualized_return", account)
         self.assertTrue(all(event["outcome_status"] == "resolved" for event in events))
         self.assertEqual(len(dates), len(nav))
         self.assertTrue(holdings)
@@ -1188,6 +1196,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
         codes = ["300085", "300339", "300700", "300701", "300702", "300703", "300704", "300705"]
         day, template_prior = a_inputs()
         calls: dict[str, int] = {}
+        requests: dict[str, set[str] | None] = {}
 
         def future(value: dict) -> dict:
             result = copy.deepcopy(value)
@@ -1201,6 +1210,7 @@ class TailNextMorningV2Tests(unittest.TestCase):
         def fake_load(_root, trade_date, requested=None):
             calls[trade_date] = calls.get(trade_date, 0) + 1
             universe = set(codes) if requested is None else set(requested)
+            requests[trade_date] = None if requested is None else set(requested)
             index = calendar.index(trade_date)
             values = {}
             for code in universe:
@@ -1222,9 +1232,73 @@ class TailNextMorningV2Tests(unittest.TestCase):
             self.assertEqual(1, summary["fixture_evidence"]["300085@20240923"]["prior5_amount_pass_count"])
             self.assertEqual(5, summary["fixture_evidence"]["300339@20240926"]["prior5_amount_pass_count"])
             self.assertTrue(all(count == 1 for count in calls.values()))
+            self.assertTrue(all("300085" not in (requests[calendar[index]] or set()) for index in range(0, 5)))
+            self.assertTrue(summary["read_phase_events"])
+            self.assertTrue(any(event["phase"] == "short" for event in summary["read_phase_events"]))
+            self.assertTrue(any(event["phase"] == "long" for event in summary["read_phase_events"]))
+            self.assertTrue(summary["risk_fixture_evidence"]["all_losing_triggered"])
+            self.assertTrue(summary["risk_fixture_evidence"]["delayed_forced_exit_backfilled"])
+            self.assertIn("annualized_return", summary["account"])
+            self.assertEqual(2, len([row for row in summary["aggregates"]["daily_slot_net"] if row["channel"] == "A" and row["strategy_or_control"] == "strategy"]))
             for relative in ("daily_results.csv.gz", "event_results.csv.gz", "account_ledger.csv.gz", "account_nav.csv.gz", "account_holdings_1304.csv.gz", "risk_state.csv.gz", "cooldown_skips.csv.gz", "artifact_manifest.json", "completion.json"):
                 self.assertTrue((run_dir / relative).is_file(), relative)
             self.assertEqual("SUCCEEDED", json.loads((run_dir / "completion.json").read_text(encoding="utf-8"))["status"])
+
+    def test_v23_two_phase_gate_matches_naive_rows_and_skips_failed_long_history(self) -> None:
+        day, prior = a_inputs()
+        raw = {
+            "300085": copy.deepcopy(prior), "300339": copy.deepcopy(prior), "300700": copy.deepcopy(prior),
+        }
+        for value in raw["300085"][-5:-1]:
+            value["history"]["full_amount"] = 100_000_000.0
+        naive = {code: build_v23_signal_row(code, day, values, LISTED) for code, values in raw.items()}
+        survivors = {code for code, values in raw.items() if _v23_prior5_evidence(values[-5:])["prior5_amount_all_gt_200m"]}
+        optimized = {code: build_v23_signal_row(code, day, raw[code], LISTED) for code in survivors}
+        self.assertEqual({"300339", "300700"}, survivors)
+        self.assertFalse(naive["300085"]["liquidity_pass"])
+        for code in survivors:
+            self.assertEqual(naive[code], optimized[code])
+        self.assertEqual(
+            [row["sec_code"] for row in rank_v22_channels(list(naive.values()))["a_selected"]],
+            [row["sec_code"] for row in rank_v22_channels(list(optimized.values()))["a_selected"]],
+        )
+
+    def test_v23_risk_fixture_and_stale_mark_provenance(self) -> None:
+        fixture = _v23_risk_fixture_evidence()
+        self.assertTrue(fixture["all_losing_triggered"])
+        self.assertTrue(fixture["mean_exact_minus5_not_triggered"])
+        self.assertTrue(fixture["mean_below_minus5_triggered"])
+        self.assertTrue(fixture["delayed_forced_exit_backfilled"])
+        self.assertTrue(fixture["unavailable_buy_on_cooldown"])
+        self.assertTrue(fixture["event_study_statuses_unchanged"])
+        self.assertEqual(3, fixture["episode"]["actual_forced_exits"])
+
+        holding = {"A1": {"event": {"sec_code": "300001"}, "buy_price": 100.0, "last_mark": 99.0, "last_mark_date": "20240920", "last_mark_index": 2}}
+        stale = v23_risk_snapshot(holding, {"300001": {"v23_exit": {"decision_status": "invalid"}}}, decision_date="20240925", session_index=5)
+        mark = stale["marks"][0]
+        self.assertEqual(99.0, mark["mark_price"])
+        self.assertEqual("20240920", mark["mark_source_date"])
+        self.assertEqual("20240925", mark["decision_date"])
+        self.assertEqual(3, mark["stale_days"])
+
+    def test_v23_full_target_calendar_zero_slots_fixed_ab_weight_and_leave_best_month(self) -> None:
+        event = {"trade_date": "20240131", "sec_code": "300001", "channel": "A", "strategy_or_control": "strategy", "rank": 1, "slot_weight": 1.0, "outcome_status": "resolved", "bought": True, "gross_return": .093, "net_return": .09, "holding_days": 1}
+        targets = ["20240131", "20240201"]
+        aggregates = _v22_event_aggregates([event], target_dates=targets)
+        a = [row for row in aggregates["daily_slot_net"] if row["channel"] == "A" and row["strategy_or_control"] == "strategy"]
+        b = [row for row in aggregates["daily_slot_net"] if row["channel"] == "B" and row["strategy_or_control"] == "strategy"]
+        ab = [row for row in aggregates["combined_channel"]["daily_slot_net"] if row["strategy_or_control"] == "strategy"]
+        self.assertEqual([.015, 0.0], [row["daily_slot_net"] for row in a])
+        self.assertEqual([0.0, 0.0], [row["daily_slot_net"] for row in b])
+        self.assertEqual([.01, 0.0], [row["daily_slot_net"] for row in ab])
+        empty = _v22_event_aggregates([], target_dates=targets)
+        self.assertTrue(all(row["daily_slot_net"] == 0.0 for row in empty["daily_slot_net"]))
+        leave = _v23_leave_best_month([
+            {"trade_date": "20240131", "channel": "A", "strategy_or_control": "strategy", "daily_slot_net": .02},
+            {"trade_date": "20240201", "channel": "A", "strategy_or_control": "strategy", "daily_slot_net": -.01},
+        ])
+        self.assertEqual("202401", leave["A|strategy"]["best_month"])
+        self.assertAlmostEqual(-.01, leave["A|strategy"]["remaining_arithmetic_sum"])
 
     def test_v23_spec_hash_ignores_evidence(self) -> None:
         from mining import tail_next_morning_v2 as module
