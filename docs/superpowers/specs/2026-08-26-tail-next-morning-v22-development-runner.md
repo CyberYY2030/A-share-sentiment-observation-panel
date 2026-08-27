@@ -166,3 +166,27 @@ commits/states 覆盖 484 个实际来源日，故大于 473 个 target-level ch
 `v22-development-8fffe4a3fba4-969e9d05cd0a` 仍为原子 `FAILED/TailDataError`
 `v2_canary_year_guard:20230103`，其 manifest/progress/completion/log 均只读保留。现有 shared dirty 未变、
 暂存区在提交前为空；本次只追加本节。等待 Sol 最终独立审核，2025/2026 继续锁定。Lessons：`skip`。
+
+### TNM-V2.2-R2 派生经济审计补充（Terra，2026-08-27）
+
+状态：`tnm_v22_r2_supplement_verified_pending_sol`。仅从冻结且已成功的
+`v22-development-8fffe4a3fba4-7afabfa01de2` 只读派生
+`output/tail-next-morning-v2/audit/v22-development-8fffe4a3fba4-7afabfa01de2/economic_supplement.json`；
+未改原批的任何字节、未启动/resume、未读取 2025/2026、未写 E 盘。派生前后原 artifact manifest SHA 均为
+`a118994006d7f3a053ba05730305226db25ab21fa7f8d526748f6f38344324db`。补充 JSON 的物理文件 SHA-256 为
+`27b135501f3ef12f9740b2912610237ad5be6ab6e30b420216ee0deefcefc490`；其 canonical payload self SHA-256 为
+`cb086d38a6f264e08d53fa108e7ee8bca3ca5f140c41e5604ea4cb4374c9eaab`，范围明确为移除 self 字段后的
+UTF-8 sort-key/compact JSON。
+
+JSON 绑定 source run/spec/input/manifest hash，并记录 `development_summary.json` SHA
+`cd5bd0e205def2e9227c379f7a4760efb7121c3f9a8e4fe8dc5dbdead79e5012` 和 `account_nav.csv.gz` SHA
+`87b5c234d1b097a7a506de9699c49739a6345fc25c10f88615f4602a1aa8f8b6`。按 strategy-only fixed-slot
+`daily_slot_net` 逐 YYYYMM 求和并删除唯一最佳月 `202409` 后，累计为 A
+`-5.717467881724109`（最佳月 `0.2740869640650344`，471 日）、B
+`-4.3790761366509745`（`0.33901128830617805`，467 日）、AB
+`-5.720765892576499`（`0.3627384290580903`，473 日）。账户 N=484、初始/最终 NAV 为
+5,000,000.0/61,142.290713900235，年化 `-0.8995136724155419`、max drawdown
+`-0.9886350184953276`、平均 utilization `0.9230945821854918`；JSON 内列出原公式。
+
+这是对 Sol R2 两项 P2 的派生审计证据补全，不改策略、统计口径或原批经济结论。shared dirty 保持，
+补充 JSON 为 ignored output 且不进入提交；等待 Sol 复审。Lessons：`skip`。
