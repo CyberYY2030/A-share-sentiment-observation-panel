@@ -110,3 +110,24 @@ python -m mining.tail_next_morning_v2 v23-development
 - 最终经济完成标签仍为 `tnm_v23_development_completed`，不得降低或另造经济版本。
 
 Lessons 决策：`create` 候选，范围为 Windows AppX/Codex 宿主中的 HEAVY-BATCH：客户端 `Start-Process` 不等于生命周期独立；长批必须由外部调度器托管，并用祖先链 smoke 验证。待真实 resume 终态后再 capture，不提前提升为规则。
+
+## 7. R1A 修订：恢复预检本身也必须外部托管
+
+2026-08-28 的首次 R1 实测补充了新的 first divergence：
+
+- Terra 以 Codex 统一执行会话启动 ignored helper `v23_recovery_553887b.py --recovery-only`；
+- helper PID `49372` 持续只读复演约2小时，CPU与读取量持续增长、内存平稳，并写出 `v23_recovery_553887b.running.json`；
+- Terra 回合结束时 PID `49372` 与父 pwsh `35532` 同时消失，未生成 preflight JSON，未进入 smoke；
+- 没有 Task Scheduler task、没有真实 resume、没有移动旧 `run.lock`、没有修改原 run；
+- 这不是 checkpoint/data 失败，而是 R1 的逐 marker 消费身份复演也属于 HEAVY-BATCH，却仍由 Codex 会话承载。
+
+因此第3节执行顺序修订为：
+
+1. 先创建唯一 Task Scheduler smoke task `TNM-V23-SMOKE-adfb3b853979`，按第3.2节完成15秒祖先链/原子完成验证并删除 task；
+2. smoke 通过后，用同一已验证调度机制创建唯一只读预检 task `TNM-V23-PREFLIGHT-adfb3b853979`，运行固定 SHA helper 的 `--recovery-only`；
+3. 预检 task 必须使用 `RunLevel=Limited`、`Hidden=true`、`ExecutionTimeLimit=PT0S`、不因电池切换停止、无自动 restart、`MultipleInstancesPolicy=IgnoreNew`；helper stdout/stderr、PID/PPID/祖先链、task XML、helper SHA、running/preflight JSON路径必须冻结；
+4. 预检运行中只低频读取 task state、PID、running/preflight JSON存在性和 stderr尾部；不得由 Codex 等待其计算，不得重复启动；
+5. PID消失且无明确 preflight 终态立即 `blocked_evidence`；成功后删除已结束的预检 task并保留XML/日志/hash，再交 Sol 做 R1R；
+6. R1A 仍严格禁止移动旧锁或启动真实 resume。原 PID49372 的 running JSON 和进程消失证据永久只读保留，不得冒充成功预检或覆盖。
+
+本修订只改变恢复预检的宿主拓扑，不改变第1～6节的经济身份、checkpoint验证宽度、Sol门禁或最终恢复命令。
