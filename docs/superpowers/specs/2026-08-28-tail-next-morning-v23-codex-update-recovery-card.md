@@ -131,3 +131,20 @@ Lessons 决策：`create` 候选，范围为 Windows AppX/Codex 宿主中的 HEA
 6. R1A 仍严格禁止移动旧锁或启动真实 resume。原 PID49372 的 running JSON 和进程消失证据永久只读保留，不得冒充成功预检或覆盖。
 
 本修订只改变恢复预检的宿主拓扑，不改变第1～6节的经济身份、checkpoint验证宽度、Sol门禁或最终恢复命令。
+
+## 8. R1B 修订：规划身份使用祖先约束，不绑定可变 HEAD
+
+R1A 的 Task Scheduler smoke 已通过，证明调度宿主与 Codex 生命周期独立；随后唯一 preflight task 在任何生产 calendar/input/marker 读取前以 `recovery_frozen_identity_mismatch:planning_head` 退出。
+
+首个分歧是 ignored helper 把首版规划 commit `553887b` 与当前 HEAD 做精确相等比较。第7节宿主修订形成合法 docs-only commit `b7b8d1b` 后，经济代码、测试和原 run identity 均未改变，但该过度严格检查必然失败。规划/证据提交是可追加的控制面，不能作为已冻结经济 run 的精确 HEAD。
+
+最窄修复：
+
+1. 保持经济身份精确冻结：原 run manifest 的 `base_commit=63a496f...`、spec/run/input hash、module/test/economic/runner blobs必须逐字段相等；当前 working-tree module/test blob也必须相等；
+2. 恢复控制面只要求 `b7b8d1b` 是当前 HEAD 的祖先，并记录实际 HEAD；不得要求 HEAD 精确等于任一规划或证据 commit；
+3. 创建唯一新 helper/launcher/preflight task 名称并记录 SHA，不覆盖 R1A 失败 helper、stderr、task XML、health 与旧 running JSON；
+4. 已通过的 smoke 不重复。只授权一次修正后的 `TNM-V23-PREFLIGHT-adfb3b853979-R2`；它仍按第7节由 Task Scheduler 托管，无自动 restart；
+5. preflight 启动后只做短健康检查并立即交低频监控，不由 Terra 回合等待；成功后按原门禁交 Sol R1R；失败则停止，不得第三次 preflight；
+6. 本修订仍不授权移动旧锁或真实 resume。
+
+该修复只收窄错误的控制面身份约束，不放宽任何经济、输入、checkpoint或单 writer不变量。
