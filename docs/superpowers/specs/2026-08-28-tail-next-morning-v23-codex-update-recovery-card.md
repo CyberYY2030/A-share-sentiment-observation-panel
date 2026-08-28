@@ -148,3 +148,73 @@ R1A 的 Task Scheduler smoke 已通过，证明调度宿主与 Codex 生命周�
 6. 本修订仍不授权移动旧锁或真实 resume。
 
 该修复只收窄错误的控制面身份约束，不放宽任何经济、输入、checkpoint或单 writer不变量。
+
+## 9. R2A 修订：从冻结 runner checkout 恢复，不修改身份算法
+
+R2 的唯一 Scheduler resume 在取得新 `run.lock` 或修改 `progress.json` 前，以
+`TailDataError: v22_resume_identity_mismatch` 退出。失败任务、XML、helper、stdout/stderr、
+terminal JSON 和旧锁归档必须原样保留；不得用同名 task 重试。
+
+### 9.1 First divergence
+
+原 run manifest 将以下项目共同绑定为经济执行身份：
+
+- `base_commit=63a496fcbb65c9548027d1b5d00d39a46d85bf63`；
+- 已批准的 spec/input/run hash；
+- module/test/economic card/runner card blobs。
+
+R2 launcher 却从当前规划 checkout `be1742a...` 启动。虽然其经济 blobs 与原 run 相同，
+`_v22_prepare_run` 仍按当前 checkout 的 HEAD 计算 `base_commit`，因此得到不同 run id 并正确
+拒绝显式 resume。首个偏差位于 launcher 的 checkout 选择，不在 checkpoint、数据、策略或
+`_v22_prepare_run`。
+
+### 9.2 最窄修复
+
+不得修改 `mining/tail_next_morning_v2.py`、`tests/test_tail_next_morning_v2.py` 或放宽
+`_v22_prepare_run`。Terra 只可：
+
+1. 在 repo 的 ignored recovery 区创建 detached Git worktree，精确 checkout
+   `63a496fcbb65c9548027d1b5d00d39a46d85bf63`；不得切换当前 shared checkout；
+2. 固定 worktree 绝对路径、HEAD、module/test/card blobs，并验证与原 manifest/批准包完全一致；
+3. 使用冻结 Python，从该 worktree 运行 import-only smoke，必须证明：
+   `mining.tail_next_morning_v2.__file__` 位于冻结 worktree、`_current_commit()` 为 `63a496f...`，
+   且 `PYTHONPATH`/当前 shared checkout 未劫持 import；
+4. 前台运行 identity-only 合成检查：读取原 `run_manifest.json` 中已冻结的
+   `input_manifest`，调用同一 `_v22_prepare_run`，必须返回原 run id/run hash，且 run manifest、
+   progress、checkpoint、归档锁的 SHA/mtime/bytes 全部不变；该检查不得扫描 E: 或进入真实 runner；
+5. 在冻结 worktree 运行 `python -m unittest tests.test_tail_next_morning_v2`、
+   `python -m unittest tests.test_tail_next_morning`、`python -m py_compile` 和 `git diff --check`；
+6. 保留 R2 失败 task 的 actual/requested XML 后，仅注销
+   `TNM-V23-RESUME-adfb3b853979`，只读证明 task 不存在；不得覆盖任何 R2 失败证据；
+7. 交 Sol 做 `TNM-V23-R2AR` 独立只读审核。只有 `approve` 才允许一次真实恢复；
+   `changes_required` 只回传精确问题，`blocked_evidence` 立即停止。
+
+### 9.3 唯一真实恢复
+
+Sol approve 后，Terra 才可创建新任务 `TNM-V23-RESUME-adfb3b853979-R2`。launcher 必须：
+
+- 使用固定 SHA ignored helper，显式设置 child cwd 为冻结 worktree，移除会改变 import 根的
+  `PYTHONPATH`/`PYTHONHOME`，并在启动 writer 前再次断言冻结 HEAD、module path 和全部批准 blobs；
+- 使用原第4节的完整逻辑 argv 与显式
+  `--resume-run-id v23-development-4dc58bf0106b-adfb3b853979`，输出目录仍为当前 repo 中的原 run；
+- 保持 Task Scheduler 的 Limited/Hidden/PT0S/IgnoreNew、battery=false、restart=0 与无 Codex
+  祖先链不变量；不得创建新 identity、重跑 preflight、再次移动归档锁或使用同名失败 task；
+- 短健康检查必须证明新 `run.lock` 的 run hash/PID/command 正确，`progress.stage=resumed`、
+  completed/frontier 不倒退，manifest 字节不变。任一断言失败立即停止，禁止第三次真实 resume。
+
+运行与终态验收继续遵守第5节。冻结 worktree 在最终 Sol `TNM-V23-2R` approve 前保留；
+最终验收完成后，停止/注销 task 并用 Git worktree 机制移除该可复现 checkout，保留其
+commit、路径、launcher/helper/task XML 和 SHA 证据。
+
+### 9.4 对抗性验收
+
+最便宜的证伪实验必须覆盖：
+
+- 当前 shared checkout 启动 identity-only 检查仍得到 `v22_resume_identity_mismatch`；
+- 冻结 `63a496f` worktree 启动同一检查得到原 run id/hash；
+- 故意注入当前 repo 到 `PYTHONPATH` 时，launcher 在启动 writer 前拒绝 module path 不匹配；
+- 错误冻结 commit、任一 module/test/card blob、spec/input/run id/hash 不匹配均 fail closed；
+- 原 run manifest/progress/checkpoints/归档锁在全部 smoke/测试后字节与时间戳不变。
+
+本修订不改变产品代码或身份定义。它让执行环境满足原有 fail-closed 合约，是恢复原 run 的
+唯一最小充分变更。
