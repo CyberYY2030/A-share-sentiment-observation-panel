@@ -218,3 +218,28 @@ commit、路径、launcher/helper/task XML 和 SHA 证据。
 
 本修订不改变产品代码或身份定义。它让执行环境满足原有 fail-closed 合约，是恢复原 run 的
 唯一最小充分变更。
+
+## 10. TNM-V23-R2B 终态执行证据（2026-08-29）
+
+- 唯一原 identity `v23-development-4dc58bf0106b-adfb3b853979` 已由冻结 worktree
+  `63a496fcbb65c9548027d1b5d00d39a46d85bf63` 的 Scheduler writer 原子完成：
+  `completion.status=SUCCEEDED`、`execution_label=tnm_v23_development_completed`、
+  `run_hash=adfb3b8539799634895b06b67f7f2cd43b4866d8b87fb7ed27717b8b69c69a0d`。
+- `progress.stage=aggregated`、target `474/474`、frontier `20241231`、open exit `0`；
+  474 个 target checkpoint 与 484 个 source-day marker 的 state/signal/outcome/account
+  SHA 引用全部逐项复算通过，artifact manifest 的 2,407 项文件与大小/SHA 全部一致。
+  artifact manifest SHA256=`c292ac5f6f98a802569c683500a1b87b2eb26fe3ba73c57406c34197cb2a7539`；
+  development summary SHA256=`92214e875a0f5b78007e44f5d34b8ce546fd3eca00576cd6db5ca9ead3f513dc`。
+- 原 manifest SHA256 仍为 `0115b3a120a89f765b2b57cf0b741c188a4b28abc2d34a258c3fd4eec0d68d65`；
+  中断归档锁保持 `c128e9729aa79ca79dea0881c6cb08e9a2217d272b59494b3435cff950873cb2`。
+  新 `run.lock` 已清除；R2B helper terminal returncode=0，writer/helper stderr 合计 0 bytes。
+- Task `TNM-V23-RESUME-adfb3b853979-R2` 的实际设置为
+  Limited/Hidden/PT0S/IgnoreNew、battery=false、RestartCount=0；完成时 Ready/LastTaskResult=0，
+  已仅注销该结束任务并证明不存在。requested/actual XML、helper、launcher、started/writer/terminal
+  JSON 均保留在 `output/tail-next-morning-v2/v23-development/__recovery/r2b-resume/`。
+- 只读终态审计：
+  `TNM-V23-RESUME-adfb3b853979-R2.terminal-audit.json`，
+  SHA256=`fbfd8ab7cdd7a26920690e18e69033b331bc5be0e5fa6e68c660c5da444cccb3`。
+  它还记录经济终态：13,596 events、13,580 resolved、16 unresolved；A/B/AB 因未决项为
+  `blocked_unresolved`，九袖套账户为 `blocked_unresolved_account`。这是待 Sol `TNM-V23-2R`
+  独立经济审核的结果，未调参、未重跑、未读 2025/2026、未写 E: 源目录。
