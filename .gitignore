@@ -40,3 +40,4 @@ intraday_light_exporter.py
 market_light_api.py
 ths_concept_watchlist.py
 trade_advisor_mvp.py
+outputs/
