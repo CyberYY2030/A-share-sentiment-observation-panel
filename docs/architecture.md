@@ -6,7 +6,7 @@ This project is a local A-share market sentiment dashboard with an opportunity-m
 
 Dashboard startup:
 
-1. `streamlit run app.py`
+1. `streamlit run app.py` starts this project on port `8502` through `.streamlit/config.toml`; the separate crypto dashboard uses `8501`.
 2. `app.py` calls `app_panel.main()`.
 3. `app_panel.py` resolves runtime paths through `runtime_paths.build_runtime_paths()`.
 4. The panel checks stock, index, concept, ETF, and mining data freshness.
@@ -42,7 +42,7 @@ Formal-only close path:
 1. `run_daily.py --date <day> --formal-only` accepts one explicit close-ready date and skips provider, legacy, outcome, watchlist, and report work.
 2. The shared stock/index quality contract builds a universe from valid rows only; quarantined and absent stocks remain excluded.
 3. `mining.capabilities.CAPABILITY_REGISTRY` evaluates the six formal A-E strategy ids.
-4. `persist_close_final_batch()` writes one atomic `v2.5/close_final/complete` batch. The input fingerprint makes an identical rerun a zero-growth reuse.
+4. `persist_close_final_batch()` writes one atomic `v2.6/close_final/complete` batch. The input fingerprint makes an identical rerun a zero-growth reuse; v2.5 batches remain historical read-only records.
 5. Streamlit reads that exact complete batch. Optional concept failure is rendered as degraded/unavailable and does not replace the core screening date or results.
 
 ## Data Stores

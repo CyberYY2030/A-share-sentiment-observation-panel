@@ -1,0 +1,57 @@
+=== 1. WHERE THE MONEY GOES: overnight leg vs intraday leg (day-equal-weight) ===
+  --- 2023-2024 ---
+    TARGET overnight  (14:51 -> next open) ev= 2168 day= 347  dayEW -0.2275%  HAC_t -1.85  95%LB -0.4299%  d>0 40.9%
+    TARGET intraday   (open -> 11:30) ev= 2168 day= 347  dayEW +0.0908%  HAC_t +0.52  95%LB -0.1961%  d>0 46.1%
+    MARKET overnight  (14:51 -> next open) ev= 2149 day= 347  dayEW +0.1405%  HAC_t +2.32  95%LB +0.0411%  d>0 54.5%
+    MARKET intraday   (open -> 11:30) ev= 2149 day= 347  dayEW -0.0051%  HAC_t -0.04  95%LB -0.1980%  d>0 45.8%
+    PAIRED overnight T-M           day= 346  -0.3674%  HAC_t -3.58  95%LB -0.5364%  d>0 41.3%
+    PAIRED intraday  T-M           day= 346  +0.1098%  HAC_t +0.56  95%LB -0.2132%  d>0 48.8%
+  --- 2025 ---
+    TARGET overnight  (14:51 -> next open) ev=  733 day= 193  dayEW -0.3523%  HAC_t -2.91  95%LB -0.5511%  d>0 38.9%
+    TARGET intraday   (open -> 11:30) ev=  733 day= 193  dayEW +0.2606%  HAC_t +1.17  95%LB -0.1073%  d>0 47.2%
+    MARKET overnight  (14:51 -> next open) ev=  735 day= 194  dayEW +0.0093%  HAC_t +0.17  95%LB -0.0804%  d>0 47.9%
+    MARKET intraday   (open -> 11:30) ev=  735 day= 194  dayEW -0.0509%  HAC_t -0.44  95%LB -0.2424%  d>0 51.0%
+    PAIRED overnight T-M           day= 193  -0.3625%  HAC_t -2.91  95%LB -0.5674%  d>0 41.5%
+    PAIRED intraday  T-M           day= 193  +0.3067%  HAC_t +1.33  95%LB -0.0722%  d>0 51.3%
+  --- 2026H1 ---
+    TARGET overnight  (14:51 -> next open) ev=  574 day= 101  dayEW -0.0958%  HAC_t -0.75  95%LB -0.3065%  d>0 44.6%
+    TARGET intraday   (open -> 11:30) ev=  574 day= 101  dayEW -0.0592%  HAC_t -0.25  95%LB -0.4542%  d>0 45.5%
+    MARKET overnight  (14:51 -> next open) ev=  574 day= 101  dayEW -0.0068%  HAC_t -0.09  95%LB -0.1325%  d>0 48.5%
+    MARKET intraday   (open -> 11:30) ev=  574 day= 101  dayEW -0.1701%  HAC_t -1.00  95%LB -0.4507%  d>0 51.5%
+    PAIRED overnight T-M           day= 101  -0.0890%  HAC_t -0.67  95%LB -0.3068%  d>0 44.6%
+    PAIRED intraday  T-M           day= 101  +0.1109%  HAC_t +0.53  95%LB -0.2306%  d>0 51.5%
+  --- ALL ---
+    TARGET overnight  (14:51 -> next open) ev= 3475 day= 641  dayEW -0.2443%  HAC_t -3.08  95%LB -0.3747%  d>0 40.9%
+    TARGET intraday   (open -> 11:30) ev= 3475 day= 641  dayEW +0.1183%  HAC_t +0.96  95%LB -0.0836%  d>0 46.3%
+    MARKET overnight  (14:51 -> next open) ev= 3458 day= 642  dayEW +0.0777%  HAC_t +1.99  95%LB +0.0135%  d>0 51.6%
+    MARKET intraday   (open -> 11:30) ev= 3458 day= 642  dayEW -0.0449%  HAC_t -0.58  95%LB -0.1728%  d>0 48.3%
+    PAIRED overnight T-M           day= 640  -0.3220%  HAC_t -4.52  95%LB -0.4392%  d>0 41.9%
+    PAIRED intraday  T-M           day= 640  +0.1694%  HAC_t +1.29  95%LB -0.0460%  d>0 50.0%
+
+=== 2. SAME NAMES, ENTERED NEXT MORNING AT 09:46 INSTEAD (skips the overnight leg) ===
+  --- 2023-2024 ---
+    TARGET 09:46->11:30            ev= 2171 day= 347  dayEW -0.1008%  HAC_t -0.79  95%LB -0.3104%  d>0 41.5%
+    MARKET 09:46->11:30            ev= 2171 day= 348  dayEW -0.2581%  HAC_t -3.38  95%LB -0.3838%  d>0 35.6%
+    PAIRED T-M hold                day= 347  +0.1625%  HAC_t +1.25  95%LB -0.0516%  d>0 51.0%
+    PAIRED T-M +1.5% limit         day= 347  +0.1254%  HAC_t +1.63  95%LB -0.0010%  d>0 53.9%
+    TARGET flat-at-09:45 only      ev=  578 day= 226  dayEW +0.0387%  HAC_t +0.25  95%LB -0.2135%  d>0 45.1%
+    PAIRED T-M flat-only           day= 192  +0.3167%  HAC_t +1.78  95%LB +0.0242%  d>0 53.1%
+  --- 2025 ---
+    TARGET 09:46->11:30            ev=  733 day= 193  dayEW -0.1377%  HAC_t -0.95  95%LB -0.3754%  d>0 45.1%
+    MARKET 09:46->11:30            ev=  737 day= 194  dayEW -0.3930%  HAC_t -4.40  95%LB -0.5400%  d>0 36.1%
+    PAIRED T-M hold                day= 193  +0.2507%  HAC_t +1.61  95%LB -0.0048%  d>0 53.9%
+    PAIRED T-M +1.5% limit         day= 193  +0.2037%  HAC_t +1.72  95%LB +0.0084%  d>0 54.9%
+    TARGET flat-at-09:45 only      ev=  262 day= 125  dayEW -0.1484%  HAC_t -0.82  95%LB -0.4453%  d>0 42.4%
+    PAIRED T-M flat-only           day= 111  +0.0853%  HAC_t +0.39  95%LB -0.2757%  d>0 51.4%
+  --- 2026H1 ---
+    TARGET 09:46->11:30            ev=  574 day= 101  dayEW -0.4494%  HAC_t -2.34  95%LB -0.7660%  d>0 33.7%
+    MARKET 09:46->11:30            ev=  574 day= 101  dayEW -0.5380%  HAC_t -3.65  95%LB -0.7803%  d>0 28.7%
+    PAIRED T-M hold                day= 101  +0.0886%  HAC_t +0.52  95%LB -0.1912%  d>0 50.5%
+    PAIRED T-M +1.5% limit         day= 101  +0.0871%  HAC_t +0.68  95%LB -0.1226%  d>0 54.5%
+    TARGET flat-at-09:45 only      ev=  188 day=  69  dayEW -0.1804%  HAC_t -0.60  95%LB -0.6735%  d>0 34.8%
+    PAIRED T-M flat-only           day=  66  +0.3591%  HAC_t +1.25  95%LB -0.1149%  d>0 50.0%
+
+=== 3. is the amplitude excess itself stable? (paired MFE from 09:46, by year) ===
+    PAIRED 2023-2024  MFE T-M      day= 347  +0.9360%  HAC_t +7.08  95%LB +0.7184%  d>0 70.3%
+    PAIRED 2025  MFE T-M           day= 193  +0.9644%  HAC_t +6.73  95%LB +0.7286%  d>0 72.0%
+    PAIRED 2026H1  MFE T-M         day= 101  +0.5655%  HAC_t +3.28  95%LB +0.2821%  d>0 67.3%

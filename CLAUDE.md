@@ -17,13 +17,13 @@ Then read only the files listed for that slice.
 
 ## Fast Orientation
 
-- `app.py` is the Streamlit entrypoint. It only imports and calls `app_panel.main()`.
+- `app.py` is the Streamlit entrypoint. It only imports and calls `app_panel.main()`; project-local `.streamlit/config.toml` reserves port `8502` so the crypto dashboard can keep `8501`.
 - `app_panel.py` is the current main dashboard implementation. It contains auto-backfill checks, SQLite access, market sentiment calculations, intraday snapshot handling, and Streamlit rendering in one large module.
 - `backfill_orchestrator.py` starts long-running backfill scripts outside the Streamlit render thread and writes their output to `output/backfill_jobs/`.
 - `offline_daily_update.py` is the offline daily updater and the canonical outer repair entrypoint. In core mode it owns one close-ready target day, stock/index quality gates, one repair child, and the provider-free formal batch that follows a successful market gate. `daily_job.ps1` is the schedulable wrapper; it writes logs under `output/backfill_jobs/`, the latest health summary to `output/health_latest.md`, and an optional Telegram digest when `TG_BOT_TOKEN`/`TG_CHAT_ID` or ignored `data/notify_config.json` is configured.
 - `repair_market_day_akshare.py` is the bounded stock/index repair child. It classifies the true unresolved set, stages BaoStock → Sina → probed Eastmoney, isolates a timed-out symbol in a killable worker process, and checkpoints accepted rows in the parent. Do not launch it in parallel with the canonical outer updater.
 - `runtime_paths.py` centralizes local path resolution for `data/`, root-level legacy DBs, metrics CSVs, and runtime directories.
-- `run_daily.py` is the CLI entrypoint for the mining pipeline. Its full path refreshes basics, runs scanners, persists candidates/outcomes, and emits reports; `--date <day> --formal-only` is the bounded provider-free path for one formal v2.5 close batch.
+- `run_daily.py` is the CLI entrypoint for the mining pipeline. Its full path refreshes basics, runs scanners, persists candidates/outcomes, and emits reports; `--date <day> --formal-only` is the bounded provider-free path for one formal v2.6 close batch.
 - `mining/` is the newer modular package for strategy scanning and review UI.
 - `tests/` covers the mining pipeline, runtime paths, and Streamlit helper behavior with synthetic SQLite fixtures.
 
@@ -54,7 +54,7 @@ Formal-only close flow:
 
 1. `python run_daily.py --base-dir . --date YYYY-MM-DD --formal-only`
 2. Reuse the shared stock/index quality and universe contracts; quarantine rows stay excluded.
-3. Evaluate the capability registry and atomically persist one `v2.5/close_final/complete` batch.
+3. Evaluate the capability registry and atomically persist one `v2.6/close_final/complete` batch; v2.5 batches remain historical read-only records.
 4. An identical fingerprint is a zero-growth reuse. No provider, legacy, outcome, watchlist, or report work runs in this mode.
 
 Data stores:

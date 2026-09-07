@@ -1,0 +1,21 @@
+=== 1. pooled vs day-equal-weight: does the signal count covary with the day's return? ===
+  n/day    days   share_ev   R_hold_EW     R_tp_EW
+  1         186       5.4%     -0.999%     -1.178%
+  2         131       7.5%     -0.565%     -0.902%
+  3-4       143      14.1%     -0.268%     -0.311%
+  5-8       116      19.7%     -0.231%     -0.154%
+  9+         65      53.3%      0.709%      0.367%
+  corr(n, R_hold_EW) = +0.136    top-20 busiest days hold  37.9% of all events
+  -> pooled weights each EVENT, so it is dominated by the few very busy days;
+     day-EW weights each TRADING DAY, which is what a fixed daily capital budget actually earns.
+
+=== 2. minute-archive layout audit: uniqueness of (date, exchange, code) ===
+  2023  day_dirs=242  layout counts={'flat': 726, 'bare': 726}  duplicate (date,ex,code) keys=0
+  2025  day_dirs=240  layout counts={'flat': 543, 'bare': 660, 'nested': 177, 'prefixed': 60}  duplicate (date,ex,code) keys=0
+  2026  day_dirs=116  layout counts={'flat': 270, 'prefixed': 285, 'nested': 78, 'bare': 63}  duplicate (date,ex,code) keys=5526
+
+=== 3. dropped events ===
+  events built from the daily panel : 6976
+  events with both D and D+1 minute : 6960  (99.8%)
+  dropped                           : 16  -- D1_no_file 8, D_no_day 4, D1_no_day 4
+  entry price unavailable at 14:51  : 27  (bar 230 had zero volume)

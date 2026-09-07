@@ -58,7 +58,9 @@ PROTO-2 在冻结 commit `7fd57fc` 上完成 2026-08-10 受控 canary：该日�
 
 OPS-HARDEN-1B.2 已在冻结修复链上完成 2026-08-11 核心生产闭环：股票有效行 5,180、基准 eligible 5,199、coverage `0.9963454510`、usable `1.0`，四指数齐全；22 个尾项保持结构化未解决（18 `provider_empty`、3 `provider_invalid`、1 `continuity_guard_rejected`），不被伪装成 100% 完整。原子 revalidation 将旧闩锁转为 `clean`，正式 batch id=4、六个 formal runs、候选 359（strong trend 115、compression 1、momentum 204、second launch 0、base breakout 0、counter-trend RS 39），reader 选择日期为 2026-08-11。concept/ETF 仍按独立可选域展示，不阻断核心结果。
 
-2026-08-13 的正常启动进一步完成 2026-08-12 收盘闭环：股票有效行 5,179、coverage baseline 5,190、coverage `0.9978805395`、usable `1.0`、状态 `clean`，四指数齐全；23 个尾项保持在 provider/continuity 排除集合。正式 batch id=5、六个 formal runs、候选 356（strong trend 142、compression 6、momentum 125、second launch 1、base breakout 2、counter-trend RS 80）。这证明普通“打开才更新”链路能够在下一次启动时完成上一 close-ready 日，不要求当天夜间常驻调度器。
+2026-08-13 的正常启动进一步完成 2026-08-12 收盘闭环：股票有效行 5,179、coverage baseline 5,190、coverage `0.9978805395`、usable `1.0`、状态 `clean`，四指数齐全；23 个尾项保持在 provider/continuity 排除集合。正式 batch id=5、六个 formal runs、候选 356（strong trend 142、compression 6、momentum 125、second launch 1、base breakout 2、counter-trend RS 80）。这证明启动补齐能完成有限的最近收盘日恢复；每日调度仍是保持数据连续性的正式机制。
+
+2026-08-23 的受控生产恢复已按 `08-18 -> 08-19 -> 08-20 -> 08-21` 完成：四日 stock 均为 `clean`、`usable_ratio=1.0`、四指数齐全，v2.6 batches 10～13 均为 `close_final/complete`，面板指标和正式选股共同显示 `2026-08-21`。concept/ETF SHA 保持不变，并以 `concept_coverage_incomplete` 显式降级。该一次性恢复的完整证据与写入边界见 `2026-08-23-screening-v2-6-prod-recovery-task-card.md`；它不授权后续生产写入或调度改造。
 
 收盘修复现采用质量感知未解决集合、单请求可杀死 worker、单代码超时隔离、连续三次 provider 调用错误切源、每 200 条 SQLite checkpoint 和单日 `--formal-only`。普通启动只针对最近已完成交易日运行一个全局互斥 writer；失败后需要显式重试，页面 rerun 不会并发重复写入。详细事故与恢复合同见 `docs/runbook.md`。
 

@@ -45,7 +45,7 @@ knowledge/
 - [x] 盘点 + 可行性验证 + 抽取去重管线
 - [x] 卡片 Schema + 样板卡
 - [x] **主攻策略/模式/机会挖掘**：模式谱系总图 + 6 张 setup 卡（连板接力 / 反包 / 大长腿 / 启动 / 趋势突破 / 板块共振）
-- [x] 基础特征：`mining/features.py` 已有单日 `is_limit_up` 与 `rolling_new_high`；`true_leader`、`trend_embryo` 和正式 v2.5 A–E 已分别落地。
+- [x] 基础特征：`mining/features.py` 已有单日 `is_limit_up` 与 `rolling_new_high`；`true_leader`、`trend_embryo` 和正式 v2.6 A–E 已分别落地；v2.5 批次保留为历史只读记录。
 - [ ] 落地：补齐连板高度、断板与反包等连续形态，再评估 relay/trend/concept 的后续扩展（见 backlog.md）。
 - [ ] 继续补 setup 卡（超级龙头接力 / 双头反包 / 龙头切换 等）
 

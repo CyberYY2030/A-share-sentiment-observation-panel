@@ -14,9 +14,11 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
+项目级 `.streamlit/config.toml` 将 A 股面板固定在 `http://localhost:8502`，避免与使用 `8501` 的加密货币面板共用端口。直接运行 `streamlit run app_panel.py` 也会使用同一配置。
+
 启动入口是 `app.py`，实际逻辑在 `app_panel.py`。面板启动时会检查本地数据库是否落后；如果发现最近交易日存在缺口，会通过 `backfill_orchestrator.py` 在后台启动 `offline_daily_update.py`，避免在 Streamlit 渲染主线程里长时间卡住。
 
-收盘日以北京时间 17:30 为 close-ready 分界：交易日 17:30 后启动或刷新面板，可补当天收盘；17:30 前以及次日盘前，目标仍是最近已经完成的交易日。页面只有在股票质量、四指数和同日 `v2.5/close_final` 正式批次全部完成后才切换日期，因此更新过程中继续显示上一可用日是正常的防混日行为。
+收盘日以北京时间 17:30 为 close-ready 分界：交易日 17:30 后启动或刷新面板，可补当天收盘；17:30 前以及次日盘前，目标仍是最近已经完成的交易日。页面只有在股票质量、四指数和同日 `v2.6/close_final` 正式批次全部完成后才切换日期，因此更新过程中继续显示上一可用日是正常的防混日行为。
 
 ## 离线日更与修复
 
@@ -38,13 +40,17 @@ python offline_daily_update.py --base-dir . --asof 2026-04-22 --days 10
 python run_daily.py --base-dir . --range 2026-04-21 2026-04-22
 ```
 
-只为一个已通过收盘质量门禁的交易日生成正式 v2.5 A–E 批次：
+只为一个已通过收盘质量门禁的交易日生成正式 v2.6 A–E 批次：
 
 ```bash
 python run_daily.py --base-dir . --date YYYY-MM-DD --formal-only
 ```
 
 `--formal-only` 不抓取外部行情，也不运行 legacy scanner、复盘、watchlist 或报告；相同输入会复用 fingerprint，不重复增加正式结果。当前原型允许 concept 数据缺失时降级运行，个股指标和正式选股仍只使用通过逐行质量门禁的数据。
+
+### 当前已核验恢复记录
+
+截至 2026-08-23，受控恢复已验证到 `2026-08-21`：stock 为 `clean`、四个必需指数齐全，同日 `v2.6/close_final/complete` 批次可被面板读取；concept/ETF 保持可选降级状态。该记录是一次审计快照，不替代每日调度；完整边界与证据索引见 `docs/superpowers/specs/2026-08-23-screening-v2-6-prod-recovery-task-card.md`。
 
 单独补齐一个最近收盘日时，使用核心日更入口，让它统一处理质量门禁、provider 切换、断点续跑和正式批次：
 

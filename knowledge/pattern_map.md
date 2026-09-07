@@ -18,7 +18,7 @@
 
 ## 现有扫描器与缺口
 
-`mining/scanners/` 当前注册了 legacy/discovery 的 `momentum_breakout`、`rps_stock`、`rps_concept`、`trend_embryo`、`true_leader`、`launch_burst`，以及正式 v2.5 A–E 所用的 `strong_trend`、`second_launch`、`base_breakout`、`counter_trend_rs`。`mining.capabilities.CAPABILITY_REGISTRY` 是正式 A–E strategy id 的唯一清单；`cup_handle.py` 是未注册的旧模块。
+`mining/scanners/` 当前注册了 legacy/discovery 的 `momentum_breakout`、`rps_stock`、`rps_concept`、`trend_embryo`、`true_leader`、`launch_burst`，以及正式 v2.6 A–E 所用的 `strong_trend`、`second_launch`、`base_breakout`、`counter_trend_rs`。`mining.capabilities.CAPABILITY_REGISTRY` 是正式 A–E strategy id 的唯一清单；`cup_handle.py` 是未注册的旧模块。
 
 **关键缺口**：`mining/features.py` 已有单日涨停和滚动新高判断；连续涨停高度、断板、空间板和反包仍没有统一的序列特征层。
 连板接力、反包、大长腿三族都卡在同一块基建——**涨停连板引擎**。它是这三族扫描器的共同地基，纯用现有日线（change_pct 判涨停、连板计数）即可建原型。

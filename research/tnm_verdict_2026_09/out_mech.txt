@@ -1,0 +1,30 @@
+panel rows=469068 days=842 2023-01-03..2026-06-29
+
+=== A. overnight gap excess by close-position, ALL days (n=469068) ===
+    pos 0-.2                       n= 116288 day= 841  gap_excess dayEW -0.1220%  HAC_t  -3.84  d>0 52.4%
+    pos .2-.4                      n=  90928 day= 840  gap_excess dayEW -0.0330%  HAC_t  -4.11  d>0 46.8%
+    pos .4-.6                      n=  83121 day= 842  gap_excess dayEW -0.0759%  HAC_t  -9.69  d>0 33.7%
+    pos .6-.8                      n=  86531 day= 842  gap_excess dayEW -0.1181%  HAC_t -11.24  d>0 27.2%
+    pos .8-1                       n=  92200 day= 842  gap_excess dayEW +0.0878%  HAC_t  +3.74  d>0 63.5%
+
+=== B. same, restricted to big up days (ret>7%%, non-limit) ===
+    big-yang pos .4-.6             n=    569 day= 345  gap_excess dayEW -1.1166%  HAC_t  -8.45  d>0 27.2%
+    big-yang pos .6-.8             n=   2000 day= 673  gap_excess dayEW -0.8257%  HAC_t -11.86  d>0 26.7%
+    big-yang pos .8-1              n=   4001 day= 676  gap_excess dayEW -0.7688%  HAC_t  -9.73  d>0 31.1%
+
+=== C. is it stable year by year? (big-yang, pos>=0.8) ===
+    2023                           n=    660 day= 191  gap_excess dayEW -0.9462%  HAC_t  -7.58  d>0 28.3%
+    2024                           n=   1810 day= 179  gap_excess dayEW -0.8980%  HAC_t  -4.73  d>0 31.8%
+    2025                           n=    851 day= 205  gap_excess dayEW -0.6423%  HAC_t  -4.77  d>0 31.7%
+    2026                           n=    686 day= 103  gap_excess dayEW -0.4914%  HAC_t  -3.45  d>0 32.0%
+    ALL 2023-2026H1                n=   4007 day= 678  gap_excess dayEW -0.7725%  HAC_t  -9.82  d>0 30.8%
+
+=== D. control: ordinary up days 0<ret<=7%%, pos>=0.8 ===
+    2023                           n=  21198 day= 242  gap_excess dayEW -0.1224%  HAC_t  -5.16  d>0 29.8%
+    2024                           n=  23761 day= 239  gap_excess dayEW -0.0942%  HAC_t  -2.71  d>0 46.9%
+    2025                           n=  23170 day= 242  gap_excess dayEW -0.0308%  HAC_t  -1.46  d>0 46.3%
+    2026                           n=  10111 day= 115  gap_excess dayEW -0.0716%  HAC_t  -2.26  d>0 40.9%
+    ALL                            n=  78240 day= 838  gap_excess dayEW -0.0809%  HAC_t  -5.59  d>0 40.9%
+
+=== E. mirror: big DOWN days closing at the LOW (ret<-7%%, pos<=0.2) ===
+    ALL 2023-2026H1                n=   4305 day= 595  gap_excess dayEW -0.4924%  HAC_t  -8.59  d>0 37.0%

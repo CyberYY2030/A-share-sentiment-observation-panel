@@ -97,6 +97,8 @@ Run the dashboard:
 streamlit run app.py
 ```
 
+The project-local `.streamlit/config.toml` fixes this A-share dashboard on port `8502`; keep the crypto dashboard on `8501` so both can run concurrently.
+
 Dry-run recent missing-data checks:
 
 ```powershell
@@ -125,7 +127,7 @@ Run opportunity-mining pipeline for a date range:
 python run_daily.py --base-dir . --range 2026-04-21 2026-04-22
 ```
 
-Run only the formal v2.5 A-E batch for one close-ready date:
+Run only the formal v2.6 A-E batch for one close-ready date:
 
 ```powershell
 python run_daily.py --base-dir . --date 2026-08-10 --formal-only

@@ -24,11 +24,13 @@ The project uses local SQLite databases and generated outputs. These are intenti
 streamlit run app.py
 ```
 
-The dashboard entrypoint is `app.py`; implementation lives in `app_panel.py`.
+The dashboard entrypoint is `app.py`; implementation lives in `app_panel.py`. Project-local `.streamlit/config.toml` reserves port `8502` for this A-share dashboard, while the crypto dashboard can remain on `8501`. Running `streamlit run app_panel.py` uses the same project-local port.
 
 On startup, the panel resolves the latest completed close day. If the core stock/index/formal result is behind, it starts one globally exclusive background job through `backfill_orchestrator.py`. That job runs a target-day `stock index` update and then a single `--formal-only` batch after the market gate passes. Optional concept/ETF gaps do not block core screening. A failed target is latched for explicit manual retry; Streamlit reruns do not start another writer.
 
 The close-ready cutoff is 17:30 China time. On a trading day, starting or refreshing after 17:30 targets that day's close; before 17:30 it targets the previous completed trading day. The same previous close remains the target on the next morning, so next-day startup is a recovery opportunity rather than a requirement. A panel left open before the cutoff needs a Streamlit rerun/refresh after 17:30 to evaluate the new target. The displayed close date advances only after stock quality, four indices, and the same-day formal batch are all ready.
+
+Startup catch-up handles a bounded missing-close recovery; it does not replace a daily scheduler. If a writer is orphaned or a target fails, first inspect its structured terminal state and `PROVIDER_SUMMARY`; preserve checkpoints and retry only under an explicit recovery plan.
 
 For a provider-free, no-backfill review of the current local databases, start a process-local isolated view:
 
@@ -68,7 +70,7 @@ Run only opportunity mining and review outputs:
 python run_daily.py --base-dir . --range 2026-04-21 2026-04-22
 ```
 
-Generate only the formal v2.5 A-E close batch for one close-ready date:
+Generate only the formal v2.6 A-E close batch for one close-ready date:
 
 ```powershell
 python run_daily.py --base-dir . --date YYYY-MM-DD --formal-only

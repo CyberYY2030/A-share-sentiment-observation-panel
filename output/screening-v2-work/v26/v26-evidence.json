@@ -1,34 +1,1149 @@
 {
-  "definition_version": "v2.6",
-  "mode": "isolated_online_backup_replay",
-  "status": "blocked_partial",
-  "requested_usable_sessions": 20,
-  "completed_usable_sessions": 0,
-  "partial_attempt": {
-    "sandbox_batch_status": {
-      "v2.5_close_final_complete": 8,
-      "v2.6_close_final_failed": 6
+  "a_history_coverage_after": {
+    "covered_dates": [
+      "2026-07-24",
+      "2026-07-27",
+      "2026-07-28",
+      "2026-07-29",
+      "2026-07-30",
+      "2026-07-31",
+      "2026-08-03",
+      "2026-08-04"
+    ],
+    "covered_sessions": 8,
+    "error_msg": null,
+    "status": "complete",
+    "target_sessions": 60
+  },
+  "a_history_coverage_before": {
+    "covered_dates": [],
+    "covered_sessions": 0,
+    "error_msg": null,
+    "status": "complete",
+    "target_sessions": 60
+  },
+  "base_dir": "C:\\Users\\TY_trader1\\.codex\\worktrees\\c912\\adata_sentiment_dashboard\\output\\screening-v2-work\\v26\\sandbox",
+  "candidate_counts": {
+    "base_breakout": 98,
+    "compression_launch": 0,
+    "counter_trend_rs": 350,
+    "momentum_anomaly": 400,
+    "second_launch": 76,
+    "strong_trend": 400
+  },
+  "daily": [
+    {
+      "batch_id": 10,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06413770220579884,
+          "reclaim_ma10": true,
+          "sec_code": "000776",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05861354204196989,
+          "reclaim_ma10": true,
+          "sec_code": "000703",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 5,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "894156bc103660c0374589a9c6f53a46572675108fda718fc6a993425d18d6ac",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-07-20"
     },
-    "failed_dates": ["2026-07-20", "2026-07-21", "2026-07-22"],
-    "failure": "compression_launch: KeyError: activity_pct_min",
-    "disposition": "source corrected; fresh 20-session replay remains required"
+    {
+      "batch_id": 13,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.12412477652750031,
+          "reclaim_ma10": true,
+          "sec_code": "002850",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11267939551121509,
+          "reclaim_ma10": true,
+          "sec_code": "300024",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.1103381127267542,
+          "reclaim_ma10": true,
+          "sec_code": "688361",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07896414790690154,
+          "reclaim_ma10": true,
+          "sec_code": "300604",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.0694767165355401,
+          "reclaim_ma10": true,
+          "sec_code": "000100",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 5
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 10,
+        "momentum_anomaly": 20,
+        "second_launch": 5,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "07012d92bff6f95e56579417217fb9da8b6e0e1f8c6638cb3c97babbfe1c4852",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-07-21"
+    },
+    {
+      "batch_id": 15,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.10390875920605847,
+          "reclaim_ma10": true,
+          "sec_code": "688141",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.0957089953713014,
+          "reclaim_ma10": true,
+          "sec_code": "688620",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.053763440860215006,
+          "reclaim_ma10": true,
+          "sec_code": "000571",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 3
+      },
+      "candidate_counts": {
+        "base_breakout": 1,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 3,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "53c3c6f717d404a241415ebc25d010a182b5bfbf9a1310865d7c4ab89b75427d",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-07-22"
+    },
+    {
+      "batch_id": 17,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06772606493206168,
+          "reclaim_ma10": true,
+          "sec_code": "002955",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06260575296108295,
+          "reclaim_ma10": true,
+          "sec_code": "002141",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 1,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "f84461230b9e07b004d76a5161729927e886d7a953faf94d138d8cbbd7065da9",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-07-23"
+    },
+    {
+      "batch_id": 18,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06781684755631279,
+          "reclaim_ma10": true,
+          "sec_code": "000017",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 1
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 1,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "40d8af44ea305d39e1d94e90b5dc9b9e82d13dc0d218ceb9fec4e338ae74dca4",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-24"
+    },
+    {
+      "batch_id": 19,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.13246116107931327,
+          "reclaim_ma10": true,
+          "sec_code": "000779",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07142857142857151,
+          "reclaim_ma10": true,
+          "sec_code": "002303",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "ea0064432ff209c71f614b19e7705299571c8c393c414397e15891e3d48a1fe2",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-27"
+    },
+    {
+      "batch_id": 20,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11118012422360246,
+          "reclaim_ma10": true,
+          "sec_code": "603990",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09126984126984128,
+          "reclaim_ma10": true,
+          "sec_code": "002303",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07380952380952388,
+          "reclaim_ma10": true,
+          "sec_code": "300765",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 3
+      },
+      "candidate_counts": {
+        "base_breakout": 1,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 3,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "968a00e21848a26947679d47c5f9465896428f72b745f0011147eef154b2ac2d",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-28"
+    },
+    {
+      "batch_id": 21,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.14152768135363347,
+          "reclaim_ma10": true,
+          "sec_code": "300588",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.059455454713835953,
+          "reclaim_ma10": true,
+          "sec_code": "300347",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "c6bf39270fb135f8dabf4612ae890ea029411b7ae43841fe0cecb38456f068fc",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-29"
+    },
+    {
+      "batch_id": 22,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07173913043478264,
+          "reclaim_ma10": true,
+          "sec_code": "300071",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 1
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 1,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "195a414ed7c6c3f9c8a9517c8639e316e48cd76393a8d2bf48a693fe7c67b2c3",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-30"
+    },
+    {
+      "batch_id": 23,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09126984126984128,
+          "reclaim_ma10": true,
+          "sec_code": "002303",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.08063063063063058,
+          "reclaim_ma10": true,
+          "sec_code": "002541",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07180851063829774,
+          "reclaim_ma10": true,
+          "sec_code": "002084",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05895953757225436,
+          "reclaim_ma10": true,
+          "sec_code": "300768",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 4
+      },
+      "candidate_counts": {
+        "base_breakout": 0,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 4,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "707aefcb70943a340da38f9cc597e6bbbaf90d62fdcda3b9e95163af6aa8baf6",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-07-31"
+    },
+    {
+      "batch_id": 24,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07310870947234582,
+          "reclaim_ma10": true,
+          "sec_code": "603367",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 1
+      },
+      "candidate_counts": {
+        "base_breakout": 5,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 1,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "44d192cdc726820ee92ff8424072d16a7882409cb6a9fbeb95e519ee58eb9667",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-08-03"
+    },
+    {
+      "batch_id": 25,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.17113176599234547,
+          "reclaim_ma10": true,
+          "sec_code": "688222",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.14156898106402171,
+          "reclaim_ma10": true,
+          "sec_code": "300149",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.12800906258850198,
+          "reclaim_ma10": true,
+          "sec_code": "688479",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.12719751809720792,
+          "reclaim_ma10": true,
+          "sec_code": "300692",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.12553191489361704,
+          "reclaim_ma10": true,
+          "sec_code": "301509",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11805676475709559,
+          "reclaim_ma10": true,
+          "sec_code": "688073",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.10000000000000009,
+          "reclaim_ma10": true,
+          "sec_code": "603519",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09805510534846018,
+          "reclaim_ma10": true,
+          "sec_code": "603466",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09801031687546058,
+          "reclaim_ma10": true,
+          "sec_code": "300251",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.0820689655172413,
+          "reclaim_ma10": true,
+          "sec_code": "688046",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07755720053835802,
+          "reclaim_ma10": true,
+          "sec_code": "688293",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.0740384615384615,
+          "reclaim_ma10": true,
+          "sec_code": "600829",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06725146198830423,
+          "reclaim_ma10": true,
+          "sec_code": "002250",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06675143038779408,
+          "reclaim_ma10": true,
+          "sec_code": "603367",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06309148264984221,
+          "reclaim_ma10": true,
+          "sec_code": "002437",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05991516436903499,
+          "reclaim_ma10": true,
+          "sec_code": "300363",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.058549825513764975,
+          "reclaim_ma10": true,
+          "sec_code": "300357",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 17
+      },
+      "candidate_counts": {
+        "base_breakout": 1,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 17,
+        "strong_trend": 20
+      },
+      "error": null,
+      "input_fingerprint": "2f12fa6763da23f24b214425cd69da3ac6af5e8221ae054b4872d1be80f6cd72",
+      "reused": true,
+      "status": "complete",
+      "trade_date": "2026-08-04"
+    },
+    {
+      "batch_id": 27,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.17211703958691915,
+          "reclaim_ma10": true,
+          "sec_code": "688333",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.1253381424706944,
+          "reclaim_ma10": true,
+          "sec_code": "300149",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.12484848484848488,
+          "reclaim_ma10": true,
+          "sec_code": "301165",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11559778305621538,
+          "reclaim_ma10": true,
+          "sec_code": "300199",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11176470588235288,
+          "reclaim_ma10": true,
+          "sec_code": "688238",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.1103343465045592,
+          "reclaim_ma10": true,
+          "sec_code": "301509",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09842748980780436,
+          "reclaim_ma10": true,
+          "sec_code": "688488",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07779578606158821,
+          "reclaim_ma10": true,
+          "sec_code": "603466",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06834532374100732,
+          "reclaim_ma10": true,
+          "sec_code": "000034",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06680805938494161,
+          "reclaim_ma10": true,
+          "sec_code": "300363",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05431754874651806,
+          "reclaim_ma10": true,
+          "sec_code": "002414",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 11
+      },
+      "candidate_counts": {
+        "base_breakout": 8,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 11,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "3233f7013112f870705d8397cd45bf42c23043859c132372c6f53047b2730466",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-05"
+    },
+    {
+      "batch_id": 30,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.1365606936416185,
+          "reclaim_ma10": true,
+          "sec_code": "300204",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09712121212121205,
+          "reclaim_ma10": true,
+          "sec_code": "301165",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09494872768704898,
+          "reclaim_ma10": true,
+          "sec_code": "301367",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07665505226480829,
+          "reclaim_ma10": true,
+          "sec_code": "301273",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.060287081339712834,
+          "reclaim_ma10": true,
+          "sec_code": "601918",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 5
+      },
+      "candidate_counts": {
+        "base_breakout": 5,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 5,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "b9ef020ee0a1379d28f5df5734cefee16385fc648306949da1324131c31d584e",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-06"
+    },
+    {
+      "batch_id": 32,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.13168487636572745,
+          "reclaim_ma10": true,
+          "sec_code": "603983",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11048505634492889,
+          "reclaim_ma10": true,
+          "sec_code": "002432",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 4,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "d432d9ce443f5f434c011bd87792c0146f5b52376f5dc05aea8b650df2d95a67",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-07"
+    },
+    {
+      "batch_id": 33,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.09620253164556969,
+          "reclaim_ma10": true,
+          "sec_code": "002422",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07862068965517244,
+          "reclaim_ma10": true,
+          "sec_code": "300040",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07342342342342334,
+          "reclaim_ma10": true,
+          "sec_code": "002541",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.07272727272727275,
+          "reclaim_ma10": true,
+          "sec_code": "603519",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06622768510389232,
+          "reclaim_ma10": true,
+          "sec_code": "688506",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05724240915878542,
+          "reclaim_ma10": true,
+          "sec_code": "301273",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.054443157372166096,
+          "reclaim_ma10": true,
+          "sec_code": "301293",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 7
+      },
+      "candidate_counts": {
+        "base_breakout": 20,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 7,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "f58c04f9749773b8a5fa135e60564cd4298470d72d2f8bd8f41915282cee3bdf",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-10"
+    },
+    {
+      "batch_id": 36,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.1352941176470588,
+          "reclaim_ma10": true,
+          "sec_code": "300105",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06645316253002398,
+          "reclaim_ma10": true,
+          "sec_code": "300164",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.05015873015873007,
+          "reclaim_ma10": true,
+          "sec_code": "300049",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 3
+      },
+      "candidate_counts": {
+        "base_breakout": 5,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 3,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "9d94ae5004afb1dda44441446d1afe143c270e359baa7108d5e8bae36871a42a",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-11"
+    },
+    {
+      "batch_id": 38,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.10784313725490191,
+          "reclaim_ma10": true,
+          "sec_code": "300105",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.057538237436270956,
+          "reclaim_ma10": true,
+          "sec_code": "002043",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 16,
+        "compression_launch": 0,
+        "counter_trend_rs": 20,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "2320b751fd565dd669b5b8488419a53eac33ab2ffeacb383cbed262dbd41d491",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-12"
+    },
+    {
+      "batch_id": 40,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.0779896013864817,
+          "reclaim_ma10": true,
+          "sec_code": "603118",
+          "state": "再启动"
+        },
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.06921153280376591,
+          "reclaim_ma10": true,
+          "sec_code": "600809",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 2
+      },
+      "candidate_counts": {
+        "base_breakout": 17,
+        "compression_launch": 0,
+        "counter_trend_rs": 0,
+        "momentum_anomaly": 20,
+        "second_launch": 2,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "47796ee06c93073c0b7a8f421c75dcf954581ae23c898b0ffe8cfab75d6a1da7",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-13"
+    },
+    {
+      "batch_id": 41,
+      "c_retriggers": [
+        {
+          "activity_expand": true,
+          "pullback_pct": -0.11673016972635952,
+          "reclaim_ma10": true,
+          "sec_code": "300779",
+          "state": "再启动"
+        }
+      ],
+      "c_state_counts": {
+        "再启动": 1
+      },
+      "candidate_counts": {
+        "base_breakout": 9,
+        "compression_launch": 0,
+        "counter_trend_rs": 0,
+        "momentum_anomaly": 20,
+        "second_launch": 1,
+        "strong_trend": 20
+      },
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "input_fingerprint": "74b0d759bb40dfa786035f840e0eefa4ab98ce6a1a68134613100814f7f40d0c",
+      "reused": false,
+      "status": "failed",
+      "trade_date": "2026-08-14"
+    }
+  ],
+  "empty": 0,
+  "empty_by_strategy": {
+    "base_breakout": 6,
+    "compression_launch": 20,
+    "counter_trend_rs": 2,
+    "momentum_anomaly": 0,
+    "second_launch": 0,
+    "strong_trend": 0
   },
-  "funnel": {
-    "universe": null,
-    "structure": null,
-    "trigger": null,
-    "eligible": null,
-    "top20": null,
-    "reason": "No v2.6 complete batch exists; values are intentionally not inferred from failed runs."
+  "evidence_schema_version": 2,
+  "failed": 12,
+  "failures": [
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-07-20"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-07-21"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-07-22"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-07-23"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-05"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-06"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-07"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-10"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-11"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-12"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-13"
+    },
+    {
+      "error": "failed=compression_launch:KeyError: 'activity_pct_min'",
+      "status": "failed",
+      "trade_date": "2026-08-14"
+    }
+  ],
+  "generator": {
+    "git_commit": "944ac514ebbcc8e5e26aaa1720698eccde5c1a23",
+    "source_path": "mining/history_bootstrap.py",
+    "source_sha256": "B9A7C8BA56BBF1AF90CE662F55998E1A4C3C14C36A0D83C14BD42218A909F575"
   },
-  "capability_counts": null,
-  "b_subtype_dedup": null,
-  "data_gap_status": "formal production batches stop at 2026-08-17; 2026-08-18 partial and 2026-08-19 missing were not treated as close-ready.",
-  "source_sha256": {
-    "a_share_mvp.db": "77c4a00660fe9bc398a69a5dfda22fddae42faef0e4af11591c34187f35a6464",
-    "ths_concept.db": "837db4226ab1ab1f807163d8cec99ab35211e1d64371e682b7de30315f323b65",
-    "etf_mvp.db": "721ed4a41372b582189e93bd9363f343fc4eb9314aaed9f5a9a3005251a1bf28",
-    "mining_mvp.db": "ee2fd0419b3a0396ea471be364bbf63e8d543eb3c7affdc8169a7afe52d6e6cc"
+  "increments": {
+    "candidates": {
+      "after": 30136,
+      "before": 29618,
+      "delta": 518
+    },
+    "outcomes": {
+      "after": 25061,
+      "before": 25061,
+      "delta": 0
+    },
+    "pullback_state_history": {
+      "after": 1937,
+      "before": 1906,
+      "delta": 31
+    },
+    "selection_batches": {
+      "after": 41,
+      "before": 8,
+      "delta": 33
+    },
+    "strategy_runs": {
+      "after": 2626,
+      "before": 2578,
+      "delta": 48
+    }
   },
-  "source_hash_before_equals_after": true
+  "manifest": {
+    "base_dir": "C:\\Users\\TY_trader1\\.codex\\worktrees\\c912\\adata_sentiment_dashboard\\output\\screening-v2-work\\v26\\sandbox",
+    "definition_version": "v2.6",
+    "schema_version": 1,
+    "sessions": 20,
+    "source_sha256": {
+      "a_share_mvp.db": "6E78A98579948E2FE368EA0A934E35AE5F61215165781E04D25C63532AAA12A7",
+      "etf_mvp.db": "DDADEDDC6EBB7BC665E6E7073A29D7873C03AB952F366CDD9D938E42CBFC9186",
+      "mining_mvp.db": "EB07DF4B6F7EE4D26CEE804041D8B789F69562E407AF9D6FFAD2035DE79D47F1",
+      "ths_concept.db": "B0AD51AD8E369479B88CF5CCFA87A2588C24BA5FFD97ED4348876FCE4F49507F"
+    },
+    "target_date": "2026-08-17"
+  },
+  "manifest_path": "C:\\Users\\TY_trader1\\.codex\\worktrees\\c912\\adata_sentiment_dashboard\\output\\screening-v2-work\\v26\\sandbox\\v26-shadow.db.manifest.json",
+  "mode": "history_bootstrap_dry_run",
+  "processed": 8,
+  "replay_dates": [
+    "2026-07-20",
+    "2026-07-21",
+    "2026-07-22",
+    "2026-07-23",
+    "2026-07-24",
+    "2026-07-27",
+    "2026-07-28",
+    "2026-07-29",
+    "2026-07-30",
+    "2026-07-31",
+    "2026-08-03",
+    "2026-08-04",
+    "2026-08-05",
+    "2026-08-06",
+    "2026-08-07",
+    "2026-08-10",
+    "2026-08-11",
+    "2026-08-12",
+    "2026-08-13",
+    "2026-08-14"
+  ],
+  "reused_batches": 8,
+  "sessions_requested": 20,
+  "shadow_created": false,
+  "shadow_mining_db": "C:\\Users\\TY_trader1\\.codex\\worktrees\\c912\\adata_sentiment_dashboard\\output\\screening-v2-work\\v26\\sandbox\\v26-shadow.db",
+  "skipped_insufficient_history": 0,
+  "source_sha256_after": {
+    "a_share_mvp.db": "6E78A98579948E2FE368EA0A934E35AE5F61215165781E04D25C63532AAA12A7",
+    "etf_mvp.db": "DDADEDDC6EBB7BC665E6E7073A29D7873C03AB952F366CDD9D938E42CBFC9186",
+    "mining_mvp.db": "EB07DF4B6F7EE4D26CEE804041D8B789F69562E407AF9D6FFAD2035DE79D47F1",
+    "ths_concept.db": "B0AD51AD8E369479B88CF5CCFA87A2588C24BA5FFD97ED4348876FCE4F49507F"
+  },
+  "source_sha256_before": {
+    "a_share_mvp.db": "6E78A98579948E2FE368EA0A934E35AE5F61215165781E04D25C63532AAA12A7",
+    "etf_mvp.db": "DDADEDDC6EBB7BC665E6E7073A29D7873C03AB952F366CDD9D938E42CBFC9186",
+    "mining_mvp.db": "EB07DF4B6F7EE4D26CEE804041D8B789F69562E407AF9D6FFAD2035DE79D47F1",
+    "ths_concept.db": "B0AD51AD8E369479B88CF5CCFA87A2588C24BA5FFD97ED4348876FCE4F49507F"
+  },
+  "target_date": "2026-08-17"
 }

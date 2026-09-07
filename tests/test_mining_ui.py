@@ -5,6 +5,7 @@ import sqlite3
 import datetime as dt
 import hashlib
 import time
+import tomllib
 from unittest import mock
 
 import pandas as pd
@@ -13,6 +14,14 @@ from tests._mining_test_helpers import create_sample_market_dbs, trading_days
 
 
 class MiningUiSmokeTests(unittest.TestCase):
+    def test_project_streamlit_port_does_not_share_crypto_dashboard_port(self) -> None:
+        project_root = Path(__file__).resolve().parents[1]
+        config_path = project_root / ".streamlit" / "config.toml"
+
+        self.assertTrue(config_path.is_file(), "project Streamlit config is missing")
+        config = tomllib.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(config.get("server", {}).get("port"), 8502)
+
     def test_daily_matrics_upsert_is_idempotent_for_identical_rows(self) -> None:
         from app_panel import upsert_daily_matrics
 

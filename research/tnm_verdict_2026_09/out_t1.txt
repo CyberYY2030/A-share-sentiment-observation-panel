@@ -1,0 +1,23 @@
+=== turnover ordering, big-yang non-limit, pos>=0.8 (the actual TARGET pool) ===
+    Q1 low                     n=   803 day= 238  turn_med   2.1%  gap_excess -0.2175%  HAC_t  -2.07  d>0 45.0%
+    Q2                         n=   800 day= 320  turn_med   4.3%  gap_excess -0.2123%  HAC_t  -2.94  d>0 40.6%
+    Q3                         n=   801 day= 326  turn_med   6.8%  gap_excess -0.2342%  HAC_t  -1.92  d>0 36.5%
+    Q4                         n=   801 day= 378  turn_med  10.7%  gap_excess -0.3828%  HAC_t  -3.34  d>0 38.1%
+    Q5 high                    n=   802 day= 416  turn_med  19.8%  gap_excess -1.4503%  HAC_t  -9.60  d>0 25.0%
+
+=== same ordering on ordinary up days 0<ret<=7%%, pos>=0.8 (placebo) ===
+    Q1 low                     n= 15649 day= 786  turn_med   0.5%  gap_excess +0.0011%  HAC_t  +0.06  d>0 46.9%
+    Q2                         n= 15659 day= 768  turn_med   1.1%  gap_excess +0.0018%  HAC_t  +0.09  d>0 48.3%
+    Q3                         n= 15645 day= 772  turn_med   1.8%  gap_excess +0.0446%  HAC_t  +2.14  d>0 51.3%
+    Q4                         n= 15644 day= 783  turn_med   2.9%  gap_excess +0.0024%  HAC_t  +0.10  d>0 48.1%
+    Q5 high                    n= 15643 day= 818  turn_med   6.3%  gap_excess -0.3350%  HAC_t -12.59  d>0 27.3%
+
+=== turnover ordering INSIDE matched turnover bands: is it the move or the turnover? ===
+    Q1  small<=7%              n= 16428 day= 787  turn_med   0.5%  gap_excess +0.0032%  HAC_t  +0.19  d>0 48.4%
+    Q2  small<=7%              n= 16316 day= 769  turn_med   1.1%  gap_excess +0.0066%  HAC_t  +0.31  d>0 49.4%
+    Q3  small<=7%              n= 16114 day= 775  turn_med   1.9%  gap_excess +0.0437%  HAC_t  +2.16  d>0 52.4%
+    Q3  big>7%                 n=   328 day= 117  turn_med   2.0%  gap_excess -0.1229%  HAC_t  -0.95  d>0 48.7%
+    Q4  small<=7%              n= 15709 day= 787  turn_med   3.1%  gap_excess -0.0050%  HAC_t  -0.20  d>0 46.4%
+    Q4  big>7%                 n=   736 day= 273  turn_med   3.3%  gap_excess -0.2889%  HAC_t  -3.04  d>0 41.0%
+    Q5  small<=7%              n= 13673 day= 817  turn_med   6.8%  gap_excess -0.3634%  HAC_t -12.29  d>0 27.4%
+    Q5  big>7%                 n=  2776 day= 644  turn_med   9.7%  gap_excess -0.8692%  HAC_t  -9.87  d>0 29.2%
