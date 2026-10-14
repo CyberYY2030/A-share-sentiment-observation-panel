@@ -10,7 +10,7 @@ class RuntimePathsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = build_runtime_paths(tmp)
 
-            base = Path(tmp)
+            base = Path(tmp).resolve()  # macOS: /var -> /private/var
             self.assertEqual(paths.data_dir, str(base / "data"))
             self.assertEqual(paths.stock_db, str(base / "data" / "a_share_mvp.db"))
             self.assertEqual(paths.concept_db, str(base / "data" / "ths_concept.db"))
@@ -21,7 +21,7 @@ class RuntimePathsTests(unittest.TestCase):
         from runtime_paths import build_runtime_paths
 
         with tempfile.TemporaryDirectory() as tmp:
-            base = Path(tmp)
+            base = Path(tmp).resolve()
             legacy_stock = base / "a_share_mvp.db"
             legacy_concept = base / "ths_concept.db"
             legacy_etf = base / "etf_mvp.db"
