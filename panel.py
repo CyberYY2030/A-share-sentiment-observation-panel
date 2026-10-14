@@ -675,8 +675,15 @@ def get_remote_latest_close_day_concept(concept_db: Optional[str]) -> Optional[s
     return None
 
 
-def calc_backfill_days(local_d: Optional[str], remote_d: Optional[str], cap: int = 15) -> int:
-    """Small incremental backfill: missing_days + buffer, capped for performance."""
+def calc_backfill_days(local_d: Optional[str], remote_d: Optional[str], cap: int = 60) -> int:
+    """Incremental backfill: calendar days missing + 2-day buffer, at least 5.
+
+    Calendar days >= trading days, so the window always reaches back to local_d.
+    The cap used to be 15: after a break longer than ~3 weeks only the last 15
+    trading days were fetched and the gap before them was never filled. The
+    stock and concept scripts make one request per security whatever the
+    window (the ETF script makes one per day), so a wider window costs little.
+    """
     if not remote_d:
         return 0
     if not local_d:
@@ -740,9 +747,9 @@ def maybe_backfill_all(stock_db: str, concept_db: Optional[str], etf_db: Optiona
         except Exception:
             local_stock_ref = local.get("stock") or local.get("index")
 
-    days_stock = 60 if force else calc_backfill_days(local_stock_ref, remote_stock, cap=15)
-    days_concept = 60 if force else calc_backfill_days(local.get("concept"), remote_concept, cap=15)
-    days_etf = 60 if force else calc_backfill_days(local.get("etf"), remote_etf, cap=15)
+    days_stock = 60 if force else calc_backfill_days(local_stock_ref, remote_stock)
+    days_concept = 60 if force else calc_backfill_days(local.get("concept"), remote_concept)
+    days_etf = 60 if force else calc_backfill_days(local.get("etf"), remote_etf)
 
     need_stock = force or _is_behind(local.get("stock"), remote_stock) or _is_behind(local.get("index"), remote_stock)
     need_concept = force or _is_behind(local.get("concept"), remote_concept)
@@ -1092,8 +1099,9 @@ def repair_latest_trade_day_daily(stock_db: str, concept_db: Optional[str], etf_
     deleted_i = _delete_rows_for_trade_date_stock_index(stock_db, expected_day, codes=list(REQUIRED_INDEX_CODES))
     logs.append(f"delete_index_rows({expected_day})={deleted_i}")
 
-    # Re-run daily backfills (force=True)
-    local_after, bflogs = maybe_backfill_all(stock_db, concept_db, etf_db, force=True)
+    # The deleted day now reads as "behind", so an incremental run refetches it
+    # (stock rows for the last few days are overwritten too) without a 60-day rebuild.
+    local_after, bflogs = maybe_backfill_all(stock_db, concept_db, etf_db, force=False)
     logs.extend(bflogs[-200:])  # keep recent tail
     logs.append(f"local_after={local_after}")
 
@@ -3618,7 +3626,10 @@ def main():
     st.sidebar.subheader("数据库日线更新（adata/baostock）")
     auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算", value=True)
     validate_db_btn = st.sidebar.button("核验DB最新交易日数据")
-    manual_daily_sync = st.sidebar.button("手动更新DB（日线接口）")
+    manual_daily_sync = st.sidebar.button(
+        "手动更新DB（日线接口）",
+        help="只补落后的交易日。要整段重拉 60 日，勾选上面的“强制全量 backfill”。",
+    )
     repair_latest_btn = st.sidebar.button("修复最新交易日（日线接口，覆写当日数据）")
 
     if "daily_sync_log" not in st.session_state:
@@ -3635,7 +3646,7 @@ def main():
     # Manual daily update (no snapshot write)
     if manual_daily_sync:
         with st.spinner("正在使用日收盘接口更新数据库（baostock/adata）..."):
-            local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=True)
+            local_after, logs = maybe_backfill_all(stock_db, concept_db, etf_db, force=False)
         st.session_state["daily_sync_log"] = logs
         st.session_state["db_validate_result"] = validate_db_latest_day(
             stock_db=stock_db, concept_db=concept_db, tz_offset_hours=int(tz_offset)
