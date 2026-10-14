@@ -88,14 +88,17 @@ class PanelSmokeTests(unittest.TestCase):
         self.assertIn("概念名称", theme.columns)
 
     def test_diagnostics_hidden_until_debug_is_on(self) -> None:
-        at = self._run(dt.datetime(2026, 10, 13, 20, 0))
+        now = dt.datetime(2026, 10, 13, 20, 0)
+        at = self._run(now)
         main_expanders = [e.label for e in at.main.expander]
         self.assertNotIn("QVIX 调试", main_expanders)
         self.assertNotIn("数据核验（成交额/索引）", main_expanders)
 
         debug = [c for c in at.checkbox if c.label == "显示调试信息"]
         self.assertEqual(len(debug), 1)
-        debug[0].check().run()
+        # Keep the clock fixed on the rerun too; the real clock can be in trading hours.
+        with mock.patch.object(panel, "_now_with_tz_offset", return_value=now):
+            debug[0].check().run()
         self.assertEqual(list(at.exception), [])
         main_expanders = [e.label for e in at.main.expander]
         self.assertIn("QVIX 调试", main_expanders)
