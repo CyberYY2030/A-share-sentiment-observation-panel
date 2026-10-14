@@ -414,6 +414,12 @@ def sql_max_date(con: sqlite3.Connection, sql: str, params: Tuple = ()) -> Optio
         return None
 
 
+def _sql_scalar(con: sqlite3.Connection, sql: str, params: Tuple = ()) -> Any:
+    """First column of the first row, or None."""
+    r = con.execute(sql, params).fetchone()
+    return r[0] if r else None
+
+
 def get_local_last_dates(stock_db: str, concept_db: Optional[str], etf_db: Optional[str]) -> Dict[str, Optional[str]]:
     out: Dict[str, Optional[str]] = {"stock": None, "index": None, "concept": None, "etf": None}
     try:
@@ -1196,6 +1202,22 @@ def safe_to_float(x):
     except Exception:
         return np.nan
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cn_trade_dates_sina() -> pd.Series:
+    """Sina trade calendar via akshare; empty when unavailable.
+
+    Cached because every rerun asks "is today a trading day" several times.
+    """
+    try:
+        import akshare as ak  # type: ignore
+        cal = ak.tool_trade_date_hist_sina()
+        if cal is None or cal.empty:
+            return pd.Series(dtype="datetime64[ns]")
+        return pd.to_datetime(cal[cal.columns[0]], errors="coerce").dropna().sort_values().reset_index(drop=True)
+    except Exception:
+        return pd.Series(dtype="datetime64[ns]")
+
+
 def get_latest_cn_trade_date(today: Optional[pd.Timestamp] = None) -> Optional[pd.Timestamp]:
     """
     Get latest China A-share trading date <= today using akshare trade calendar if available.
@@ -1204,18 +1226,10 @@ def get_latest_cn_trade_date(today: Optional[pd.Timestamp] = None) -> Optional[p
     try:
         if today is None:
             today = pd.Timestamp(pd.Timestamp.today().date())
-        try:
-            import akshare as ak  # type: ignore
-            if hasattr(ak, "tool_trade_date_hist_sina"):
-                cal = ak.tool_trade_date_hist_sina()
-                if cal is not None and not cal.empty:
-                    col = cal.columns[0]
-                    s = pd.to_datetime(cal[col], errors="coerce").dropna()
-                    s = s[s <= pd.Timestamp(today.date())]
-                    if not s.empty:
-                        return pd.Timestamp(s.max().date())
-        except Exception:
-            pass
+        s = _cn_trade_dates_sina()
+        s = s[s <= pd.Timestamp(today.date())]
+        if not s.empty:
+            return pd.Timestamp(s.max().date())
         # fallback: if weekend, use last Friday
         d = pd.Timestamp(today.date())
         if d.weekday() >= 5:
@@ -2560,9 +2574,9 @@ def last_completed_trade_date_cn(now_cn: Optional[dt.datetime] = None, tz_offset
         if _today_trade_date_cn(now_cn, tz_offset_hours) is not None:
             if now_cn.time() >= CN_CLOSE_DATA_READY_TIME:
                 return today
-            prev = get_cn_last_trade_date(today - pd.Timedelta(days=1))
+            prev = get_latest_cn_trade_date(today - pd.Timedelta(days=1))
             return prev if prev is not None else today
-        last_td = get_cn_last_trade_date(today)
+        last_td = get_latest_cn_trade_date(today)
         return last_td if last_td is not None else today
     except Exception:
         # very defensive fallback
