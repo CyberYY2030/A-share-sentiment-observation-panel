@@ -1356,6 +1356,17 @@ def normalize_date(x) -> Optional[pd.Timestamp]:
         return None
 
 
+def normalize_date_series(values: pd.Series) -> pd.Series:
+    """Parse repeated dates once, retaining the scalar parser's formats and dtype."""
+    if not (isinstance(values.dtype, pd.StringDtype) or pd.api.types.is_datetime64_any_dtype(values.dtype)):
+        return values.apply(normalize_date)
+    if values.empty:
+        return values.apply(normalize_date)
+    unique = values.drop_duplicates()
+    parsed = unique.apply(normalize_date)
+    return values.map(pd.Series(parsed.array, index=unique))
+
+
 def digits_code(x: str) -> str:
     if x is None:
         return ""
@@ -1525,7 +1536,7 @@ def load_stock_cross_section(con: sqlite3.Connection, dates: List[pd.Timestamp])
       AND {schema['sec_type']} = 'stock'
     """
     df = df_from_sql(con, sql, tuple(date_strs))
-    df["trade_date"] = df["trade_date_raw"].apply(normalize_date)
+    df["trade_date"] = normalize_date_series(df["trade_date_raw"])
     df["sec_code"] = df["sec_code"].apply(canonical_code)
     df["change_pct"] = df["change_pct"].apply(safe_to_float)
     df["amount"] = df["amount"].apply(safe_to_float)
@@ -1555,7 +1566,7 @@ def load_index_series(con: sqlite3.Connection, codes: List[str], dates: List[pd.
     df = df_from_sql(con, sql, tuple(date_strs))
     if df.empty:
         return df
-    df["trade_date"] = df["trade_date_raw"].apply(normalize_date)
+    df["trade_date"] = normalize_date_series(df["trade_date_raw"])
     df["sec_code"] = df["sec_code_raw"].apply(canonical_code)
     df["change_pct"] = df["change_pct"].apply(safe_to_float)
     df["amount"] = df["amount"].apply(safe_to_float)
@@ -1652,7 +1663,7 @@ def build_market_turnover(
     if index_df is not None and not index_df.empty and "amount" in index_df.columns:
         t = index_df.copy()
         if "trade_date" in t.columns:
-            t["trade_date"] = t["trade_date"].apply(normalize_date)
+            t["trade_date"] = normalize_date_series(t["trade_date"])
         t["sec_code"] = t["sec_code"].apply(canonical_code)
         t["amount"] = t["amount"].apply(safe_to_float)
         t = t.dropna(subset=["trade_date", "sec_code"])
@@ -1667,7 +1678,7 @@ def build_market_turnover(
     if stock_df is not None and not stock_df.empty and "amount" in stock_df.columns:
         s = stock_df.copy()
         if "trade_date" in s.columns:
-            s["trade_date"] = s["trade_date"].apply(normalize_date)
+            s["trade_date"] = normalize_date_series(s["trade_date"])
         s["amount"] = s["amount"].apply(safe_to_float)
         s = s.dropna(subset=["trade_date"])
         stk_amt = s.groupby("trade_date")["amount"].sum().reindex(dates).astype(float)
@@ -1812,7 +1823,7 @@ def load_etf_total_df(etf_db_path: str) -> pd.DataFrame:
         sql = f"SELECT {', '.join(sel)} FROM {table} ORDER BY {date_col}"
         df = df_from_sql(con, sql)
 
-        df["trade_date"] = df["d"].apply(normalize_date)
+        df["trade_date"] = normalize_date_series(df["d"])
         for c in ["sse_share_total", "szse_share_total", "total_share"]:
             df[c] = df[c].apply(safe_to_float)
 
@@ -1897,7 +1908,7 @@ def compute_daily_sentiment(
 
     df = stock_df.copy()
     df = df.dropna(subset=["trade_date", "change_pct", "amount"]).copy()
-    df["trade_date"] = df["trade_date"].apply(normalize_date)
+    df["trade_date"] = normalize_date_series(df["trade_date"])
     df["change_pct"] = df["change_pct"].apply(safe_to_float)
     df["amount"] = df["amount"].apply(safe_to_float)
 
@@ -1931,7 +1942,7 @@ def compute_daily_sentiment(
     rel = pd.Series(index=dates, dtype=float)
     if index_df is not None and not index_df.empty:
         idx = index_df.copy()
-        idx["trade_date"] = idx["trade_date"].apply(normalize_date)
+        idx["trade_date"] = normalize_date_series(idx["trade_date"])
         idx["sec_code"] = idx["sec_code"].apply(canonical_code)
         idx["change_pct"] = idx["change_pct"].apply(safe_to_float)
         idx["close"] = idx.get("close", np.nan)
@@ -2068,7 +2079,7 @@ def load_concept_kline(con: sqlite3.Connection, dates: List[pd.Timestamp], table
     if df.empty:
         return df
 
-    df["trade_date"] = df["trade_date_raw"].apply(normalize_date)
+    df["trade_date"] = normalize_date_series(df["trade_date_raw"])
     df["concept_code"] = df["concept_code_raw"].apply(canonical_code)
     df["change_pct"] = df["change_pct"].apply(safe_to_float)
     df["amount"] = df["amount"].apply(safe_to_float)
@@ -2150,7 +2161,7 @@ def compute_theme_panel(
         return pd.DataFrame(), ["concept_df empty for selected dates"]
 
     df = concept_df.copy()
-    df["trade_date"] = df["trade_date"].apply(normalize_date)
+    df["trade_date"] = normalize_date_series(df["trade_date"])
     df = df.dropna(subset=["trade_date", "concept_code"]).sort_values(["concept_code", "trade_date"])
     df["concept_code"] = df["concept_code"].apply(canonical_code)
 
@@ -3309,7 +3320,7 @@ def compute_intraday_snapshot_row(
         return None, qvix_info, ["daily empty: cannot build intraday snapshot"]
 
     d = daily.copy().sort_values("trade_date")
-    d["trade_date"] = d["trade_date"].apply(normalize_date)
+    d["trade_date"] = normalize_date_series(d["trade_date"])
 
     latest_dt = d["trade_date"].max()
     latest_row = d[d["trade_date"] == latest_dt].iloc[-1]
@@ -3882,12 +3893,12 @@ def main():
     # DB 侧可用的最新日期（分别对 stock/index/concept）
     db_latest_stock_dt = pd.Timestamp(latest_dt) if latest_dt is not None else today_ts
     try:
-        _idx_max = index_df["trade_date"].apply(normalize_date).max() if (index_df is not None and not index_df.empty and "trade_date" in index_df.columns) else db_latest_stock_dt
+        _idx_max = normalize_date_series(index_df["trade_date"]).max() if (index_df is not None and not index_df.empty and "trade_date" in index_df.columns) else db_latest_stock_dt
         db_latest_index_dt = pd.Timestamp(_idx_max) if _idx_max is not None else db_latest_stock_dt
     except Exception:
         db_latest_index_dt = db_latest_stock_dt
     try:
-        _c_max = concept_df["trade_date"].apply(normalize_date).max() if (concept_df is not None and not concept_df.empty and "trade_date" in concept_df.columns) else db_latest_stock_dt
+        _c_max = normalize_date_series(concept_df["trade_date"]).max() if (concept_df is not None and not concept_df.empty and "trade_date" in concept_df.columns) else db_latest_stock_dt
         db_latest_concept_dt = pd.Timestamp(_c_max) if _c_max is not None else db_latest_stock_dt
     except Exception:
         db_latest_concept_dt = db_latest_stock_dt
@@ -3909,7 +3920,7 @@ def main():
 
                 # —— close 口径：同一天 000001 / 399001 成交额（原始+缩放到元）——
                 idx_norm = index_df.copy()
-                idx_norm["trade_date"] = idx_norm["trade_date"].apply(normalize_date)
+                idx_norm["trade_date"] = normalize_date_series(idx_norm["trade_date"])
                 idx_norm["sec_code"] = idx_norm["sec_code"].apply(canonical_code)
 
                 sub = idx_norm[
@@ -3949,7 +3960,7 @@ def main():
                 # —— concept 当天成交额（原始口径统计，便于肉眼判断单位）——
                 if concept_df is not None and (not concept_df.empty) and ("amount" in concept_df.columns) and ("trade_date" in concept_df.columns):
                     ctmp = concept_df.copy()
-                    ctmp["trade_date"] = ctmp["trade_date"].apply(normalize_date)
+                    ctmp["trade_date"] = normalize_date_series(ctmp["trade_date"])
                     ca = ctmp[ctmp["trade_date"] == panel_close_dt]["amount"].apply(safe_to_float)
                     if not ca.empty:
                         st.write("concept_amount_raw_median：", float(ca.median()) if np.isfinite(ca.median()) else None)
@@ -4028,7 +4039,7 @@ def main():
                 if has_today_in_db and len(dates) >= 2:
                     ref_dt_main = dates[-2]
                 tmp = index_df.copy()
-                tmp["trade_date"] = tmp["trade_date"].apply(normalize_date)
+                tmp["trade_date"] = normalize_date_series(tmp["trade_date"])
                 tmp["sec_code"] = tmp["sec_code"].astype(str).apply(canonical_code)
                 for _c in [CODE_HS300, CODE_ZZ1000]:
                     hit = tmp[(tmp["sec_code"] == _c) & (tmp["trade_date"] == ref_dt_main)]
@@ -4262,7 +4273,7 @@ def main():
 
                 # prev close per concept from the close reference day (panel_close_dt)
                 _base = concept_df.copy()
-                _base["trade_date"] = _base["trade_date"].apply(normalize_date)
+                _base["trade_date"] = normalize_date_series(_base["trade_date"])
 
                 prev = _base[_base["trade_date"] == panel_close_dt][["concept_code", "close"]].copy()
                 prev["concept_code"] = prev["concept_code"].apply(canonical_code)
