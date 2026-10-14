@@ -3210,8 +3210,6 @@ def _etf_proxy_pct(code: str, etf_spot: pd.DataFrame) -> float:
     return float(safe_to_float(hit.iloc[0]))
 
 @st.cache_data(ttl=60, show_spinner=False)
-
-@st.cache_data(ttl=60, show_spinner=False)
 def ak_fetch_index_min_em(code: str) -> pd.DataFrame:
     """Index minute data from Eastmoney (AkShare), used as fallback when spot list misses codes."""
     ak, err = try_import_akshare()
@@ -3224,6 +3222,7 @@ def ak_fetch_index_min_em(code: str) -> pd.DataFrame:
         return ak.index_zh_a_hist_min_em(symbol=str(code), period="1")
 
 
+@st.cache_data(ttl=60, show_spinner=False)
 def ak_fetch_500etf_qvix_min() -> pd.DataFrame:
     """500ETF QVIX intraday series (AkShare)."""
     ak, err = try_import_akshare()
