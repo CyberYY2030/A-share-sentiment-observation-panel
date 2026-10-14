@@ -18,6 +18,12 @@ from tests.synthetic_db import make_concept_db, make_etf_db, make_stock_db, trad
 
 
 class OfflineQuoteTests(unittest.TestCase):
+    def setUp(self):
+        # A probe that hits the deadline or finds the server unreachable marks baostock down for a while.
+        patcher = mock.patch.object(panel, "_baostock_down_until", 0.0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_baostock_probes_bound_reads_and_restore_socket_defaults(self):
         import baostock as bs
         original = socket.getdefaulttimeout()
@@ -59,7 +65,8 @@ class OfflineQuoteTests(unittest.TestCase):
             ("try_get_latest_kline_day_baostock", ("sh.000001",), None),
         ):
             with self.subTest(probe=name), \
-                 mock.patch.object(panel.socket, "create_connection", side_effect=OSError("unreachable")), \
+                 mock.patch.object(panel, "_baostock_down_until", 0.0), \
+                 mock.patch.object(panel.socket, "create_connection", side_effect=OSError("unreachable")) as reach, \
                  mock.patch.object(bs, "login") as login, \
                  mock.patch.object(bs, "logout") as logout:
                 before = socket.getdefaulttimeout()
@@ -67,6 +74,54 @@ class OfflineQuoteTests(unittest.TestCase):
                 login.assert_not_called()
                 logout.assert_not_called()
                 self.assertEqual(socket.getdefaulttimeout(), before)
+                # The next probe in the same render does not try again.
+                self.assertEqual(getattr(panel, name)(*args), unavailable)
+                self.assertEqual(reach.call_count, 1)
+
+    def test_server_closing_without_reply_is_cut_off_by_the_deadline(self):
+        # The SDK's recv loop spins on b"" forever when the server closes without replying
+        # (seen live on 2026-10-14: 6.25M recv calls in 6s); the socket timeout cannot stop it.
+        from baostock.common import contants as bs_cons
+        import threading
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        self.addCleanup(server.close)
+        accepted = []
+
+        def serve():
+            while True:
+                try:
+                    conn, _ = server.accept()
+                except OSError:
+                    return
+                accepted.append(1)
+                try:
+                    conn.settimeout(1)
+                    conn.recv(65536)
+                except OSError:
+                    pass
+                conn.close()  # FIN, no reply
+
+        threading.Thread(target=serve, daemon=True).start()
+        result = []
+        with mock.patch.object(bs_cons, "BAOSTOCK_SERVER_IP", "127.0.0.1"), \
+             mock.patch.object(bs_cons, "BAOSTOCK_SERVER_PORT", server.getsockname()[1]), \
+             mock.patch.object(panel, "BAOSTOCK_PROBE_DEADLINE", 0.3):
+            probe = threading.Thread(
+                target=lambda: result.append(panel.try_get_trade_dates_baostock("2026-10-01", "2026-10-13")),
+                daemon=True)
+            started = time.monotonic()
+            probe.start()
+            probe.join(5)
+            self.assertFalse(probe.is_alive(), "probe still spinning after 5s")
+            self.assertLess(time.monotonic() - started, 3)
+            self.assertEqual(result, [[]])
+
+            seen = len(accepted)
+            self.assertIsNone(panel.try_get_last_trade_day_baostock(False))
+            self.assertEqual(len(accepted), seen)  # marked down: no new connection
 
     def test_failed_eastmoney_quote_is_cached_and_other_sources_still_work(self):
         panel._ak_fetch_a_spot_em_result.clear()

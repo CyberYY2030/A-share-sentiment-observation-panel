@@ -21,6 +21,8 @@ import subprocess
 import socket
 import requests
 import sys
+import threading
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
@@ -237,6 +239,24 @@ def run_cmd(cmd: List[str], timeout_sec: int = 3600) -> Tuple[int, str]:
 
 
 BAOSTOCK_PROBE_SOCKET_TIMEOUT = 5.0
+BAOSTOCK_PROBE_DEADLINE = 15.0
+BAOSTOCK_DOWN_SECONDS = 60.0
+_baostock_down_until = 0.0
+
+
+def _close_baostock_socket() -> None:
+    """If the server closes without replying, the SDK's recv loop spins on b"" forever; a closed socket ends it."""
+    try:
+        from baostock.common import context as bs_ctx  # type: ignore
+        sock = getattr(bs_ctx, "default_socket", None)
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+    except Exception:
+        pass
 
 
 def _baostock_reachable() -> bool:
@@ -255,18 +275,30 @@ def _baostock_reachable() -> bool:
 
 
 def _bounded_baostock_probe(unavailable):
-    """Skip the probe when the server is unreachable; otherwise bound its SDK sockets, then restore defaults."""
+    """Skip the probe when the server is unreachable or recently hung; otherwise bound its SDK sockets
+    and its total time, then restore defaults."""
     def decorate(fn):
         @wraps(fn)
         def bounded(*args, **kwargs):
-            if not _baostock_reachable():
+            global _baostock_down_until
+            if time.monotonic() < _baostock_down_until:
                 return unavailable()
+            if not _baostock_reachable():
+                _baostock_down_until = time.monotonic() + BAOSTOCK_DOWN_SECONDS
+                return unavailable()
+            fired = []
+            watchdog = threading.Timer(BAOSTOCK_PROBE_DEADLINE, lambda: (fired.append(1), _close_baostock_socket()))
+            watchdog.daemon = True
             previous = socket.getdefaulttimeout()
             try:
                 socket.setdefaulttimeout(BAOSTOCK_PROBE_SOCKET_TIMEOUT)
+                watchdog.start()
                 return fn(*args, **kwargs)
             finally:
+                watchdog.cancel()
                 socket.setdefaulttimeout(previous)
+                if fired:
+                    _baostock_down_until = time.monotonic() + BAOSTOCK_DOWN_SECONDS
         return bounded
     return decorate
 
