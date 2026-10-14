@@ -121,6 +121,37 @@ class PanelSmokeTests(unittest.TestCase):
         self.assertEqual(_metric(at, "小盘-大盘相对").value, "0.03%")
         self.assertIn("🟢", _metric(at, "动量Z").label)
 
+    def test_close_view_qvix_is_the_selected_day_close(self) -> None:
+        # During trading hours the minute series is today's live value. T-1 must show T-1's daily close.
+        rng = np.random.default_rng(7)
+        spot = pd.DataFrame({
+            "sec_code": [f"{600000 + i:06d}" for i in range(300)],
+            "change_pct": rng.normal(0, 2, 300),
+            "amount": rng.lognormal(19, 1, 300),
+        })
+        index_spot = pd.DataFrame({"sec_code": ["000300", "000852"], "change_pct": [0.50, 0.53]})
+        qdaily = pd.DataFrame({"date": ["2026-10-09", "2026-10-12", "2026-10-13", "2026-10-14"],
+                               "close": [30.0, 25.0, 27.79, 10.0]})
+        qmin = pd.DataFrame({"time": ["14:20:21"], "qvix": [99.0]})
+
+        with mock.patch.object(panel, "ak_fetch_a_spot_any", return_value=(spot, "synthetic")), \
+             mock.patch.object(panel, "ak_fetch_index_spot_any", return_value=(index_spot, "synthetic")), \
+             mock.patch.object(panel, "ak_fetch_500etf_qvix_daily", return_value=qdaily), \
+             mock.patch.object(panel, "ak_fetch_500etf_qvix_min", return_value=qmin), \
+             mock.patch.object(panel, "_now_with_tz_offset", return_value=dt.datetime(2026, 10, 14, 14, 20)):
+            at = AppTest.from_string("import panel\npanel.main()", default_timeout=120)
+            at.run()
+            self.assertEqual(_metric(at, "QVIX").value, "99.00  (100%)")  # snapshot keeps the live value
+
+            day_radio = [r for r in at.radio if r.label == "查看数据日期"][0]
+            day_radio.set_value([o for o in day_radio.options if o.startswith("T-1")][0]).run()
+
+        self.assertEqual(list(at.exception), [])
+        self.assertEqual([e.value for e in at.error], [])
+        # Closes up to 2026-10-13 are 30.0, 25.0, 27.79: two of three are <= 27.79.
+        self.assertEqual(_metric(at, "QVIX").value, "27.79  (67%)")
+        self.assertNotIn("🟢", _metric(at, "QVIX").label)
+
 
 if __name__ == "__main__":
     unittest.main()

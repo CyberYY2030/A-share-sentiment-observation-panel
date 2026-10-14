@@ -3177,6 +3177,27 @@ def _qvix_pctile(qvix_now: float, hist: pd.Series, window: int = 252) -> float:
     return float((s <= qvix_now).sum() / len(s))
 
 
+def _qvix_close_on(qdaily: pd.DataFrame, day) -> Tuple[float, float]:
+    """QVIX daily close on `day`, and its percentile over the history up to that day."""
+    target = normalize_date(day)
+    if qdaily is None or qdaily.empty or target is None:
+        return np.nan, np.nan
+    dcol = _pick_df_col(qdaily, ["date", "日期", "trade_date"])
+    vcol = _pick_df_col(qdaily, ["QVIX", "qvix", "value", "close", "收盘", "最新价"])
+    if dcol is None or vcol is None:
+        return np.nan, np.nan
+    s = pd.Series(pd.to_numeric(qdaily[vcol], errors="coerce").to_numpy(),
+                  index=pd.to_datetime(qdaily[dcol], errors="coerce"))
+    s = s[s.index.notna()]
+    s.index = s.index.normalize()
+    hist = s[s.index <= target].sort_index()
+    hit = hist[hist.index == target].dropna()
+    if hit.empty:
+        return np.nan, np.nan
+    qv = float(hit.iloc[-1])
+    return qv, _qvix_pctile(qv, hist)
+
+
 def compute_intraday_snapshot_row(
     daily: pd.DataFrame,
     weights: Dict[str, float],
@@ -3989,21 +4010,36 @@ def main():
     
     # ---- QVIX (display only; always compute) ----
     try:
-        # Try intraday first (may be all None near close); fallback to daily close.
-        qmin = ak_fetch_500etf_qvix_min()
-        qv_now = _qvix_value_from_df(qmin)
-        if not np.isfinite(qv_now):
+        if intraday_row is None:
+            # 收盘口径：取所选收盘日的日线值，和其他指标同一天（分钟线永远是今天的盘中值）。
+            qday = normalize_date(last.get("trade_date")) or panel_close_dt
             qdaily = ak_fetch_500etf_qvix_daily()
-            qv_now = _qvix_value_from_df(qdaily)
-        if np.isfinite(qv_now):
-            qvix_info['qvix'] = float(qv_now)
-            try:
-                qdaily = ak_fetch_500etf_qvix_daily()
+            qv_now, qv_pct = _qvix_close_on(qdaily, qday)
+            if not np.isfinite(qv_now) and qday.date() == _now_with_tz_offset(int(tz_offset)).date():
+                # 盘后日线可能还没发布：所选日就是今天时，分钟线最新值就是当天收盘。
+                qv_now = _qvix_value_from_df(ak_fetch_500etf_qvix_min())
                 dcol = _pick_df_col(qdaily, ["QVIX","qvix","value","close","收盘","最新价"])
-                if dcol is not None:
-                    qvix_info['qvix_pctile'] = float(_qvix_pctile(qv_now, qdaily[dcol]))
-            except Exception:
-                pass
+                qv_pct = _qvix_pctile(qv_now, qdaily[dcol]) if dcol is not None else np.nan
+            if np.isfinite(qv_now):
+                qvix_info = {'qvix': float(qv_now), 'qvix_pctile': qv_pct}
+            else:
+                intraday_msgs.append(f"QVIX 日线没有 {qday.date()} 的收盘值，该格显示为 —")
+        else:
+            # 盘中快照：分钟线优先 (may be all None near close); fallback to daily close.
+            qmin = ak_fetch_500etf_qvix_min()
+            qv_now = _qvix_value_from_df(qmin)
+            if not np.isfinite(qv_now):
+                qdaily = ak_fetch_500etf_qvix_daily()
+                qv_now = _qvix_value_from_df(qdaily)
+            if np.isfinite(qv_now):
+                qvix_info['qvix'] = float(qv_now)
+                try:
+                    qdaily = ak_fetch_500etf_qvix_daily()
+                    dcol = _pick_df_col(qdaily, ["QVIX","qvix","value","close","收盘","最新价"])
+                    if dcol is not None:
+                        qvix_info['qvix_pctile'] = float(_qvix_pctile(qv_now, qdaily[dcol]))
+                except Exception:
+                    pass
     except Exception as e:
         # keep NaN if failed
         intraday_msgs.append(f"QVIX 获取失败：{e}")

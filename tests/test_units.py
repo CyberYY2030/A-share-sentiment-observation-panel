@@ -54,5 +54,38 @@ class EastmoneyIndexPctTests(unittest.TestCase):
         self.assertAlmostEqual(pct, 0.29)
 
 
+class QvixCloseTests(unittest.TestCase):
+    """Close views read QVIX from the daily series on the selected day."""
+
+    def _daily(self):
+        import pandas as pd
+
+        # AkShare order and dtypes: string dates, float closes; rows after the day must be ignored.
+        return pd.DataFrame({"date": ["2026-10-09", "2026-10-12", "2026-10-13", "2026-10-14"],
+                             "open": [1.0, 1.0, 1.0, 1.0],
+                             "close": [30.0, 25.0, 27.79, 10.0]})
+
+    def test_value_and_percentile_stop_at_selected_day(self) -> None:
+        import pandas as pd
+        from panel import _qvix_close_on
+
+        qv, pct = _qvix_close_on(self._daily(), pd.Timestamp("2026-10-13"))
+        self.assertAlmostEqual(qv, 27.79)
+        self.assertAlmostEqual(pct, 2 / 3)
+
+    def test_missing_day_is_nan_not_a_neighbour(self) -> None:
+        from panel import _qvix_close_on
+
+        qv, pct = _qvix_close_on(self._daily(), "2026-10-10")
+        self.assertTrue(math.isnan(qv))
+        self.assertTrue(math.isnan(pct))
+
+    def test_empty_source_is_nan(self) -> None:
+        import pandas as pd
+        from panel import _qvix_close_on
+
+        self.assertTrue(all(math.isnan(v) for v in _qvix_close_on(pd.DataFrame(), "2026-10-13")))
+
+
 if __name__ == "__main__":
     unittest.main()
