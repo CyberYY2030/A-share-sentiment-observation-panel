@@ -18,8 +18,10 @@ import datetime as dt
 import re
 import math
 import subprocess
+import socket
 import requests
 import sys
+from functools import wraps
 from pathlib import Path
 from typing import Optional, Dict, List, Tuple, Any
 
@@ -234,6 +236,23 @@ def run_cmd(cmd: List[str], timeout_sec: int = 3600) -> Tuple[int, str]:
         return 999, f"run failed: {e}"
 
 
+BAOSTOCK_PROBE_SOCKET_TIMEOUT = 5.0
+
+
+def _bounded_baostock_probe(fn):
+    """Bound native SDK sockets during serialized date probes, then restore defaults."""
+    @wraps(fn)
+    def bounded(*args, **kwargs):
+        previous = socket.getdefaulttimeout()
+        try:
+            socket.setdefaulttimeout(BAOSTOCK_PROBE_SOCKET_TIMEOUT)
+            return fn(*args, **kwargs)
+        finally:
+            socket.setdefaulttimeout(previous)
+    return bounded
+
+
+@_bounded_baostock_probe
 def try_get_last_trade_day_baostock(include_today: bool, tz_offset_hours: int = 8) -> Optional[str]:
     """Return the last trading day using baostock calendar.
 
@@ -315,6 +334,7 @@ def is_date_behind(local_d: Optional[str], remote_d: Optional[str]) -> bool:
         return True
 
 
+@_bounded_baostock_probe
 def try_get_trade_dates_baostock(start_date: str, end_date: str) -> List[str]:
     try:
         import baostock as bs  # type: ignore
@@ -544,6 +564,7 @@ def _date_str(d: dt.date) -> str:
     return d.strftime("%Y-%m-%d")
 
 
+@_bounded_baostock_probe
 def try_get_latest_kline_day_baostock(code: str, lookback_days: int = 25) -> Optional[str]:
     """Query baostock daily endpoint for `code` and return the latest `date` observed.
     This reflects *data availability* on the interface, not just the trade calendar.

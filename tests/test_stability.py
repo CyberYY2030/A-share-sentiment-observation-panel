@@ -1,7 +1,9 @@
 """Offline regressions for disconnected rendering and incremental recovery."""
 import datetime as dt
 import sqlite3
+import socket
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -16,6 +18,35 @@ from tests.synthetic_db import make_concept_db, make_etf_db, make_stock_db, trad
 
 
 class OfflineQuoteTests(unittest.TestCase):
+    def test_baostock_probes_bound_reads_and_restore_socket_defaults(self):
+        import baostock as bs
+        original = socket.getdefaulttimeout()
+        self.addCleanup(socket.setdefaulttimeout, original)
+        socket.setdefaulttimeout(0.25)
+        for name, args, unavailable in (
+            ("try_get_last_trade_day_baostock", (False,), None),
+            ("try_get_trade_dates_baostock", ("2026-10-01", "2026-10-13"), []),
+            ("try_get_latest_kline_day_baostock", ("sh.000001",), None),
+        ):
+            with self.subTest(probe=name):
+                observed = []
+                def stalled_login():
+                    reader, writer = socket.socketpair()
+                    try:
+                        observed.append(reader.gettimeout())
+                        reader.recv(1)  # peer sends nothing; uses a real local socket deadline
+                    finally:
+                        reader.close()
+                        writer.close()
+                with mock.patch.object(panel, "BAOSTOCK_PROBE_SOCKET_TIMEOUT", 0.01, create=True), \
+                     mock.patch.object(bs, "login", side_effect=stalled_login), \
+                     mock.patch.object(bs, "logout"):
+                    started = time.monotonic()
+                    self.assertEqual(getattr(panel, name)(*args), unavailable)
+                    self.assertEqual(observed, [0.01])
+                    self.assertLess(time.monotonic() - started, 0.2)
+                    self.assertEqual(socket.getdefaulttimeout(), 0.25)
+
     def test_failed_eastmoney_quote_is_cached_and_other_sources_still_work(self):
         panel._ak_fetch_a_spot_em_result.clear()
         self.addCleanup(panel._ak_fetch_a_spot_em_result.clear)
