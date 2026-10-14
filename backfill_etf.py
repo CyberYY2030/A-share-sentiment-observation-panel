@@ -32,12 +32,14 @@ from pathlib import Path
 import argparse
 import datetime as dt
 import inspect
+import io
 import os
 import re
 import sqlite3
 import sys
 import time
 from typing import Iterable, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -131,6 +133,8 @@ def _normalize_code(code: str) -> str:
 
 
 def _filter_equity_etf(df: pd.DataFrame, exchange: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        raise RuntimeError(f"{exchange} returned empty ETF scale data")
     # name column
     name_col = _pick_col(df, ["基金简称", "证券简称", "基金名称", "名称", "简称"])
     if name_col is None:
@@ -147,6 +151,9 @@ def _filter_equity_etf(df: pd.DataFrame, exchange: str) -> pd.DataFrame:
         if type_col is not None:
             out = out.loc[~out[type_col].astype(str).str.contains("跨境", na=False)].copy()
     else:
+        # The official fund list also contains LOFs and REITs.
+        if "基金类别" in out.columns:
+            out = out.loc[out["基金类别"].astype(str).eq("ETF")].copy()
         # SZSE keep only 股票基金 / 混合基金 if we can
         cat_col = _pick_col(out, ["投资类别", "基金类别", "类型"])
         if cat_col is not None:
@@ -182,7 +189,16 @@ def _etf_master_from_scale(df: pd.DataFrame, exchange: str) -> pd.DataFrame:
     return out
 
 
-def load_trade_dates_from_ref_db(ref_db: str, days: int) -> List[str]:
+def default_asof(now: Optional[dt.datetime] = None) -> str:
+    """Calendar cutoff; the trade calendar/ref DB then selects the last closed day."""
+    now = now or dt.datetime.now(ZoneInfo("Asia/Shanghai"))
+    day = now.date()
+    if now.time() < dt.time(15):
+        day -= dt.timedelta(days=1)
+    return day.isoformat()
+
+
+def load_trade_dates_from_ref_db(ref_db: str, days: int, asof: Optional[str] = None) -> List[str]:
     if not ref_db or not os.path.exists(ref_db):
         return []
     conn = sqlite_connect(ref_db)
@@ -193,12 +209,14 @@ def load_trade_dates_from_ref_db(ref_db: str, days: int) -> List[str]:
             cols = [r[1] for r in conn.execute(f"PRAGMA table_info({t})").fetchall()]
             if "trade_date" in cols:
                 # prefer index rows if available
-                q = f"SELECT DISTINCT trade_date FROM {t} WHERE trade_date IS NOT NULL ORDER BY trade_date DESC LIMIT ?"
-                rows = conn.execute(q, (max(days, 120),)).fetchall()
+                q = (f"SELECT DISTINCT REPLACE(trade_date, '/', '-') AS d FROM {t} "
+                     "WHERE trade_date IS NOT NULL AND REPLACE(trade_date, '/', '-') <= ? "
+                     "ORDER BY d DESC LIMIT ?")
+                rows = conn.execute(q, (asof or default_asof(), days)).fetchall()
                 ds = [str(r[0]) for r in rows]
                 ds = [d.replace("/", "-") for d in ds]
                 ds = sorted(set(ds))
-                if len(ds) >= 10:
+                if len(ds) >= days:
                     return ds[-days:]
         return []
     finally:
@@ -258,8 +276,41 @@ def fetch_scale_szse(ak, yyyymmdd: Optional[str]) -> pd.DataFrame:
     # some versions use trade_date
     if sig and "trade_date" in sig.parameters and yyyymmdd is not None:
         return _safe_call(fn, trade_date=yyyymmdd)
-    # fallback: latest only
-    return _safe_call(fn)
+    # AKShare's latest-only implementation uses a failing fund subdomain
+    # and passes raw bytes to read_excel (unsupported in pandas 3).
+    # Read the same official report from the exchange's working main domain.
+    import requests
+    headers = {"Referer": "https://www.szse.cn/", "User-Agent": "Mozilla/5.0"}
+    response = _safe_call(requests.get,
+        "https://www.szse.cn/api/report/ShowReport",
+        params={"SHOWTYPE": "xlsx", "CATALOGID": "1000_lf", "TABKEY": "tab1"},
+        headers=headers, timeout=20,
+    )
+    response.raise_for_status()
+    df = pd.read_excel(io.BytesIO(response.content), engine="openpyxl", dtype={"基金代码": str})
+    df = df.rename(columns={"当前规模(份)": "基金份额"})
+    if "基金份额" in df.columns:
+        df["基金份额"] = pd.to_numeric(
+            df["基金份额"].astype(str).str.replace(",", "", regex=False), errors="coerce"
+        )
+    # The workbook has no observation date. Its JSON report header does;
+    # subname is the page date, so use the date attached to the scale column.
+    try:
+        metadata_response = _safe_call(requests.get,
+            "https://www.szse.cn/api/report/ShowReport/data",
+            params={"SHOWTYPE": "JSON", "CATALOGID": "1000_lf", "TABKEY": "tab1"},
+            headers=headers, timeout=20,
+        )
+        metadata_response.raise_for_status()
+        reports = metadata_response.json()
+        header = next(r["metadata"]["cols"]["dqgm"] for r in reports
+                      if r.get("metadata", {}).get("tabkey") == "tab1")
+        match = re.search(r"\d{4}-\d{2}-\d{2}", header)
+        if match:
+            df.attrs["trade_date"] = match.group(0)
+    except (requests.RequestException, ValueError, KeyError, StopIteration, TypeError) as exc:
+        log(f"SZSE snapshot date unavailable: {exc}")
+    return df
 
 
 def upsert_master(conn: sqlite3.Connection, master: pd.DataFrame) -> None:
@@ -362,16 +413,18 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="etf_mvp.db", help="ETF sqlite db path")
     ap.add_argument("--days", type=int, default=60, help="backfill trade days")
-    ap.add_argument("--asof", default=None, help="asof date YYYY-MM-DD (default: today)")
+    ap.add_argument("--asof", default=None, help="asof date YYYY-MM-DD (default: latest closed trading day)")
     ap.add_argument("--ref-db", default="a_share_mvp.db", help="ref db to get trading dates")
     ap.add_argument("--out-dir", default=os.path.join("data", "output"), help="output directory")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
-    asof = args.asof or dt.date.today().isoformat()
+    asof = args.asof or default_asof()
+    if args.days <= 0:
+        ap.error("--days must be positive")
 
     # trade dates
-    dates = load_trade_dates_from_ref_db(args.ref_db, args.days)
+    dates = load_trade_dates_from_ref_db(args.ref_db, args.days, asof)
     if not dates:
         log(f"ref-db trade dates unavailable, fallback to baostock calendar")
         dates = get_trade_dates_via_baostock(args.days, asof)
@@ -394,6 +447,8 @@ def main() -> None:
     df_sz = _filter_equity_etf(df_sz, "SZSE")
     master_sz = _etf_master_from_scale(df_sz, "SZSE")
 
+    if master_sse.empty or master_sz.empty:
+        raise RuntimeError("no eligible equity ETFs returned for one or both exchanges")
     master = pd.concat([master_sse, master_sz], ignore_index=True)
     # keep only equity
     master = master.drop_duplicates(subset=["exchange", "fund_code"])
@@ -418,6 +473,9 @@ def main() -> None:
     except Exception:
         sz_supports_date = False
     log(f"fund_etf_scale_szse date-aware: {sz_supports_date}")
+    sz_snapshot_date = df_sz.attrs.get("trade_date")
+    if not sz_supports_date:
+        log(f"SZSE latest snapshot actual trade_date={sz_snapshot_date}; save only if in requested dates")
 
     total_rows = 0
     for i, d in enumerate(dates, 1):
@@ -432,7 +490,10 @@ def main() -> None:
             n = upsert_scale(conn, d, "SSE", df, source="akshare")
             total_rows += n
         except Exception as e:
-            log(f"SSE {d} fetch failed: {e}")
+            # fetch_scale_sse has already exhausted its bounded retries.
+            # Stop this source instead of repeating the failure on all dates.
+            conn.close()
+            raise RuntimeError(f"SSE backfill stopped at {d}: {e}") from e
 
         # SZSE (maybe latest only)
         if sz_supports_date:
@@ -446,7 +507,7 @@ def main() -> None:
                 total_rows += n2
             except Exception as e:
                 log(f"SZSE {d} fetch failed: {e}")
-        elif d == asof_td:
+        elif d == sz_snapshot_date:
             try:
                 df2 = df_sz.copy()
                 code_col2 = _pick_col(df2, ["基金代码", "证券代码", "代码"])
@@ -464,6 +525,8 @@ def main() -> None:
             log(f"progress {i}/{len(dates)} saved_rows~{total_rows}")
 
     conn.close()
+    if total_rows == 0:
+        raise RuntimeError("ETF backfill saved zero rows; all requested data were empty or failed")
     log(f"DONE. db={args.db} total_rows={total_rows}")
 
 
