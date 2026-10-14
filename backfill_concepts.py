@@ -356,8 +356,8 @@ def fetch_concept_kline(adata, index_code: str, start: dt.date, end: dt.date) ->
     out = out.dropna(subset=["trade_date", "concept_code"]).drop_duplicates(subset=["trade_date", "concept_code"])
     out = out.sort_values(["concept_code", "trade_date"])
 
-    # keep only last ~N trade days per concept to reduce db IO
-    # (adata might still return a lot; tail() is per concept_code)
+    # Bound oversized provider history here; main applies the requested
+    # trading-day write window per concept below.
     out = out.groupby("concept_code", group_keys=False).tail(90).reset_index(drop=True)
 
     return out
@@ -369,7 +369,7 @@ def fetch_concept_kline(adata, index_code: str, start: dt.date, end: dt.date) ->
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ths_concept.db", help="sqlite db path")
-    ap.add_argument("--days", type=int, default=60, help="backfill target trade days (approx window)")
+    ap.add_argument("--days", type=int, default=60, help="trading days to write per concept")
     ap.add_argument("--asof", default="", help="YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD, default last completed trading day")
     ap.add_argument("--limit", type=int, default=0, help="limit number of concept indices for testing")
     ap.add_argument("--purge_excluded", type=int, default=1, help="purge excluded concepts from DB (1=yes,0=no)")
@@ -481,6 +481,8 @@ def main():
                 _log(f"[FAIL] {idx} {nm}: empty df")
             else:
                 consecutive_fail = 0
+                # THS may return full history even for an incremental request.
+                dfk = dfk.groupby("concept_code", group_keys=False).tail(args.days)
                 total_rows += upsert_df(con, "concept_kline", dfk, commit=False)
         except Exception as e:
             fail += 1

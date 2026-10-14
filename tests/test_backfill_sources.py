@@ -68,6 +68,36 @@ class StockSourceTests(unittest.TestCase):
 
 
 class ConceptSourceTests(unittest.TestCase):
+    def test_small_concept_backfill_preserves_history_outside_requested_window(self):
+        import backfill_concepts as concepts
+        from tests.synthetic_db import make_concept_db
+        days = trade_days('2026-10-13', 80)
+        for window in (5, 45, 60):
+            with self.subTest(window=window):
+                with tempfile.TemporaryDirectory() as tmp:
+                    db = Path(tmp) / 'concept.db'
+                    make_concept_db(db, days[:-window], n_concepts=1)
+                    with sqlite3.connect(db) as con:
+                        original = con.execute('SELECT * FROM concept_kline ORDER BY trade_date').fetchall()
+                    adata = mock.Mock()
+                    # THS returns more history than requested. Older local rows must stay intact.
+                    adata.stock.market.get_market_concept_ths.return_value = pd.DataFrame({
+                        'trade_date': days, 'close': [999.0] * len(days),
+                        'change_pct': [1.0] * len(days), 'amount': [1e9] * len(days),
+                    })
+                    listing = pd.DataFrame({'index_code': ['885000'], 'name': ['概念']})
+                    with mock.patch('sys.argv', ['backfill_concepts.py', '--db', str(db), '--days', str(window), '--asof', days[-1]]), \
+                         mock.patch.object(concepts, 'try_import_adata', return_value=adata), \
+                         mock.patch.object(concepts, 'get_ths_concept_list', return_value=listing), \
+                         mock.patch.object(concepts, 'load_filtered_concepts', return_value=(set(), None)), \
+                         contextlib.redirect_stdout(io.StringIO()):
+                        concepts.main()
+                    with sqlite3.connect(db) as con:
+                        rows = con.execute('SELECT * FROM concept_kline ORDER BY trade_date').fetchall()
+                    self.assertEqual(rows[:-window], original)
+                    self.assertEqual([r[0].replace('/', '-') for r in rows], days)
+                    self.assertEqual([r[2] for r in rows[-window:]], [999.0] * window)
+
     def test_missing_index_code_is_resolved_from_ths_detail(self):
         import backfill_concepts as concepts
         adata = mock.Mock()
