@@ -10,10 +10,10 @@ Backfill沪深A股过去N个交易日(日线K)到本地SQLite，并保持字段�
   pip install baostock pandas
 
 运行示例：
-  python backfill_baostock_hsA_60d.py --db a_share_mvp.db --days 60
-  python backfill_baostock_hsA_60d.py --db a_share_mvp.db --days 60 --probe
-  python backfill_baostock_hsA_60d.py --db a_share_mvp.db --days 60 --with-indexes
-  python backfill_baostock_hsA_60d.py --db a_share_mvp.db --days 60 --with-concepts --concept-top 20
+  python backfill_stocks.py --db a_share_mvp.db --days 60
+  python backfill_stocks.py --db a_share_mvp.db --days 60 --probe
+  python backfill_stocks.py --db a_share_mvp.db --days 60 --with-indexes
+  python backfill_stocks.py --db a_share_mvp.db --days 60 --with-concepts --concept-top 20
 
 说明：
 - BaoStock 代码格式：sh.600000 / sz.000001

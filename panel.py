@@ -62,15 +62,19 @@ DEFAULT_CSV_OUT = "daily_metrics_last40.csv"
 # Backfill scripts (place them in the same folder as this Streamlit app)
 # We keep a small list of candidate filenames to avoid breaking when you version-bump scripts.
 SCRIPT_BAOSTOCK_CANDIDATES = [
+    "backfill_stocks.py",
+    # legacy names, still picked up if an old copy is lying around
     "backfill_baostock_hsA_60d_v2.py",
     "backfill_baostock_hsA_60d.py",
 ]
 SCRIPT_CONCEPT_CANDIDATES = [
+    "backfill_concepts.py",
     "backfill_adata_ths_concept_index_kline_60d_v3.py",
     "backfill_adata_ths_concept_index_kline_60d_v2.py",
     "backfill_adata_ths_concept_index_kline_60d.py",
 ]
 SCRIPT_ETF_CANDIDATES = [
+    "backfill_etf.py",
     "backfill_etf_equity_60d_v2.py",
     "backfill_etf_equity_60d.py",
 ]

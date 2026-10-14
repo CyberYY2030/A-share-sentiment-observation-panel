@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""backfill_adata_ths_concept_index_kline_60d_v3.py
+"""backfill_concepts.py
 
 目标：仅用 adata 拉取 **同花顺概念指数(88xxxx)** 的日K线（过去 N 个交易日左右），
 并保存到本地 SQLite（ths_concept.db），供面板指标计算使用。
@@ -18,7 +18,7 @@
 - K线写入分批 commit，减少数据库开销
 
 用法示例：
-    python backfill_adata_ths_concept_index_kline_60d_v3.py --db ths_concept.db --days 60 --asof 2026-01-29
+    python backfill_concepts.py --db ths_concept.db --days 60 --asof 2026-01-29
 """
 
 from __future__ import annotations

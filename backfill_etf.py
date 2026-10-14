@@ -18,7 +18,7 @@ Notes
 
 Run
 ---
-python backfill_etf_equity_60d.py --db etf_mvp.db --days 60 --ref-db a_share_mvp.db
+python backfill_etf.py --db etf_mvp.db --days 60 --ref-db a_share_mvp.db
 
 Outputs
 -------
