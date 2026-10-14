@@ -32,6 +32,8 @@ from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
+from bs4 import BeautifulSoup
 
 
 # ----------------------------
@@ -198,30 +200,47 @@ def try_import_adata():
 
 
 def get_ths_concept_list(adata) -> pd.DataFrame:
-    """Return df with at least index_code, name."""
-    try:
-        df = adata.stock.info.all_concept_code_ths()
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
-    except Exception as e:
-        _log(f"all_concept_code_ths failed: {e}")
-
-    candidates = [
-        ("adata.stock.info", "all_concept_ths"),
-        ("adata.stock.info", "all_concept_code"),
-    ]
-    for mod_name, fn_name in candidates:
-        try:
-            mod = eval(mod_name)
-            fn = getattr(mod, fn_name, None)
-            if callable(fn):
-                df = fn()
-                if isinstance(df, pd.DataFrame) and not df.empty:
-                    return df
-        except Exception:
-            pass
-
-    raise RuntimeError("Cannot get THS concept list from adata in this environment.")
+    """Resolve missing THS index codes from the same provider's detail pages."""
+    df = adata.stock.info.all_concept_code_ths()
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("THS concept list returned empty")
+    df = df.copy()
+    if "index_code" not in df:
+        df["index_code"] = None
+    df["index_code"] = df["index_code"].astype(object)
+    failures = 0
+    for position, (i, row) in enumerate(df.iterrows(), 1):
+        if re.fullmatch(r"88\d{4}", canonical_code(row["index_code"])):
+            continue
+        concept_code = canonical_code(row.get("concept_code", ""))
+        if not re.fullmatch(r"30\d{4}", concept_code):
+            raise RuntimeError(f"THS concept has no usable index/concept code: {row.to_dict()}")
+        for attempt in range(1, 4):
+            try:
+                response = requests.get(
+                    f"https://q.10jqka.com.cn/gn/detail/code/{concept_code}/",
+                    headers={"User-Agent": "Mozilla/5.0"}, timeout=20,
+                )
+                response.raise_for_status()
+                node = BeautifulSoup(response.content, "html.parser").find("input", id="clid")
+                code = node.get("value", "") if node else ""
+                if not re.fullmatch(r"88\d{4}", code):
+                    raise RuntimeError(f"THS detail {concept_code} has no 88xxxx clid")
+                df.at[i, "index_code"] = code
+                failures = 0
+                break
+            except Exception as exc:
+                _log(f"index-code resolution failed {concept_code} attempt={attempt}/3: {exc}")
+                if attempt == 3:
+                    failures += 1
+                    if failures >= 3:
+                        raise RuntimeError("THS index-code resolution failed 3 consecutive times") from exc
+        if position % 50 == 0 or position == len(df):
+            _log(f"index-code resolution progress {position}/{len(df)}")
+    missing = int((~df["index_code"].map(canonical_code).str.fullmatch(r"88\d{4}")).sum())
+    if missing:
+        raise RuntimeError(f"THS concept list has {missing} unresolved index codes; cannot save a complete master")
+    return df
 
 
 def fetch_concept_kline(adata, index_code: str, start: dt.date, end: dt.date) -> pd.DataFrame:
@@ -351,7 +370,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="ths_concept.db", help="sqlite db path")
     ap.add_argument("--days", type=int, default=60, help="backfill target trade days (approx window)")
-    ap.add_argument("--asof", default="", help="YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD, default today")
+    ap.add_argument("--asof", default="", help="YYYYMMDD / YYYY-MM-DD / YYYY/MM/DD, default last completed trading day")
     ap.add_argument("--limit", type=int, default=0, help="limit number of concept indices for testing")
     ap.add_argument("--purge_excluded", type=int, default=1, help="purge excluded concepts from DB (1=yes,0=no)")
     ap.add_argument("--exclude_file", default="", help="optional exclude file name (csv/xlsx), default auto-detect")
@@ -361,7 +380,15 @@ def main():
     if adata is None:
         raise SystemExit(1)
 
-    asof = _date(args.asof) if args.asof else dt.date.today()
+    if args.asof:
+        asof = _date(args.asof)
+    else:
+        from backfill_stocks import bs_login, bs_logout, get_last_trading_day
+        bs_login()
+        try:
+            asof = _date(get_last_trading_day())
+        finally:
+            bs_logout()
     # wide calendar window; will be filtered by [start,end] later
     start = asof - dt.timedelta(days=max(90, args.days * 2))
     end = asof
@@ -396,6 +423,9 @@ def main():
     concepts = concepts.drop_duplicates(subset=["index_code"])
     _log(f"concept list rows={len(concepts)} (filtered 88xxxx)")
 
+    if concepts.empty:
+        raise RuntimeError("THS concept list has no usable 88xxxx index codes")
+
     # exclude concepts listed in filtered_concept.csv / xlsx
     exclude_set, exclude_fp = load_filtered_concepts(args.exclude_file if args.exclude_file else None)
     if exclude_set:
@@ -415,6 +445,9 @@ def main():
                 _log(f"WARN: purge excluded failed: {e}")
     else:
         _log(f"exclude_set empty (file={exclude_fp or 'not found'}) -> will NOT exclude anything")
+
+    if concepts.empty:
+        raise RuntimeError("no THS concepts remain after exclusions")
 
     # LIMIT should work regardless exclude_set is empty
     if args.limit and args.limit > 0:
@@ -436,6 +469,7 @@ def main():
 
     total_rows = 0
     fail = 0
+    consecutive_fail = 0
     for i, row in enumerate(concepts.itertuples(index=False), start=1):
         idx = getattr(row, "index_code")
         nm = getattr(row, "name", "")
@@ -443,12 +477,20 @@ def main():
             dfk = fetch_concept_kline(adata, idx, start, end)
             if dfk is None or dfk.empty:
                 fail += 1
+                consecutive_fail += 1
                 _log(f"[FAIL] {idx} {nm}: empty df")
             else:
+                consecutive_fail = 0
                 total_rows += upsert_df(con, "concept_kline", dfk, commit=False)
         except Exception as e:
             fail += 1
+            consecutive_fail += 1
             _log(f"[FAIL] {idx} {nm}: {e}")
+
+        if consecutive_fail >= 3:
+            con.commit()
+            con.close()
+            raise RuntimeError("THS kline failed 3 consecutive times; stopping this source")
 
         if i % 20 == 0:
             con.commit()
@@ -456,6 +498,8 @@ def main():
 
     con.commit()
     con.close()
+    if total_rows == 0:
+        raise RuntimeError(f"no concept kline saved: concepts={len(concepts)} fail={fail}")
     _log(f"DONE saved_rows={total_rows} fail={fail} db={args.db}")
 
 

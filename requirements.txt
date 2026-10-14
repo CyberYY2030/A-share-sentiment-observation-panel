@@ -1,6 +1,7 @@
 adata>=2.0.0
 akshare>=1.0.0
 baostock>=0.8.9
+beautifulsoup4>=4.9.1
 numpy>=1.26.0
 pandas>=2.0.0
 requests>=2.31.0

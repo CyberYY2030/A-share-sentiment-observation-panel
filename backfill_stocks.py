@@ -195,11 +195,21 @@ def bs_logout() -> None:
         pass
 
 
+def read_baostock_result(rs) -> pd.DataFrame:
+    """Read all pages through the public iterator (pandas 2+ compatible)."""
+    rows = []
+    while rs.error_code == "0" and rs.next():
+        rows.append(rs.get_row_data())
+    if rs.error_code != "0":
+        raise RuntimeError(f"baostock result failed: {rs.error_code} {rs.error_msg}")
+    return pd.DataFrame(rows, columns=rs.fields)
+
+
 def get_trade_calendar(start_date: str, end_date: str) -> pd.DataFrame:
     rs = bs.query_trade_dates(start_date=start_date, end_date=end_date)
     if rs.error_code != "0":
         raise RuntimeError(f"query_trade_dates failed: {rs.error_code} {rs.error_msg}")
-    return rs.get_data()  # expected cols: calendar_date, is_trading_day
+    return read_baostock_result(rs)  # expected cols: calendar_date, is_trading_day
 
 
 def get_last_trading_day() -> str:
@@ -261,13 +271,15 @@ def fetch_all_hs_a_stock_list(asof: str) -> pd.DataFrame:
     rs = bs.query_all_stock(day=asof)
     if rs.error_code != "0":
         raise RuntimeError(f"query_all_stock failed: {rs.error_code} {rs.error_msg}")
-    df = rs.get_data()
+    df = read_baostock_result(rs)
     if df is None or df.empty:
         raise RuntimeError(f"query_all_stock returned empty for {asof} (is it a trading day?)")
     df["code"] = df["code"].astype(str).str.lower()
     df = df[df["code"].apply(is_hs_a_share)].copy()
     df.rename(columns={"code": "bs_code", "code_name": "name", "tradeStatus": "trade_status"}, inplace=True)
     df["sec_code"] = df["bs_code"].str.split(".", n=1).str[1]
+    if df.empty:
+        raise RuntimeError(f"query_all_stock contains no HS A shares for {asof}")
     return df[["sec_code", "bs_code", "name", "trade_status"]].reset_index(drop=True)
 
 
@@ -288,7 +300,7 @@ def fetch_kline_baostock(bs_code: str, start_date: str, end_date: str) -> pd.Dat
     if rs.error_code != "0":
         raise RuntimeError(f"history_k_data_plus failed for {bs_code}: {rs.error_code} {rs.error_msg}")
 
-    df = rs.get_data()
+    df = read_baostock_result(rs)
     if df is None or df.empty:
         return pd.DataFrame()
 
@@ -584,6 +596,7 @@ def main():
 
         total = len(stock_list)
         done, fail = 0, 0
+        consecutive_fail = 0
         t0 = time.time()
 
         batch_frames: List[pd.DataFrame] = []
@@ -595,15 +608,21 @@ def main():
                 df = fetch_kline_baostock(bs_code, start_date, end_date)
                 if df.empty:
                     fail += 1
+                    consecutive_fail += 1
                 else:
                     batch_frames.append(df)
                     done += 1
+                    consecutive_fail = 0
                 if args.sleep > 0:
                     time.sleep(args.sleep)
             except Exception as e:
                 fail += 1
-                if i <= 5:
+                consecutive_fail += 1
+                if fail <= 5:
                     print(f"[STOCK] FAIL {bs_code}: {e}")
+
+            if consecutive_fail >= 3:
+                raise RuntimeError(f"stock kline failed 3 consecutive times at {bs_code}; stopping this source")
 
             if len(batch_frames) >= BATCH_N:
                 big = pd.concat(batch_frames, ignore_index=True)
@@ -620,8 +639,13 @@ def main():
             upsert_kline(conn, big)
             conn.commit()
 
+        if done == 0:
+            raise RuntimeError(f"no stock kline saved: total={total} fail={fail}")
+
         if args.with_indexes:
             idx_df = fetch_indexes_baostock(start_date, end_date)
+            if idx_df.empty:
+                raise RuntimeError("no requested index kline saved")
             if not idx_df.empty:
                 upsert_kline(conn, idx_df)
                 conn.commit()
