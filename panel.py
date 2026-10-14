@@ -985,11 +985,23 @@ def validate_db_latest_day(stock_db: str, concept_db: Optional[str], tz_offset_h
                     if c_max and (pd.Timestamp(c_max) < pd.Timestamp(expected_day)):
                         issues.append(f"concept_db: concept daily behind expected_day ({c_max} < {expected_day})")
 
-                    # row count on expected day
-                    n = _sql_scalar(conC, f"SELECT COUNT(1) FROM {table} WHERE substr(replace({date_col},'/','-'),1,10)=?", (expected_day,))
+                    # Row count on expected day vs. this DB's own recent days. A fixed floor
+                    # does not work: THS has a few hundred live concepts and the filter list
+                    # purges some, so the old "< 800" would flag every healthy day.
+                    day_expr = f"substr(replace({date_col},'/','-'),1,10)"
+                    n = _sql_scalar(conC, f"SELECT COUNT(1) FROM {table} WHERE {day_expr}=?", (expected_day,))
+                    recent = [r[0] for r in conC.execute(
+                        f"SELECT COUNT(1) FROM {table} WHERE {day_expr}<? GROUP BY {day_expr} ORDER BY {day_expr} DESC LIMIT 10",
+                        (expected_day,),
+                    ).fetchall()]
+                    typical = float(np.median(recent)) if recent else None
+                    min_rows = max(100.0, 0.8 * typical) if typical else 100.0
                     details["concept_rows_on_expected"] = int(n) if n is not None else None
-                    if n is None or int(n) < 800:
-                        issues.append(f"concept_db: too few rows on {expected_day} (n={n}), possible bad/partial write")
+                    details["concept_rows_typical"] = typical
+                    if n is None or int(n) < min_rows:
+                        issues.append(
+                            f"concept_db: too few rows on {expected_day} (n={n}, recent typical={typical}), possible bad/partial write"
+                        )
 
                     # duplicates on expected day
                     dup = _sql_scalar(
