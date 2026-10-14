@@ -2446,18 +2446,20 @@ def em_fetch_index_pct(code6: str) -> float:
         # best-effort: assume SH=1 for indices
         secid = f"1.{code6}"
     url = "https://push2.eastmoney.com/api/qt/stock/get"
-    params = {"secid": secid, "fields": "f170,f43,f60"}  # pct, last, prev_close
+    # fltt=2 returns decimals; without it Eastmoney scales prices and f170 by 100.
+    params = {"secid": secid, "fields": "f170,f43,f60", "fltt": "2"}  # pct, last, prev_close
     r = requests.get(url, params=params, timeout=6)
     r.raise_for_status()
     j = r.json()
     data = (j or {}).get("data") or {}
+    # last / prev_close is unit-free, so prefer it over f170.
+    last = safe_to_float(data.get("f43"))
+    prev = safe_to_float(data.get("f60"))
+    if np.isfinite(last) and np.isfinite(prev) and last > 0 and prev > 0:
+        return float((last / prev - 1.0) * 100.0)
     pct = safe_to_float(data.get("f170"))
     if np.isfinite(pct):
         return float(pct)
-    last = safe_to_float(data.get("f43"))
-    prev = safe_to_float(data.get("f60"))
-    if np.isfinite(last) and np.isfinite(prev) and prev > 0:
-        return float((last / prev - 1.0) * 100.0)
     return np.nan
 
 def normalize_a_spot_df(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
@@ -2993,50 +2995,16 @@ def _st_rerun_safe():
 
 
 def infer_rel_from_pct_diff(diff: float) -> float:
-    """
-    Infer (zz1000 - hs300) relative return in *fraction* form from a diff that may be:
-      - percent-point diff (e.g., 0.57 meaning 0.57%)
-      - fraction diff (e.g., 0.0057 meaning 0.57%)
-      - occasionally 57 meaning 0.57% (bad scaling)
-    Returns a fraction (0.0057).
+    """Convert a (zz1000 - hs300) difference in percent points to a fraction.
+
+    Every caller passes percent points (0.57 means 0.57%). Guessing the unit from the
+    magnitude used to turn a 0.03pp spread into 3%, so the unit is fixed here and a
+    spread beyond +/-20pp (impossible for two broad indices) is rejected as bad data.
     """
     diff = safe_to_float(diff)
-    if not np.isfinite(diff):
+    if not np.isfinite(diff) or abs(diff) > 20.0:
         return np.nan
-
-    # If diff is huge, likely scaled by 100 (or more)
-    if abs(diff) > 20:
-        # 57 -> 0.57% -> 0.0057
-        return float(diff) / 10000.0
-
-    cand_pp = float(diff) / 100.0   # treat as percent-points
-    cand_frac = float(diff)         # treat as fraction already
-
-    def plausible(x: float) -> bool:
-        return np.isfinite(x) and (abs(x) <= 0.20)  # relative between indices unlikely >20%
-
-    # Prefer the candidate that is plausible and not "too tiny"
-    tiny = 5e-4  # 0.05%
-    pp_ok = plausible(cand_pp)
-    fr_ok = plausible(cand_frac)
-
-    if pp_ok and (not fr_ok):
-        return cand_pp
-    if fr_ok and (not pp_ok):
-        return cand_frac
-
-    # both plausible or both implausible:
-    # if one is tiny and the other isn't, prefer the non-tiny
-    if pp_ok and fr_ok:
-        if abs(cand_pp) < tiny and abs(cand_frac) >= tiny:
-            return cand_frac
-        if abs(cand_frac) < tiny and abs(cand_pp) >= tiny:
-            return cand_pp
-        # otherwise choose the smaller magnitude (conservative)
-        return cand_pp if abs(cand_pp) <= abs(cand_frac) else cand_frac
-
-    # both implausible -> fall back to percent-points conversion
-    return cand_pp
+    return float(diff) / 100.0
 
 
 def ak_fetch_a_spot_any() -> Tuple[pd.DataFrame, str]:
