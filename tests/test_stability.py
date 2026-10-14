@@ -39,13 +39,34 @@ class OfflineQuoteTests(unittest.TestCase):
                         reader.close()
                         writer.close()
                 with mock.patch.object(panel, "BAOSTOCK_PROBE_SOCKET_TIMEOUT", 0.01, create=True), \
+                     mock.patch.object(panel.socket, "create_connection") as reach, \
                      mock.patch.object(bs, "login", side_effect=stalled_login), \
                      mock.patch.object(bs, "logout"):
                     started = time.monotonic()
                     self.assertEqual(getattr(panel, name)(*args), unavailable)
+                    self.assertEqual(reach.call_args.kwargs["timeout"], 0.01)
                     self.assertEqual(observed, [0.01])
                     self.assertLess(time.monotonic() - started, 0.2)
                     self.assertEqual(socket.getdefaulttimeout(), 0.25)
+
+    def test_unreachable_baostock_skips_the_sdk(self):
+        # After a failed connect the SDK still sends login/logout on the dead socket; with a
+        # timeout set each send waits it out (offline first screen went from ~11s to ~51s).
+        import baostock as bs
+        for name, args, unavailable in (
+            ("try_get_last_trade_day_baostock", (False,), None),
+            ("try_get_trade_dates_baostock", ("2026-10-01", "2026-10-13"), []),
+            ("try_get_latest_kline_day_baostock", ("sh.000001",), None),
+        ):
+            with self.subTest(probe=name), \
+                 mock.patch.object(panel.socket, "create_connection", side_effect=OSError("unreachable")), \
+                 mock.patch.object(bs, "login") as login, \
+                 mock.patch.object(bs, "logout") as logout:
+                before = socket.getdefaulttimeout()
+                self.assertEqual(getattr(panel, name)(*args), unavailable)
+                login.assert_not_called()
+                logout.assert_not_called()
+                self.assertEqual(socket.getdefaulttimeout(), before)
 
     def test_failed_eastmoney_quote_is_cached_and_other_sources_still_work(self):
         panel._ak_fetch_a_spot_em_result.clear()

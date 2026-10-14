@@ -239,20 +239,39 @@ def run_cmd(cmd: List[str], timeout_sec: int = 3600) -> Tuple[int, str]:
 BAOSTOCK_PROBE_SOCKET_TIMEOUT = 5.0
 
 
-def _bounded_baostock_probe(fn):
-    """Bound native SDK sockets during serialized date probes, then restore defaults."""
-    @wraps(fn)
-    def bounded(*args, **kwargs):
-        previous = socket.getdefaulttimeout()
-        try:
-            socket.setdefaulttimeout(BAOSTOCK_PROBE_SOCKET_TIMEOUT)
-            return fn(*args, **kwargs)
-        finally:
-            socket.setdefaulttimeout(previous)
-    return bounded
+def _baostock_reachable() -> bool:
+    """One bounded TCP connect to the baostock server.
+
+    After a failed connect the SDK keeps the unconnected socket and still sends login/logout
+    on it; with a socket timeout set, each of those sends waits the full timeout.
+    """
+    try:
+        from baostock.common import contants as bs_cons  # type: ignore
+        socket.create_connection((bs_cons.BAOSTOCK_SERVER_IP, bs_cons.BAOSTOCK_SERVER_PORT),
+                                 timeout=BAOSTOCK_PROBE_SOCKET_TIMEOUT).close()
+        return True
+    except Exception:
+        return False
 
 
-@_bounded_baostock_probe
+def _bounded_baostock_probe(unavailable):
+    """Skip the probe when the server is unreachable; otherwise bound its SDK sockets, then restore defaults."""
+    def decorate(fn):
+        @wraps(fn)
+        def bounded(*args, **kwargs):
+            if not _baostock_reachable():
+                return unavailable()
+            previous = socket.getdefaulttimeout()
+            try:
+                socket.setdefaulttimeout(BAOSTOCK_PROBE_SOCKET_TIMEOUT)
+                return fn(*args, **kwargs)
+            finally:
+                socket.setdefaulttimeout(previous)
+        return bounded
+    return decorate
+
+
+@_bounded_baostock_probe(lambda: None)
 def try_get_last_trade_day_baostock(include_today: bool, tz_offset_hours: int = 8) -> Optional[str]:
     """Return the last trading day using baostock calendar.
 
@@ -334,7 +353,7 @@ def is_date_behind(local_d: Optional[str], remote_d: Optional[str]) -> bool:
         return True
 
 
-@_bounded_baostock_probe
+@_bounded_baostock_probe(list)
 def try_get_trade_dates_baostock(start_date: str, end_date: str) -> List[str]:
     try:
         import baostock as bs  # type: ignore
@@ -564,7 +583,7 @@ def _date_str(d: dt.date) -> str:
     return d.strftime("%Y-%m-%d")
 
 
-@_bounded_baostock_probe
+@_bounded_baostock_probe(lambda: None)
 def try_get_latest_kline_day_baostock(code: str, lookback_days: int = 25) -> Optional[str]:
     """Query baostock daily endpoint for `code` and return the latest `date` observed.
     This reflects *data availability* on the interface, not just the trade calendar.
