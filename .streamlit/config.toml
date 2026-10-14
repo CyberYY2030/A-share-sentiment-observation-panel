@@ -1,0 +1,6 @@
+[client]
+# Hide the "Deploy" button; this is a local tool.
+toolbarMode = "minimal"
+
+[browser]
+gatherUsageStats = false

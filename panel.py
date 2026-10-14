@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""A股情绪 & 同花顺概念题材面板（本地DB驱动）
+"""A股情绪观察面板（Streamlit，读本地 SQLite）
 
-- 热股：按“当日成交额TopN股票”的平均涨跌幅减去“全A等权”
-- 全市场成交额：上证综指(000001) + 深证成指(399001) 指数成交额之和
-- ETF：读取本地 etf_equity.db（按实际表头自适应），输出“份额日增幅(%)”
-- 题材：同花顺概念指数（ths_concept.db），显示概念名称 + temperature + risk + 当日成交额占比（概念amount / 市场成交额）
-- 计算结果保存：daily_metrics_last40.csv（最近40个交易日）
+- 情绪总分：广度 B、量能 L、热度 H、风格 R、ETF 份额 E 五个因子，各自做 60 日稳健 z 值，
+  按权重加权后用 logistic 映射到 0-100。
+- 热度：当日成交额 TopN 个股的平均涨跌幅 − 全 A 等权涨跌幅。
+- 全市场成交额：上证综指(000001) + 深证成指(399001) 成交额之和。
+- 题材：同花顺概念指数（data/ths_concept.db），Temperature / Risk 为概念间截面排名。
+- 结果写到 data/daily_metrics_last40.csv（最近 40 个交易日）。
 
-注意：
-1) 本程序默认不在面板中做“全市场股票日K全量更新”（太重）。你应当用单独 backfill 脚本更新 a/ashare_mvp.db。
-2) 本程序只基于本地DB计算，若部分因子缺历史会显示缺失提示，但不会把报错/对象repr显示在页面上。
+数据：data/ 下三个库由 backfill_stocks.py / backfill_concepts.py / backfill_etf.py 写入。
+面板启动时发现库落后，会调用这些脚本补齐缺的交易日；首次全量补历史建议单独先跑。
 """
 
 import os
