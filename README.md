@@ -8,9 +8,7 @@
 
 这个面板就是用来回答这三个问题的。本地 Streamlit 应用，数据来自 baostock / adata / akshare（免费源），存在本地 SQLite。个人工具，不构成投资建议。
 
-<!-- 截图待补：收盘口径截一张，存为 assets/screenshot.png，然后删掉这行注释、保留下一行
 ![面板截图](assets/screenshot.png)
--->
 
 ## 面板上看什么
 
@@ -49,7 +47,8 @@
 ```bash
 pip install -r requirements.txt
 
-# 第一次先单独补历史：要逐只拉约 5000 只股票的 60 日日线，比较慢
+# 第一次先单独补历史。耗时是 2026-10 的实测值：
+# 股票约 22 分钟（逐只拉约 5200 只股票的 60 日日线），概念约 3.5 分钟，ETF 约 12 秒
 python backfill_stocks.py --db data/a_share_mvp.db --days 60 --with-indexes
 python backfill_concepts.py --db data/ths_concept.db --days 60
 python backfill_etf.py --db data/etf_mvp.db --days 60 --ref-db data/a_share_mvp.db
