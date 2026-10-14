@@ -78,7 +78,7 @@ class PanelSmokeTests(unittest.TestCase):
     def test_close_view_renders_scores_and_theme_table(self) -> None:
         at = self._run(dt.datetime(2026, 10, 13, 20, 0))  # after close
 
-        self.assertEqual(at.title[0].value, "A股情绪 & 板块风险观察")
+        self.assertEqual(at.title[0].value, "A股情绪观察面板")
         self.assertEqual(len(at.metric), 10)
         score = float(_metric(at, "情绪总分").value)
         self.assertTrue(0.0 <= score <= 100.0)
@@ -86,6 +86,20 @@ class PanelSmokeTests(unittest.TestCase):
         theme = at.dataframe[-1].value
         self.assertEqual(len(theme), 30)  # default TopK
         self.assertIn("概念名称", theme.columns)
+
+    def test_diagnostics_hidden_until_debug_is_on(self) -> None:
+        at = self._run(dt.datetime(2026, 10, 13, 20, 0))
+        main_expanders = [e.label for e in at.main.expander]
+        self.assertNotIn("QVIX 调试", main_expanders)
+        self.assertNotIn("数据核验（成交额/索引）", main_expanders)
+
+        debug = [c for c in at.checkbox if c.label == "显示调试信息"]
+        self.assertEqual(len(debug), 1)
+        debug[0].check().run()
+        self.assertEqual(list(at.exception), [])
+        main_expanders = [e.label for e in at.main.expander]
+        self.assertIn("QVIX 调试", main_expanders)
+        self.assertIn("数据核验（成交额/索引）", main_expanders)
 
     def test_snapshot_view_keeps_small_spread_small(self) -> None:
         rng = np.random.default_rng(7)

@@ -3486,8 +3486,8 @@ def compute_intraday_snapshot_row(
     return pd.Series(row), qvix_info, msgs
 
 def main():
-    st.set_page_config(page_title="A股情绪 & 板块风险观察", layout="wide")
-    st.title("A股情绪 & 板块风险观察")
+    st.set_page_config(page_title="A股情绪观察面板", layout="wide")
+    st.title("A股情绪观察面板")
 
     msgs_turnover: List[str] = []
 
@@ -3501,21 +3501,28 @@ def main():
     concept_db = runtime_paths.concept_db
     etf_db = runtime_paths.etf_db
 
-    # Sidebar config（不改你已有参数命名风格）
-    st.sidebar.header("参数")
-    st.sidebar.subheader("情绪总分权重（默认=你的固定权重）")
-    # 说明：情绪总分=0.35B+0.25L+0.15H+0.15R+0.10E（盘中缺因子会按可得权重重新归一）
-    wB = st.sidebar.number_input("wB(广度: 上涨家数占比/涨跌家数比)", min_value=-5.0, max_value=5.0, value=0.35, step=0.05)
-    wL = st.sidebar.number_input("wL(流动性: 成交额/MA10-1)", min_value=-5.0, max_value=5.0, value=0.25, step=0.05)
-    wH = st.sidebar.number_input("wH(热度: 热股超额)", min_value=-5.0, max_value=5.0, value=0.15, step=0.05)
-    wR = st.sidebar.number_input("wR(风格: 小盘-大盘相对)", min_value=-5.0, max_value=5.0, value=0.15, step=0.05)
-    wE = st.sidebar.number_input("wE(资金: 权益ETF份额日增幅%)", min_value=-5.0, max_value=5.0, value=0.10, step=0.05)
-    hot_top = st.sidebar.number_input("热股TopN(按成交额)", min_value=20, max_value=300, value=100, step=10)
-    lookback = st.sidebar.number_input("日线回看(交易日)", min_value=40, max_value=120, value=60, step=10)
-    theme_topk = st.sidebar.number_input("题材TopK", min_value=10, max_value=80, value=30, step=5)
+    # Sidebar: the date switch on top, everything else folded away. The containers
+    # are created first so the code below can fill them in any order.
+    sb_view = st.sidebar.container()
+    sb_params = st.sidebar.expander("指标参数（权重 / TopN / 回看）", expanded=False)
+    sb_data = st.sidebar.container()
+    sb_adv = st.sidebar.expander("高级", expanded=False)
 
-    st.sidebar.subheader("数据日期切换")
-    tz_offset = st.sidebar.number_input("北京时间偏移(UTC+?)", min_value=-12, max_value=14, value=8, step=1)
+    sb_params.caption("情绪总分 = 各因子稳健 z 值按权重加权后映射到 0–100；盘中缺因子时按可得权重重新归一。")
+    wB = sb_params.number_input("wB(广度: 上涨家数占比/涨跌家数比)", min_value=-5.0, max_value=5.0, value=0.35, step=0.05)
+    wL = sb_params.number_input("wL(流动性: 成交额/MA10-1)", min_value=-5.0, max_value=5.0, value=0.25, step=0.05)
+    wH = sb_params.number_input("wH(热度: 热股超额)", min_value=-5.0, max_value=5.0, value=0.15, step=0.05)
+    wR = sb_params.number_input("wR(风格: 小盘-大盘相对)", min_value=-5.0, max_value=5.0, value=0.15, step=0.05)
+    wE = sb_params.number_input("wE(资金: 权益ETF份额日增幅%)", min_value=-5.0, max_value=5.0, value=0.10, step=0.05)
+    hot_top = sb_params.number_input("热股TopN(按成交额)", min_value=20, max_value=300, value=100, step=10)
+    lookback = sb_params.number_input("日线回看(交易日)", min_value=40, max_value=120, value=60, step=10)
+    theme_topk = sb_params.number_input("题材TopK", min_value=10, max_value=80, value=30, step=5)
+
+    tz_offset = sb_adv.number_input("北京时间偏移(UTC+?)", min_value=-12, max_value=14, value=8, step=1)
+    show_debug = sb_adv.checkbox(
+        "显示调试信息", value=False,
+        help="数据核验、单位换算、接口回退等诊断信息。默认隐藏，排查数据问题时打开。",
+    )
     now_cn = _now_with_tz_offset(int(tz_offset))
 
     remote_bundle = discover_data_dates_bundle(concept_db if (concept_db and os.path.exists(concept_db)) else None,
@@ -3535,13 +3542,13 @@ def main():
     opt_t2 = f"T-2 收盘（{t2_close}）" if t2_close else "T-2 收盘（不可用）"
 
     default_idx = 0 if in_snapshot_window else 1
-    choice = st.sidebar.radio("查看数据日期", [opt_snapshot, opt_t1, opt_t2], index=default_idx)
+    choice = sb_view.radio("查看数据日期", [opt_snapshot, opt_t1, opt_t2], index=default_idx)
 
     if choice == opt_snapshot and (not in_snapshot_window):
-        st.sidebar.warning("当前非交易日或不在 09:30–17:30 时间窗内：盘中快照不可用，将回退到 T-1 收盘口径。")
+        sb_view.warning("当前非交易日或不在 09:30–17:30 时间窗内：盘中快照不可用，将回退到 T-1 收盘口径。")
         effective_view = "t1"
     elif (choice == opt_t2) and (not t2_close):
-        st.sidebar.warning("无法确定 T-2 交易日：将回退到 T-1 收盘口径。")
+        sb_view.warning("无法确定 T-2 交易日：将回退到 T-1 收盘口径。")
         effective_view = "t1"
     else:
         effective_view = "snapshot" if (choice == opt_snapshot) else ("t2" if (choice == opt_t2) else "t1")
@@ -3554,18 +3561,16 @@ def main():
     use_intraday_theme = bool(effective_mode == "snapshot")
     force_intraday = False
 
-    st.sidebar.caption(
+    sb_adv.caption(
         f"接口最新收盘：stock={remote_bundle.get('remote_latest_stock_close_day')}｜concept={remote_bundle.get('remote_latest_concept_close_day')}｜"
         f"aligned(T-1)={t1_close}｜T-2={t2_close or 'N/A'}"
     )
 
-    st.sidebar.caption("说明：选择“最近收盘”将禁用所有盘中快照；选择“盘中快照优先”则尽可能使用快照并对不可取字段回退到最近收盘。")
-
     # --- 启动时补齐缺失数据（只在本次会话启动时跑一次）---
-    st.sidebar.subheader("数据库追平（对齐接口最新收盘）")
-    auto_catchup = st.sidebar.checkbox("自动追平（DB落后时自动更新）", value=True)
-    force_backfill = st.sidebar.checkbox("强制全量 backfill（60日）", value=False)
-    show_catchup_log = st.sidebar.checkbox("显示追平日志", value=False)
+    sb_data.subheader("数据更新")
+    auto_catchup = sb_data.checkbox("自动追平（DB落后时自动更新）", value=True)
+    force_backfill = sb_data.checkbox("强制全量 backfill（60日）", value=False)
+    show_catchup_log = sb_data.checkbox("显示追平日志", value=False)
 
     local_before = get_local_last_dates(stock_db, concept_db, etf_db)
     remote_stock_day = remote_bundle.get("remote_latest_stock_close_day") or remote_bundle.get(
@@ -3582,7 +3587,7 @@ def main():
     if etf_db and os.path.exists(etf_db) and is_date_behind(local_before.get("etf"), remote_etf_day):
         need_sync = True
 
-    st.sidebar.caption(
+    sb_data.caption(
         f"本地最新：stock={local_before.get('stock')}｜index={local_before.get('index')}｜concept={local_before.get('concept')}｜etf={local_before.get('etf')}"
     )
 
@@ -3592,7 +3597,7 @@ def main():
         st.session_state["catchup_log"] = []
 
     target_key = f"{remote_stock_day}|{remote_concept_day}|{remote_etf_day}"
-    now_ts = float(dt.datetime.utcnow().timestamp())
+    now_ts = float(dt.datetime.now(dt.timezone.utc).timestamp())
     state = st.session_state.get("auto_catchup_state") or {}
     throttled = bool(
         (state.get("target") == target_key)
@@ -3618,19 +3623,18 @@ def main():
         st.session_state["auto_catchup_state"] = {"target": target_key, "ok": (not still_behind), "ts": now_ts}
 
     if show_catchup_log and st.session_state.get("catchup_log"):
-        with st.sidebar.expander("追平日志", expanded=False):
+        with sb_data.expander("追平日志", expanded=False):
             for m in st.session_state.get("catchup_log", [])[-120:]:
                 st.write(m)
 
-        # --- 数据库日线更新（adata/baostock；仅日线接口写库） ---
-    st.sidebar.subheader("数据库日线更新（adata/baostock）")
-    auto_daily_sync = st.sidebar.checkbox("盘后自动：使用日线接口更新DB并重算", value=True)
-    validate_db_btn = st.sidebar.button("核验DB最新交易日数据")
-    manual_daily_sync = st.sidebar.button(
+    # --- 数据库日线更新（adata/baostock；仅日线接口写库） ---
+    auto_daily_sync = sb_data.checkbox("盘后自动：使用日线接口更新DB并重算", value=True)
+    validate_db_btn = sb_data.button("核验DB最新交易日数据")
+    manual_daily_sync = sb_data.button(
         "手动更新DB（日线接口）",
         help="只补落后的交易日。要整段重拉 60 日，勾选上面的“强制全量 backfill”。",
     )
-    repair_latest_btn = st.sidebar.button("修复最新交易日（日线接口，覆写当日数据）")
+    repair_latest_btn = sb_data.button("修复最新交易日（日线接口，覆写当日数据）")
 
     if "daily_sync_log" not in st.session_state:
         st.session_state["daily_sync_log"] = []
@@ -3682,7 +3686,7 @@ def main():
     except Exception:
         pass
 
-    with st.sidebar.expander("日线更新 / 核验日志", expanded=False):
+    with sb_data.expander("日线更新 / 核验日志", expanded=bool(validate_db_btn)):
         # validation summary
         val = st.session_state.get("db_validate_result", None)
         if isinstance(val, dict):
@@ -3778,62 +3782,63 @@ def main():
 # ---- Sentiment ----
     # st.subheader("指标计算（本地DB → 日线）")
     # st.markdown(f"**DB最新日线日期（以stock日线为准）**：{latest_dt.date()}")
-    with st.expander("数据核验（成交额/索引）", expanded=False):
-        try:
-            st.write("当前口径：", "盘中快照" if effective_mode == "snapshot" else "最近收盘")
-            st.write("panel_close_dt：", str(panel_close_dt.date()) if panel_close_dt is not None else None)
-            st.write("snapshot_trade_dt：", str(snapshot_trade_dt.date()) if snapshot_trade_dt is not None else None)
-
-            # —— close 口径：同一天 000001 / 399001 成交额（原始+缩放到元）——
-            idx_norm = index_df.copy()
-            idx_norm["trade_date"] = idx_norm["trade_date"].apply(normalize_date)
-            idx_norm["sec_code"] = idx_norm["sec_code"].apply(canonical_code)
-
-            sub = idx_norm[
-                (idx_norm["trade_date"] == panel_close_dt)
-                & (idx_norm["sec_code"].isin([CODE_SH000001, CODE_SZ399001]))
-            ].copy()
-
-            if not sub.empty and "amount" in sub.columns:
-                raw = sub.set_index("sec_code")["amount"].apply(safe_to_float)
-                st.write("close_raw_index_amount：", raw.to_dict())
-
-                scaled, f = scale_amount_series_to_yuan(raw)
-                scaled_vals = pd.to_numeric(scaled, errors="coerce").values
-                st.write("close_amount_scale_factor：", float(f))
-                st.write(
-                    "close_scaled_index_amount(元)：",
-                    {k: (float(v) if np.isfinite(v) else None) for k, v in zip(raw.index.tolist(), scaled_vals.tolist())},
-                )
-                st.write("close_market_turnover_sum(元)：", float(np.nansum(scaled_vals)))
-            else:
-                st.write("close_index_amount：", "N/A（index_df 里未找到 panel_close_dt 当天的 000001/399001 成交额）")
-
-            # —— market_turnover 最终用于面板的数值（元）——
+    if show_debug:
+        with st.expander("数据核验（成交额/索引）", expanded=False):
             try:
-                v_final = market_turnover.loc[panel_close_dt] if panel_close_dt in market_turnover.index else np.nan
-                st.write("market_turnover_used(元)：", float(v_final) if np.isfinite(v_final) else None)
-            except Exception:
-                st.write("market_turnover_used(元)：", None)
+                st.write("当前口径：", "盘中快照" if effective_mode == "snapshot" else "最近收盘")
+                st.write("panel_close_dt：", str(panel_close_dt.date()) if panel_close_dt is not None else None)
+                st.write("snapshot_trade_dt：", str(snapshot_trade_dt.date()) if snapshot_trade_dt is not None else None)
 
-            # —— 严格分母：仅 000001+399001（元）——
-            try:
-                v_strict = market_turnover_idx_only.loc[panel_close_dt] if panel_close_dt in market_turnover_idx_only.index else np.nan
-                st.write("market_turnover_strict(元)：", float(v_strict) if np.isfinite(v_strict) else None)
-            except Exception:
-                st.write("market_turnover_strict(元)：", None)
+                # —— close 口径：同一天 000001 / 399001 成交额（原始+缩放到元）——
+                idx_norm = index_df.copy()
+                idx_norm["trade_date"] = idx_norm["trade_date"].apply(normalize_date)
+                idx_norm["sec_code"] = idx_norm["sec_code"].apply(canonical_code)
 
-            # —— concept 当天成交额（原始口径统计，便于肉眼判断单位）——
-            if concept_df is not None and (not concept_df.empty) and ("amount" in concept_df.columns) and ("trade_date" in concept_df.columns):
-                ctmp = concept_df.copy()
-                ctmp["trade_date"] = ctmp["trade_date"].apply(normalize_date)
-                ca = ctmp[ctmp["trade_date"] == panel_close_dt]["amount"].apply(safe_to_float)
-                if not ca.empty:
-                    st.write("concept_amount_raw_median：", float(ca.median()) if np.isfinite(ca.median()) else None)
-                    st.write("concept_amount_raw_p95：", float(ca.quantile(0.95)) if np.isfinite(ca.quantile(0.95)) else None)
-                    st.write("concept_amount_raw_max：", float(ca.max()) if np.isfinite(ca.max()) else None)
-        except Exception as e:
-            st.write("核验信息读取失败：", e)
+                sub = idx_norm[
+                    (idx_norm["trade_date"] == panel_close_dt)
+                    & (idx_norm["sec_code"].isin([CODE_SH000001, CODE_SZ399001]))
+                ].copy()
+
+                if not sub.empty and "amount" in sub.columns:
+                    raw = sub.set_index("sec_code")["amount"].apply(safe_to_float)
+                    st.write("close_raw_index_amount：", raw.to_dict())
+
+                    scaled, f = scale_amount_series_to_yuan(raw)
+                    scaled_vals = pd.to_numeric(scaled, errors="coerce").values
+                    st.write("close_amount_scale_factor：", float(f))
+                    st.write(
+                        "close_scaled_index_amount(元)：",
+                        {k: (float(v) if np.isfinite(v) else None) for k, v in zip(raw.index.tolist(), scaled_vals.tolist())},
+                    )
+                    st.write("close_market_turnover_sum(元)：", float(np.nansum(scaled_vals)))
+                else:
+                    st.write("close_index_amount：", "N/A（index_df 里未找到 panel_close_dt 当天的 000001/399001 成交额）")
+
+                # —— market_turnover 最终用于面板的数值（元）——
+                try:
+                    v_final = market_turnover.loc[panel_close_dt] if panel_close_dt in market_turnover.index else np.nan
+                    st.write("market_turnover_used(元)：", float(v_final) if np.isfinite(v_final) else None)
+                except Exception:
+                    st.write("market_turnover_used(元)：", None)
+
+                # —— 严格分母：仅 000001+399001（元）——
+                try:
+                    v_strict = market_turnover_idx_only.loc[panel_close_dt] if panel_close_dt in market_turnover_idx_only.index else np.nan
+                    st.write("market_turnover_strict(元)：", float(v_strict) if np.isfinite(v_strict) else None)
+                except Exception:
+                    st.write("market_turnover_strict(元)：", None)
+
+                # —— concept 当天成交额（原始口径统计，便于肉眼判断单位）——
+                if concept_df is not None and (not concept_df.empty) and ("amount" in concept_df.columns) and ("trade_date" in concept_df.columns):
+                    ctmp = concept_df.copy()
+                    ctmp["trade_date"] = ctmp["trade_date"].apply(normalize_date)
+                    ca = ctmp[ctmp["trade_date"] == panel_close_dt]["amount"].apply(safe_to_float)
+                    if not ca.empty:
+                        st.write("concept_amount_raw_median：", float(ca.median()) if np.isfinite(ca.median()) else None)
+                        st.write("concept_amount_raw_p95：", float(ca.quantile(0.95)) if np.isfinite(ca.quantile(0.95)) else None)
+                        st.write("concept_amount_raw_max：", float(ca.max()) if np.isfinite(ca.max()) else None)
+            except Exception as e:
+                st.write("核验信息读取失败：", e)
 
 
     daily, msgs = compute_daily_sentiment(stock_df, index_df, etf_df, dates, weights, int(hot_top))
@@ -3868,14 +3873,9 @@ def main():
     except Exception as e:
         st.warning(f"写入 daily_matrics 失败：{e}")
 
-    if msgs:
+    if msgs and show_debug:
         with st.expander("缺失/提示", expanded=True):
             for m in msgs:
-                st.write(f"- {m}")
-
-    if intraday_msgs:
-        with st.expander("盘中快照提示", expanded=False):
-            for m in intraday_msgs:
                 st.write(f"- {m}")
 
     if daily.empty:
@@ -3996,32 +3996,34 @@ def main():
         # keep NaN if failed
         intraday_msgs.append(f"QVIX 获取失败：{e}")
 
-    with st.expander("QVIX 调试", expanded=False):
-        st.write({
-            "qvix": None if not np.isfinite(safe_to_float(qvix_info.get('qvix'))) else float(qvix_info.get('qvix')),
-            "qvix_pctile": None if not np.isfinite(safe_to_float(qvix_info.get('qvix_pctile'))) else float(qvix_info.get('qvix_pctile')),
-        })
-        try:
-            dfm = ak_fetch_500etf_qvix_min()
-            st.write("min cols:", list(dfm.columns))
-            st.dataframe(dfm.tail(5), width='stretch')
-        except Exception as e:
-            st.write("min fetch error:", str(e))
-        try:
-            dfd = ak_fetch_500etf_qvix_daily()
-            st.write("daily cols:", list(dfd.columns))
-            st.dataframe(dfd.tail(5), width='stretch')
-        except Exception as e:
-            st.write("daily fetch error:", str(e))
+    if show_debug:
+        with st.expander("QVIX 调试", expanded=False):
+            st.write({
+                "qvix": None if not np.isfinite(safe_to_float(qvix_info.get('qvix'))) else float(qvix_info.get('qvix')),
+                "qvix_pctile": None if not np.isfinite(safe_to_float(qvix_info.get('qvix_pctile'))) else float(qvix_info.get('qvix_pctile')),
+            })
+            try:
+                dfm = ak_fetch_500etf_qvix_min()
+                st.write("min cols:", list(dfm.columns))
+                st.dataframe(dfm.tail(5), width='stretch')
+            except Exception as e:
+                st.write("min fetch error:", str(e))
+            try:
+                dfd = ak_fetch_500etf_qvix_daily()
+                st.write("daily cols:", list(dfd.columns))
+                st.dataframe(dfd.tail(5), width='stretch')
+            except Exception as e:
+                st.write("daily fetch error:", str(e))
 
     
     # ---- Intraday runtime messages (after snapshot & QVIX) ----
-    if intraday_msgs:
+    if intraday_msgs and show_debug:
         with st.expander("盘中快照提示（运行信息）", expanded=False):
             for m in intraday_msgs:
                 if m:
                     st.write(f"- {m}")
 
+    st.subheader("市场情绪")
     try:
         now_cn2 = _now_with_tz_offset(int(tz_offset))
         is_trade2 = is_cn_trading_time(now_cn2, int(tz_offset))
@@ -4031,7 +4033,8 @@ def main():
     except Exception:
         pass
 
-    st.caption("标记说明：🟢=盘中实时快照；(昨)=使用昨日收盘/最新日线；—=取值失败或缺数据（详见上方提示）")
+    st.caption("标记说明：🟢=盘中实时快照；(昨)=使用昨日收盘/最新日线；—=取值失败或缺数据。"
+               "数据口径和接口回退的说明在侧边栏「高级 → 显示调试信息」。")
 
 
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -4065,7 +4068,7 @@ def main():
     c10_label = "成交额/MA10-1" + ("(昨)" if (intraday_row is not None) else "")
     c10.metric(c10_label, f"{safe_to_float(last.get('turnover_rel_ma10'))*100:.2f}%" if np.isfinite(safe_to_float(last.get("turnover_rel_ma10"))) else "—")
 
-    st.markdown("### 情绪总分（日线）")
+    st.markdown("#### 情绪总分走势（近 40 个交易日）")
     plot_df = daily[["trade_date", "sentiment_score"]].dropna().copy()
     # append/replace intraday point for visual reference (still date-based, no intraday axis)
     if intraday_row is not None and np.isfinite(safe_to_float(intraday_row.get("sentiment_score"))):
@@ -4079,12 +4082,14 @@ def main():
             pass
     if len(plot_df) >= 2:
         st.line_chart(plot_df.set_index("trade_date")["sentiment_score"].tail(40))
+        st.caption("50 ≈ 最近三个月的常态，不是历史分位。")
     else:
         st.info("情绪总分可用日线不足（需更多历史）。")
 
     # ---- Theme Cycle ----
     st.markdown("---")
-    st.subheader("指标体系B：同花顺概念板块（Theme Cycle）")
+    st.subheader("题材：同花顺概念指数")
+    st.caption("按 Temperature 排序。Temperature / Risk 都是概念之间的截面排名（0–100）：Risk 90 表示比九成概念更躁，不代表绝对风险高。")
     if concept_df.empty:
         st.warning("题材数据缺失：concept_kline_ths 为空或不可用。")
         return
@@ -4187,8 +4192,7 @@ def main():
 
     theme_tbl, theme_msgs = compute_theme_panel(concept_df_for_theme, name_map, market_turnover_for_theme, theme_latest_dt, int(theme_topk))
     theme_msgs = (rt_theme_msgs or []) + (theme_msgs or [])
-    if theme_msgs:
-
+    if theme_msgs and show_debug:
         with st.expander("题材提示", expanded=False):
             for m in theme_msgs:
                 st.write(f"- {m}")
@@ -4220,35 +4224,36 @@ def main():
         hide_index=True,
     )
 
-    with st.expander("题材成交额口径核验（000001/399001 + 概念成交额）", expanded=False):
-        try:
-            st.write("题材面板 latest_dt：", str(theme_latest_dt.date()) if theme_latest_dt is not None else None)
-            st.write("当前口径：", "盘中快照" if (effective_mode == "snapshot" and (snapshot_trade_dt is not None) and (theme_latest_dt == snapshot_trade_dt)) else "最近收盘")
-
-            if rt_theme_msgs:
-                st.write("快照/回退信息：")
-                for _m in rt_theme_msgs:
-                    st.write("-", _m)
-
-            if rt_turnover_diag:
-                raw_pair = {k: rt_turnover_diag.get(k) for k in [CODE_SH000001, CODE_SZ399001] if k in rt_turnover_diag}
-                if raw_pair:
-                    st.write("000001/399001 成交额快照原始值：", raw_pair)
-                if "amount_scale_factor" in rt_turnover_diag:
-                    st.write("指数成交额缩放因子：", rt_turnover_diag.get("amount_scale_factor"))
-                if "scaled_amounts" in rt_turnover_diag:
-                    st.write("000001/399001 缩放到元：", rt_turnover_diag.get("scaled_amounts"))
-
-            # 当前用于题材面板分母的市场成交额（元）
+    if show_debug:
+        with st.expander("题材成交额口径核验（000001/399001 + 概念成交额）", expanded=False):
             try:
-                mv = market_turnover_for_theme.loc[theme_latest_dt] if theme_latest_dt in market_turnover_for_theme.index else np.nan
-                st.write("market_turnover_for_theme_used(元)：", float(mv) if np.isfinite(mv) else None)
-            except Exception:
-                st.write("market_turnover_for_theme_used(元)：", None)
-        except Exception as e:
-            st.write("题材口径核验失败：", e)
+                st.write("题材面板 latest_dt：", str(theme_latest_dt.date()) if theme_latest_dt is not None else None)
+                st.write("当前口径：", "盘中快照" if (effective_mode == "snapshot" and (snapshot_trade_dt is not None) and (theme_latest_dt == snapshot_trade_dt)) else "最近收盘")
 
-    if etf_df is not None and not etf_df.empty:
+                if rt_theme_msgs:
+                    st.write("快照/回退信息：")
+                    for _m in rt_theme_msgs:
+                        st.write("-", _m)
+
+                if rt_turnover_diag:
+                    raw_pair = {k: rt_turnover_diag.get(k) for k in [CODE_SH000001, CODE_SZ399001] if k in rt_turnover_diag}
+                    if raw_pair:
+                        st.write("000001/399001 成交额快照原始值：", raw_pair)
+                    if "amount_scale_factor" in rt_turnover_diag:
+                        st.write("指数成交额缩放因子：", rt_turnover_diag.get("amount_scale_factor"))
+                    if "scaled_amounts" in rt_turnover_diag:
+                        st.write("000001/399001 缩放到元：", rt_turnover_diag.get("scaled_amounts"))
+
+                # 当前用于题材面板分母的市场成交额（元）
+                try:
+                    mv = market_turnover_for_theme.loc[theme_latest_dt] if theme_latest_dt in market_turnover_for_theme.index else np.nan
+                    st.write("market_turnover_for_theme_used(元)：", float(mv) if np.isfinite(mv) else None)
+                except Exception:
+                    st.write("market_turnover_for_theme_used(元)：", None)
+            except Exception as e:
+                st.write("题材口径核验失败：", e)
+
+    if show_debug and etf_df is not None and not etf_df.empty:
         st.caption(
             f"ETF份额本地最新日期：{etf_df['trade_date'].max().date()}。"
             f"若深市历史不完整，常见原因是数据源不提供历史，只能从开始运行后每日累积快照。"
