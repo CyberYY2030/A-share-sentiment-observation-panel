@@ -2414,12 +2414,25 @@ def _pick_df_col(df: pd.DataFrame, cands: List[str]) -> Optional[str]:
 
 
 @st.cache_data(ttl=60, show_spinner=False)
-def ak_fetch_a_spot_em() -> pd.DataFrame:
-    """All A-share realtime spot from Eastmoney (AkShare)."""
+def _ak_fetch_a_spot_em_result() -> Tuple[pd.DataFrame, Optional[str]]:
+    """Cache both quotes and brief transport failures for 60 seconds."""
     ak, err = try_import_akshare()
     if ak is None:
         raise RuntimeError(f"akshare not available: {err}")
-    return ak.stock_zh_a_spot_em()
+    try:
+        return ak.stock_zh_a_spot_em(), None
+    except requests.RequestException as exc:
+        # Streamlit does not cache exceptions. Cache an unavailable result for
+        # 60 seconds so each rerun does not repeat AkShare's retry backoff.
+        return pd.DataFrame(), str(exc)
+
+
+def ak_fetch_a_spot_em() -> pd.DataFrame:
+    """All A-share realtime spot from Eastmoney, retaining failure fallbacks."""
+    quotes, error = _ak_fetch_a_spot_em_result()
+    if error is not None:
+        raise RuntimeError(error)
+    return quotes
 
 
 @st.cache_data(ttl=60, show_spinner=False)
